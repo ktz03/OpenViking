@@ -250,3 +250,44 @@ def test_numeric_status_code_with_compact_error_code_context_still_matches():
     assert classify_api_error(RuntimeError("Error code:413-Payload Too Large")) == (
         ERROR_CLASS_INPUT_TOO_LARGE
     )
+
+def test_is_stale_gateway_error_detects_status_codes():
+    from openviking.utils.model_retry import is_stale_gateway_error
+
+    class FakeHTTPError(Exception):
+        def __init__(self, status_code: int):
+            self.status_code = status_code
+            super().__init__(f"HTTP {status_code}")
+
+    assert is_stale_gateway_error(FakeHTTPError(502))
+    assert is_stale_gateway_error(FakeHTTPError(503))
+    assert is_stale_gateway_error(FakeHTTPError(504))
+    assert not is_stale_gateway_error(FakeHTTPError(429))
+    assert not is_stale_gateway_error(Exception("unrelated failure"))
+
+
+def test_retry_async_invokes_on_retry_before_next_attempt():
+    import asyncio
+    from openviking.utils.model_retry import retry_async
+
+    calls = {"n": 0, "retries": 0}
+
+    async def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            err = Exception("gateway 502 bad gateway")
+            err.status_code = 502  # type: ignore[attr-defined]
+            raise err
+        return "ok"
+
+    async def on_retry(error):
+        calls["retries"] += 1
+        assert getattr(error, "status_code") == 502
+
+    async def run():
+        return await retry_async(flaky, max_retries=2, on_retry=on_retry, base_delay=0.01, jitter=False)
+
+    assert asyncio.run(run()) == "ok"
+    assert calls["n"] == 2
+    assert calls["retries"] == 1
+

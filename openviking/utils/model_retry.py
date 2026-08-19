@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import random
 import re
@@ -365,6 +366,41 @@ def retry_sync(
             attempt += 1
 
 
+
+def _extract_http_status_code(error: BaseException) -> int | None:
+    """Best-effort HTTP status extraction from SDK / httpx-shaped errors."""
+    for item in _iter_exception_chain(error):
+        status_code = getattr(item, "status_code", None)
+        if status_code is None and hasattr(item, "response"):
+            status_code = getattr(item.response, "status_code", None)
+        try:
+            if status_code is not None:
+                return int(status_code)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def is_stale_gateway_error(error: Exception) -> bool:
+    """Return True for gateway errors that may poison keep-alive connection pools.
+
+    502/503/504 are valid HTTP responses on an otherwise healthy TCP connection,
+    so httpx/OpenAI clients can keep reusing the same pooled connection after the
+    upstream recovers. Callers should drop and recreate the async client before retry.
+    """
+    status = _extract_http_status_code(error)
+    if status in (502, 503, 504):
+        return True
+    text = str(error or "")
+    if not text:
+        return False
+    text_lower = text.lower()
+    text_compact = re.sub(r"\s+", "", text_lower)
+    return any(
+        _pattern_matches(text_lower, text_compact, code) for code in ("502", "503", "504")
+    )
+
+
 async def retry_async(
     func: Callable[[], Awaitable[T]],
     *,
@@ -373,6 +409,7 @@ async def retry_async(
     max_delay: float = 8.0,
     jitter: bool = True,
     is_retryable: Callable[[Exception], bool] = is_retryable_api_error,
+    on_retry: Callable[[Exception], Awaitable[None] | None] | None = None,
     logger=None,
     operation_name: str = "operation",
 ) -> T:
@@ -401,6 +438,10 @@ async def retry_async(
                     e,
                     delay,
                 )
+            if on_retry is not None:
+                maybe = on_retry(e)
+                if inspect.isawaitable(maybe):
+                    await maybe
             await asyncio.sleep(delay)
             attempt += 1
 

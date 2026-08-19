@@ -227,9 +227,8 @@ class VolcengineDenseEmbedder(DenseEmbedderBase):
         )
 
     async def embed_async(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
-        client = self._get_async_client()
-
         async def _embed_call() -> EmbedResult:
+            client = self._get_async_client()
             if self.input_type == "multimodal":
                 response = await client.multimodal_embeddings.create(
                     input=to_multimodal_input(content),
@@ -380,9 +379,8 @@ class VolcengineSparseEmbedder(SparseEmbedderBase):
         )
 
     async def embed_async(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
-        client = self._get_async_client()
-
         async def _embed_call() -> EmbedResult:
+            client = self._get_async_client()
             response = await client.multimodal_embeddings.create(
                 input=to_multimodal_input(content),
                 model=self.model_name,
@@ -540,9 +538,8 @@ class VolcengineHybridEmbedder(HybridEmbedderBase):
         )
 
     async def embed_async(self, content: "EmbeddingInput", is_query: bool = False) -> EmbedResult:
-        client = self._get_async_client()
-
         async def _embed_call() -> EmbedResult:
+            client = self._get_async_client()
             response = await client.multimodal_embeddings.create(
                 input=to_multimodal_input(content),
                 model=self.model_name,

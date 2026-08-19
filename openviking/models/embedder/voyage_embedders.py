@@ -130,9 +130,8 @@ class VoyageDenseEmbedder(DenseEmbedderBase):
             raise RuntimeError(f"Embedding failed: {str(e)}") from e
 
     async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
-        client = self._get_async_client()
-
         async def _call() -> EmbedResult:
+            client = self._get_async_client()
             response = await client.embeddings.create(**self._build_kwargs(text))
             return EmbedResult(dense_vector=response.data[0].embedding)
 

@@ -59,3 +59,32 @@ def test_loop_scoped_async_client_cache_copies_without_live_clients():
     assert cache.has_clients()
     assert not shallow.has_clients()
     assert not deep.has_clients()
+
+def test_invalidate_current_drops_client_for_rebuild():
+    cache = LoopScopedAsyncClientCache()
+    created = []
+    closed = []
+
+    class Client:
+        def aclose(self):
+            closed.append(self)
+            return None
+
+    def build_client():
+        client = Client()
+        created.append(client)
+        return client
+
+    async def run():
+        first = cache.get(build_client)
+        second = cache.get(build_client)
+        assert first is second
+        await cache.invalidate_current()
+        third = cache.get(build_client)
+        return first, third
+
+    first, third = asyncio.run(run())
+    assert first is not third
+    assert first in closed
+    assert len(created) == 2
+

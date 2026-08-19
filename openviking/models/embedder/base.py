@@ -21,6 +21,7 @@ from openviking.utils.model_retry import (
     classify_api_error,
     retry_async,
     retry_sync,
+    is_stale_gateway_error,
 )
 from openviking_cli.utils import get_logger
 
@@ -255,7 +256,28 @@ class EmbedderBase(ABC):
             operation_name=operation_name,
         )
 
-    async def _run_with_async_retry(
+
+    async def _refresh_async_clients_after_gateway_error(self, error: Exception) -> None:
+        """Drop cached async HTTP clients after gateway 5xx so retries use fresh connections."""
+        if not is_stale_gateway_error(error):
+            return
+
+        from openviking.utils.async_client_cache import LoopScopedAsyncClientCache
+
+        caches: list[LoopScopedAsyncClientCache] = []
+        for attr in (
+            "_async_client_cache",
+            "_async_openai_client_cache",
+            "_async_httpx_client_cache",
+        ):
+            cache = getattr(self, attr, None)
+            if isinstance(cache, LoopScopedAsyncClientCache):
+                caches.append(cache)
+
+        for cache in caches:
+            await cache.invalidate_current()
+
+        async def _run_with_async_retry(
         self,
         func: Callable[[], Awaitable[T]],
         *,
@@ -296,6 +318,7 @@ class EmbedderBase(ABC):
             max_retries=self.max_retries,
             logger=logger,
             operation_name=operation_name,
+            on_retry=self._refresh_async_clients_after_gateway_error,
         )
 
     @property

@@ -72,6 +72,34 @@ class LoopScopedAsyncClientCache:
                 self._clients_by_loop[loop] = client
             return client
 
+    def pop_current(self) -> Any | None:
+        """Remove and return the client for the current loop (or fallback)."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            with self._lock:
+                client = self._fallback_client
+                self._fallback_client = None
+                return client
+
+        with self._lock:
+            return self._clients_by_loop.pop(loop, None)
+
+    async def invalidate_current(
+        self, close_client: Callable[[Any], Any] = _aclose_client
+    ) -> None:
+        """Drop the current-loop client and close it so the next get() rebuilds.
+
+        Used after gateway 5xx responses that leave keep-alive connections pinned
+        to a failed upstream backend while the TCP connection remains reusable.
+        """
+        client = self.pop_current()
+        if client is None:
+            return
+        result = close_client(client)
+        if inspect.isawaitable(result):
+            await result
+
     def has_clients(self) -> bool:
         """Return whether the cache currently retains any clients."""
 
