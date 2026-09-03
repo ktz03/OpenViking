@@ -3,7 +3,7 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { OVConfig } from "./config.js";
 import { deriveHarnessSessionId } from "./shared/session-model.mjs";
-import { enqueue, listPending, replayPending } from "./shared/pending-queue.mjs";
+import { drainPendingForSession, enqueue, listPending, replayPending } from "./shared/pending-queue.mjs";
 import { extractBranchCapturePayloads } from "./lib/capture-adapter.mjs";
 import { countUndeliveredForSession, estimatePayloadTokens } from "./lib/takeover-core.mjs";
 
@@ -73,23 +73,13 @@ export class SyncManager {
   }
 
   async flushForTakeover(): Promise<boolean> {
-    if (!this.ovSessionId) return false;
-    // A single replayPending call caps at DEFAULT_REPLAY_LIMIT (50). Loop until
-    // the session backlog is empty or a round makes no progress, so takeover is
-    // not livelocked behind a backlog larger than one replay window (#4504).
-    const maxRounds = 40;
-    for (let round = 0; round < maxRounds; round++) {
-      const stats = await this.replayPending();
-      if (stats === null) return false;
-      const pending = await listPending();
-      const left = countUndeliveredForSession(pending, this.ovSessionId);
-      if (left === 0) return true;
-      if (stats.replayed === 0 && stats.deferred === 0) return false;
-      if (stats.replayed === 0 && stats.deferred > 0) continue;
-      if (stats.replayed === 0) return false;
-    }
-    const pending = await listPending();
-    return countUndeliveredForSession(pending, this.ovSessionId) === 0;
+    if (!this.ovSessionId || !this.client.connected) return false;
+    const result = await drainPendingForSession(
+      (path: string, init?: any) => this.client.fetchJSON(path, init, 10000),
+      (stage: string, data: unknown) => debugLog(`${stage}: ${JSON.stringify(data)}`),
+      { sessionId: this.ovSessionId, maxRounds: 40, timeBudgetMs: 60_000 },
+    );
+    return result.ok;
   }
 
   async syncBranch(branch: any[]): Promise<SyncBranchResult> {

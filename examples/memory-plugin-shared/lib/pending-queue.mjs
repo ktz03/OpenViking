@@ -448,3 +448,99 @@ export async function replayPending(fetchJSON, log) {
 
   return { replayed, failed, skipped, deferred };
 }
+
+function countUndeliveredAddMessagesForSession(pending, sessionId) {
+  if (!sessionId) return 0;
+  let count = 0;
+  for (const item of pending) {
+    const entry = item.entry ?? item;
+    if (entry?.type === "addMessage" && entry.sessionId === sessionId) count++;
+  }
+  return count;
+}
+
+/**
+ * Drain the pending queue across replay windows with explicit bounds.
+ * Used by takeover barriers: replays successful backlog beyond one
+ * OPENVIKING_PENDING_REPLAY_LIMIT window, but stops after a retryable
+ * failure so one invocation does not exhaust an entry's retry budget (#4616).
+ *
+ * @param {Function} fetchJSON
+ * @param {Function} log
+ * @param {object} [options]
+ * @param {string} [options.sessionId] - when set, ok means no undelivered addMessage for this session
+ * @param {number} [options.maxRounds=40]
+ * @param {number} [options.timeBudgetMs=60000]
+ */
+export async function drainPendingForSession(fetchJSON, log, options = {}) {
+  const sessionId = options.sessionId;
+  const maxRounds = Number.isFinite(options.maxRounds) ? options.maxRounds : 40;
+  const timeBudgetMs = Number.isFinite(options.timeBudgetMs) ? options.timeBudgetMs : 60_000;
+  const started = Date.now();
+
+  let totalReplayed = 0;
+  let totalFailed = 0;
+  let rounds = 0;
+
+  async function remainingCount() {
+    const pending = await listPending();
+    return sessionId ? countUndeliveredAddMessagesForSession(pending, sessionId) : pending.length;
+  }
+
+  for (let round = 0; round < maxRounds; round++) {
+    if (Date.now() - started >= timeBudgetMs) {
+      const remaining = await remainingCount();
+      return {
+        ok: false,
+        remaining,
+        replayed: totalReplayed,
+        failed: totalFailed,
+        rounds,
+        reason: "time-budget",
+      };
+    }
+
+    const stats = await replayPending(fetchJSON, log);
+    rounds++;
+    totalReplayed += stats.replayed;
+    totalFailed += stats.failed;
+
+    const remaining = await remainingCount();
+    if (sessionId && remaining === 0) {
+      return { ok: true, remaining: 0, replayed: totalReplayed, failed: totalFailed, rounds };
+    }
+
+    if (stats.failed > 0) {
+      return {
+        ok: false,
+        remaining,
+        replayed: totalReplayed,
+        failed: totalFailed,
+        rounds,
+        reason: "retryable-failure",
+      };
+    }
+
+    if (stats.replayed === 0) {
+      if (stats.deferred > 0) continue;
+      return {
+        ok: false,
+        remaining,
+        replayed: totalReplayed,
+        failed: totalFailed,
+        rounds,
+        reason: "no-progress",
+      };
+    }
+  }
+
+  const remaining = await remainingCount();
+  return {
+    ok: sessionId ? remaining === 0 : remaining === 0,
+    remaining,
+    replayed: totalReplayed,
+    failed: totalFailed,
+    rounds,
+    reason: remaining > 0 ? "max-rounds" : undefined,
+  };
+}

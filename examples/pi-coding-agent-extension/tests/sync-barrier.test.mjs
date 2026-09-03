@@ -233,3 +233,41 @@ test("flushForTakeover drains backlog larger than one replay window", async () =
     }
   });
 });
+
+test("flushForTakeover stops after one retryable failure without exhausting retries", async () => {
+  await withPendingDir(async () => {
+    process.env.OPENVIKING_PENDING_REPLAY_LIMIT = "1";
+    process.env.OPENVIKING_PENDING_MAX_RETRIES = "3";
+    try {
+      let m0Attempts = 0;
+      const c = client({
+        fetchJSON: async (path, init) => {
+          if (String(path).includes("/messages") && init?.method === "POST") {
+            const body = JSON.parse(String(init.body || "{}"));
+            if (body.content === "m0") {
+              m0Attempts += 1;
+              return { ok: false, status: 500, error: { message: "retryable" } };
+            }
+            return { ok: true, result: {} };
+          }
+          return { ok: true, result: {} };
+        },
+      });
+      const sync = new SyncManager(c, config());
+      await sync.ensureSession("pi-retry-session");
+      const sid = sync.sessionId;
+      await enqueue("addMessage", sid, { role: "user", content: "m0" });
+      await enqueue("addMessage", sid, { role: "user", content: "m1" });
+
+      assert.equal(await sync.flushForTakeover(), false);
+      assert.equal(m0Attempts, 1);
+      const pending = await listPending();
+      assert.equal(pending.length, 2);
+      assert.equal(pending[0].entry.retries, 1);
+      assert.equal(pending[1].entry.retries, 0);
+    } finally {
+      delete process.env.OPENVIKING_PENDING_REPLAY_LIMIT;
+      delete process.env.OPENVIKING_PENDING_MAX_RETRIES;
+    }
+  });
+});
