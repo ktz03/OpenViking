@@ -56,6 +56,15 @@ class MemoryConfig(BaseModel):
             "When multiple directories are searched, results are merged and top-N are read."
         ),
     )
+    extract_max_iterations: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Maximum ReAct iterations for session memory extraction (compressor v3). "
+            "Raise when models need more tool-read rounds before writing memories; "
+            "streaming extraction keeps its own fixed budget."
+        ),
+    )
     extraction_enabled: bool = Field(
         default=True,
         description=(

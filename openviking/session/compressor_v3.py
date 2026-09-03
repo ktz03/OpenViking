@@ -281,6 +281,7 @@ class SessionCompressorV3:
         return ExtractLoop(
             vlm=vlm,
             viking_fs=viking_fs,
+            max_iterations=config.memory.extract_max_iterations,
             ctx=ctx,
             context_provider=context_provider,
             isolation_handler=isolation_handler,

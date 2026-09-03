@@ -308,6 +308,7 @@ Provider 和密钥管理配置见[加密指南](../guides/08-encryption.md)。
     "experimental_memory_switch": false,
     "eager_prefetch": true,
     "prefetch_search_topn": 5,
+    "extract_max_iterations": 3,
     "extraction_enabled": true,
     "session_skill_extraction_enabled": false,
     "link_enabled": false,
@@ -325,6 +326,7 @@ Provider 和密钥管理配置见[加密指南](../guides/08-encryption.md)。
 | `experimental_memory_switch` | boolean | `false` | 是否启用实验性记忆模板 |
 | `eager_prefetch` | boolean | `true` | 是否在抽取前预取并读取记忆内容 |
 | `prefetch_search_topn` | integer，`>= 1` | `5` | 预取时读取的检索结果数量 |
+| `extract_max_iterations` | integer，`>= 1` | `3` | Session 记忆抽取的最大 ReAct 迭代次数 |
 | `extraction_enabled` | boolean | `true` | session commit 时是否抽取长期记忆 |
 | `session_skill_extraction_enabled` | boolean | `false` | 是否同时抽取可复用 Skill |
 | `link_enabled` | boolean | `false` | 是否生成和解析记忆链接 |

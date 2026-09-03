@@ -308,6 +308,7 @@ See [Encryption](../guides/08-encryption.md) for provider and key-management set
     "experimental_memory_switch": false,
     "eager_prefetch": true,
     "prefetch_search_topn": 5,
+    "extract_max_iterations": 3,
     "extraction_enabled": true,
     "session_skill_extraction_enabled": false,
     "link_enabled": false,
@@ -325,6 +326,7 @@ See [Encryption](../guides/08-encryption.md) for provider and key-management set
 | `experimental_memory_switch` | boolean | `false` | Enable experimental templates |
 | `eager_prefetch` | boolean | `true` | Search and read memories before extraction |
 | `prefetch_search_topn` | integer, `>= 1` | `5` | Results read during prefetch |
+| `extract_max_iterations` | integer, `>= 1` | `3` | Max ReAct iterations for session memory extraction |
 | `extraction_enabled` | boolean | `true` | Extract long-term memories on session commit |
 | `session_skill_extraction_enabled` | boolean | `false` | Also extract reusable skills |
 | `link_enabled` | boolean | `false` | Generate and resolve memory links |
