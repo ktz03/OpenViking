@@ -201,3 +201,35 @@ test("restoreWatermark prevents pi -c from re-syncing already captured entries",
     assert.match(calls[0].parts[0].text, /Fresh entry/);
   });
 });
+
+
+test("flushForTakeover drains backlog larger than one replay window", async () => {
+  await withPendingDir(async () => {
+    process.env.OPENVIKING_PENDING_REPLAY_LIMIT = "5";
+    try {
+      let posts = 0;
+      const c = client({
+        fetchJSON: async (path, init) => {
+          if (String(path).includes("/messages") && init?.method === "POST") {
+            posts += 1;
+            return { ok: true, result: {} };
+          }
+          return { ok: true, result: {} };
+        },
+      });
+      const sync = new SyncManager(c, config());
+      await sync.ensureSession("pi-backlog-session");
+      const sid = sync.sessionId;
+      for (let i = 0; i < 12; i++) {
+        await enqueue("addMessage", sid, { role: "user", content: `m${i}` });
+      }
+      assert.equal((await listPending()).length, 12);
+      const ok = await sync.flushForTakeover();
+      assert.equal(ok, true);
+      assert.ok(posts >= 12);
+      assert.equal((await listPending()).length, 0);
+    } finally {
+      delete process.env.OPENVIKING_PENDING_REPLAY_LIMIT;
+    }
+  });
+});

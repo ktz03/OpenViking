@@ -58,9 +58,14 @@ export class SyncManager {
     return true;
   }
 
-  async replayPending(): Promise<void> {
-    if (!this.client.connected) return;
-    await replayPending(
+  async replayPending(): Promise<{
+    replayed: number;
+    failed: number;
+    skipped: number;
+    deferred: number;
+  } | null> {
+    if (!this.client.connected) return null;
+    return await replayPending(
       (path: string, init?: any) => this.client.fetchJSON(path, init, 10000),
       (stage: string, data: unknown) =>
         debugLog(`${stage}: ${JSON.stringify(data)}`),
@@ -69,7 +74,20 @@ export class SyncManager {
 
   async flushForTakeover(): Promise<boolean> {
     if (!this.ovSessionId) return false;
-    await this.replayPending();
+    // A single replayPending call caps at DEFAULT_REPLAY_LIMIT (50). Loop until
+    // the session backlog is empty or a round makes no progress, so takeover is
+    // not livelocked behind a backlog larger than one replay window (#4504).
+    const maxRounds = 40;
+    for (let round = 0; round < maxRounds; round++) {
+      const stats = await this.replayPending();
+      if (stats === null) return false;
+      const pending = await listPending();
+      const left = countUndeliveredForSession(pending, this.ovSessionId);
+      if (left === 0) return true;
+      if (stats.replayed === 0 && stats.deferred === 0) return false;
+      if (stats.replayed === 0 && stats.deferred > 0) continue;
+      if (stats.replayed === 0) return false;
+    }
     const pending = await listPending();
     return countUndeliveredForSession(pending, this.ovSessionId) === 0;
   }

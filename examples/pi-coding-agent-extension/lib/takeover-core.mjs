@@ -265,7 +265,11 @@ export class TakeoverCore {
     try {
       const flushed = await this.io.flush();
       if (!flushed) {
+        // Same pressure relief as the overview-not-ready branch: do not let
+        // pendingTokens grow without bound across turns while flush is blocked
+        // (e.g. pending backlog > replay limit). See #4504.
         this.log("takeover: flush failed; commit postponed");
+        this.pendingTokens = 0;
         return false;
       }
 
