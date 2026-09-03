@@ -402,11 +402,15 @@ The final output of the model must strictly follow the JSON Schema format shown 
                         console=True,
                     )
                     break
-                tracer.info(
+                # Surface exhaustion as a warning so silent "Extracted 0" is not
+                # indistinguishable from a healthy empty extraction (#4486).
+                msg = (
                     "Memory extraction final response could not be parsed as JSON operations "
                     f"after {max_iterations} iterations — treating as no operations "
                     f"failure_kind={failure_kind} response_preview={failure_preview!r}"
                 )
+                logger.warning(msg)
+                tracer.error(msg)
                 final_operations = ResolvedOperations(
                     upsert_operations=[],
                     delete_file_contents=[],
