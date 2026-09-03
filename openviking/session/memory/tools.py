@@ -10,7 +10,7 @@ import json
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
-from openviking.session.memory.utils import add_line_numbers, line_count, slice_content_lines
+from openviking.session.memory.utils import add_line_numbers, line_count, slice_content_lines, split_content_lines
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.telemetry import tracer
 from openviking_cli.exceptions import NotFoundError
@@ -76,11 +76,16 @@ def add_tool_call_pair_to_messages(
     result: Any,
 ) -> None:
     """Add a tool call pair with optimized format to save tokens."""
+    # Optimize only the LLM-visible copy. Callers that need the full payload
+    # (e.g. MemoryReadTool -> ctx.read_file_contents) keep the original result.
+    # See https://github.com/volcengine/OpenViking/issues/4486
+    optimized = optimize_tool_result(tool_name, result)
     messages.append(
         {
             "role": "user",
             "content": json.dumps(
-                {"tool_call_name": tool_name, "args": params, "result": result}, ensure_ascii=False
+                {"tool_call_name": tool_name, "args": params, "result": optimized},
+                ensure_ascii=False,
             ),
         }
     )
@@ -206,6 +211,13 @@ class MemoryReadTool(MemoryTool):
                 if page_id is not None:
                     llm_result["page_id"] = page_id
             plain_content = mf.plain_content() or ""
+            # Sparse memory templates can contain long runs of trailing blank
+            # lines. Drop them before paging/numbering so ReAct context is not
+            # spent on empty line numbers (#4486).
+            content_lines = split_content_lines(plain_content)
+            while content_lines and not content_lines[-1].strip():
+                content_lines.pop()
+            plain_content = "\n".join(content_lines)
             visible_content = slice_content_lines(plain_content, offset=offset, limit=limit)
             if visible_content:
                 llm_result["content"] = add_line_numbers(visible_content, start_line=offset + 1)
