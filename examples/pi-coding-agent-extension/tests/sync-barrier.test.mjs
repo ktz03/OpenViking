@@ -256,15 +256,20 @@ test("flushForTakeover stops after one retryable failure without exhausting retr
       const sync = new SyncManager(c, config());
       await sync.ensureSession("pi-retry-session");
       const sid = sync.sessionId;
-      await enqueue("addMessage", sid, { role: "user", content: "m0" });
-      await enqueue("addMessage", sid, { role: "user", content: "m1" });
+      const t0 = Date.now();
+      // Pin createdAt so m0 is always replayed first (same-ms enqueue order is unstable).
+      await enqueue("addMessage", sid, { role: "user", content: "m0" }, { createdAt: t0 });
+      await enqueue("addMessage", sid, { role: "user", content: "m1" }, { createdAt: t0 + 1 });
 
       assert.equal(await sync.flushForTakeover(), false);
       assert.equal(m0Attempts, 1);
       const pending = await listPending();
       assert.equal(pending.length, 2);
-      assert.equal(pending[0].entry.retries, 1);
-      assert.equal(pending[1].entry.retries, 0);
+      const byContent = Object.fromEntries(
+        pending.map((p) => [p.entry.payload.content, p.entry]),
+      );
+      assert.equal(byContent.m0.retries, 1);
+      assert.equal(byContent.m1.retries, 0);
     } finally {
       delete process.env.OPENVIKING_PENDING_REPLAY_LIMIT;
       delete process.env.OPENVIKING_PENDING_MAX_RETRIES;

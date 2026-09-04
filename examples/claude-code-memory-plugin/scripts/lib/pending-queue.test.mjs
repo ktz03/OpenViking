@@ -299,8 +299,9 @@ test("drainPendingForSession stops after retryable failure without exhausting re
       }
       return { ok: true, result: {} };
     };
-    await enqueue("addMessage", "drain-session", { role: "user", content: "m0" });
-    await enqueue("addMessage", "drain-session", { role: "user", content: "m1" });
+    const t0 = Date.now();
+    await enqueue("addMessage", "drain-session", { role: "user", content: "m0" }, { createdAt: t0 });
+    await enqueue("addMessage", "drain-session", { role: "user", content: "m1" }, { createdAt: t0 + 1 });
     const result = await drainPendingForSession(fetchJSON, () => {}, {
       sessionId: "drain-session",
     });
@@ -309,7 +310,10 @@ test("drainPendingForSession stops after retryable failure without exhausting re
     assert.equal(m0Attempts, 1);
     const pending = await listPending();
     assert.equal(pending.length, 2);
-    assert.equal(pending[0].entry.retries, 1);
-    assert.equal(pending[1].entry.retries, 0);
+    const byContent = Object.fromEntries(
+      pending.map((p) => [p.entry.payload.content, p.entry]),
+    );
+    assert.equal(byContent.m0.retries, 1);
+    assert.equal(byContent.m1.retries, 0);
   });
 });
