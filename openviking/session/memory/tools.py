@@ -63,8 +63,15 @@ UNTRUSTED_MEMORY_FILE_CLOSE = "</untrusted-memory-file>"
 
 
 def fence_untrusted_memory_content(content: str) -> str:
-    """Wrap file bodies so extract LLMs treat them as data, not instructions (#4292)."""
-    return f"{UNTRUSTED_MEMORY_FILE_OPEN}\n{content}\n{UNTRUSTED_MEMORY_FILE_CLOSE}"
+    """Wrap file bodies so extract LLMs treat them as data, not instructions (#4292).
+
+    Forged fence markers already present in ``content`` are neutralized so
+    untrusted text cannot close the span early (same approach as #4664).
+    """
+    neutralized = content.replace(
+        UNTRUSTED_MEMORY_FILE_CLOSE, "</\\untrusted-memory-file"
+    ).replace(UNTRUSTED_MEMORY_FILE_OPEN, "<\\untrusted-memory-file")
+    return f"{UNTRUSTED_MEMORY_FILE_OPEN}\n{neutralized}\n{UNTRUSTED_MEMORY_FILE_CLOSE}"
 
 
 def extract_error_summary(error: str) -> str:
