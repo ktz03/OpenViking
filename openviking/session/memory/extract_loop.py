@@ -409,8 +409,13 @@ The final output of the model must strictly follow the JSON Schema format shown 
                     f"after {max_iterations} iterations — treating as no operations "
                     f"failure_kind={failure_kind} response_preview={failure_preview!r}"
                 )
+                # Prefer application logs for operator visibility; keep tracer as a
+                # short breadcrumb to avoid duplicate full lines in shared backends.
                 logger.warning(msg)
-                tracer.error(msg)
+                tracer.error(
+                    "Memory extraction exhausted iterations without parseable operations "
+                    f"failure_kind={failure_kind}"
+                )
                 final_operations = ResolvedOperations(
                     upsert_operations=[],
                     delete_file_contents=[],
