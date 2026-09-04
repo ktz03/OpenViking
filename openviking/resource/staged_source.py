@@ -221,9 +221,9 @@ async def _copy_local_tree(
             kept_dirs.append(name)
         dir_names[:] = kept_dirs
 
-        relative_root = root_path.relative_to(local_dir)
-        if relative_root.parts:
-            directories.add(safe_join_viking_uri(target_uri, relative_root.as_posix()))
+        # Do not mkdir every walked directory — excluded subtrees would leave
+        # empty dir skeletons in staging (#4604 review). Parents of kept files
+        # are still registered below.
         for name in file_names:
             local_path = root_path / name
             if local_path.is_symlink() or not local_path.is_file():
