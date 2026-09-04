@@ -117,3 +117,73 @@ function response(result, status = 200) {
     headers: { "Content-Type": "application/json" },
   });
 }
+
+test("agent/pre-step runs profile and recall concurrently", async () => {
+  const handlers = new Map();
+  let memoryRuntime;
+  const ctx = {
+    logger: { debug() {} },
+    provide(name, value) {
+      if (name === "openvikingMemory") memoryRuntime = value;
+    },
+    effect(execute) {
+      execute();
+      return async () => {};
+    },
+    tools: { register() {} },
+    plugin() {},
+    on(name, handler) {
+      handlers.set(name, handler);
+    },
+  };
+  apply(ctx, {
+    endpoint: "http://127.0.0.1:1933",
+    workspacePeer: false,
+    skipSubagentSessions: false,
+  });
+
+  let recallEntered = false;
+  let profileSawRecall = false;
+  let resolveRecallGate;
+  const recallGate = new Promise((resolve) => {
+    resolveRecallGate = resolve;
+  });
+
+  memoryRuntime.profileMessage = async () => {
+    // Wait until recall has started; sequential awaits would hang / fail this gate.
+    const timed = Promise.race([
+      recallGate,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("profile waited too long for concurrent recall")), 500)),
+    ]);
+    await timed;
+    profileSawRecall = recallEntered;
+    return message("profile-msg");
+  };
+  memoryRuntime.recallMessage = async () => {
+    recallEntered = true;
+    resolveRecallGate();
+    return message("recall-msg");
+  };
+
+  const agent = {
+    session: { id: "dsh-parallel", header: { cwd: "/workspace" } },
+    ctx: {
+      effect(execute) {
+        execute();
+        return async () => {};
+      },
+    },
+  };
+  const preStep = handlers.get("agent/pre-step");
+  const initial = [message("user input")];
+  const decision = await preStep(
+    { agent, messages: initial, signal: new AbortController().signal },
+    async () => ({ kind: "enter", messages: initial }),
+  );
+
+  assert.equal(profileSawRecall, true);
+  assert.deepEqual(
+    decision.messages.map((m) => m.content[0].text),
+    ["user input", "profile-msg", "recall-msg"],
+  );
+});
