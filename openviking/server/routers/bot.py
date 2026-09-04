@@ -94,7 +94,7 @@ def _build_openviking_connection(
         connection["api_key"] = api_key
     # Preserve request-scoped actor peer so vikingbot does not fall back to
     # body user_id / authenticated OpenViking user_id (#4649).
-    actor_peer_id = str(getattr(ctx, "actor_peer_id", None) or "").strip()
+    actor_peer_id = str(ctx.actor_peer_id or "").strip()
     if actor_peer_id:
         connection["actor_peer_id"] = actor_peer_id
     return connection

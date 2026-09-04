@@ -18,10 +18,8 @@ def test_build_openviking_connection_forwards_actor_peer_id():
         effective_auth_mode="api_key",
         server_url="http://127.0.0.1:1933",
     )
-    body = {"message": "hello", "user_id": "peer-b", "openviking_connection": connection}
-    actual = body["openviking_connection"].get("actor_peer_id") or body["user_id"]
+    # Assert the OpenViking-side forward only; vikingbot owns connection > body fallback.
     assert connection["actor_peer_id"] == "peer-a"
-    assert actual == "peer-a"
 
 
 def test_build_openviking_connection_omits_blank_actor_peer_id():
