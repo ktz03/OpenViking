@@ -249,13 +249,19 @@ test("commitAndAdvance advances boundary and persists after overview is ready", 
   assert.equal(calls.persisted[0].type, TAKEOVER_ENTRY_TYPE);
 });
 
-test("commitAndAdvance keeps pending tokens when flush fails", async () => {
+test("commitAndAdvance resets pending tokens when flush fails", async () => {
   const { core, calls } = makeCore({ flushResult: false });
   core.transformContext([user("one"), user("two")]);
   assert.equal(await core.onTurnSynced(120), false);
-  assert.equal(core.state.pendingTokens, 120);
+  // Same pressure relief as overview-not-ready: do not let pendingTokens grow
+  // without bound across turns while flush is blocked (#4504 / #4616).
+  assert.equal(core.state.pendingTokens, 0);
   assert.equal(calls.committed, 0);
   assert.equal(calls.persisted.length, 0);
+  // Next threshold crossing can retry after tokens accumulate again.
+  assert.equal(await core.onTurnSynced(120), false);
+  assert.equal(core.state.pendingTokens, 0);
+  assert.equal(calls.flushed, 2);
 });
 
 test("commitAndAdvance keeps boundary unchanged when overview is not ready", async () => {
