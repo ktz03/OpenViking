@@ -19,5 +19,6 @@ export function drainPendingForSession(
 export function replayPending(
   fetchJSON: (path: string, init?: any) => Promise<{ ok: boolean; status?: number; result?: any; error?: any }>,
   log: (stage: string, data?: any) => void,
+  options?: { sessionId?: string },
 ): Promise<{ replayed: number; failed: number; skipped: number; deferred: number }>;
 export function cleanStale(): Promise<number>;
