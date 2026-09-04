@@ -2,7 +2,8 @@ import type { OVClient } from "./client.js";
 import { createLogger } from "./shared/debug-log.mjs";
 import type { OVConfig } from "./config.js";
 import { deriveHarnessSessionId } from "./shared/session-model.mjs";
-import { enqueue, listPending, replayPending } from "./shared/pending-queue.mjs";
+import { claimForReplay, dequeue, enqueue, incrementRetry, listPending, replayPending } from "./shared/pending-queue.mjs";
+import { BATCH_LIMIT, sendSessionMessages } from "./shared/batch-send.mjs";
 import { extractBranchCapturePayloads } from "./lib/capture-adapter.mjs";
 import { countUndeliveredForSession, estimatePayloadTokens } from "./lib/takeover-core.mjs";
 
@@ -61,26 +62,74 @@ export class SyncManager {
 
   async flushForTakeover(): Promise<boolean> {
     if (!this.ovSessionId) return false;
-    await this.replayPending();
+    if (this.client.connected) await this.drainSessionBacklog();
     const pending = await listPending();
     return countUndeliveredForSession(pending, this.ovSessionId) === 0;
   }
+
+  /**
+   * Replay this session's queued addMessage entries through the batch
+   * endpoint, BATCH_LIMIT per request. The shared replayPending() sends one
+   * request per entry and stops after one replay window, which is what let a
+   * large offline backlog block the takeover barrier for many turns (#4504).
+   * Entries are claimed one batch at a time so a failed batch only costs a
+   * retry for the entries it contained.
+   */
+  private async drainSessionBacklog(): Promise<void> {
+    const sid = this.ovSessionId;
+    if (!sid) return;
+    const backlog = (await listPending()).filter(
+      ({ entry }) => entry?.type === "addMessage" && entry.sessionId === sid,
+    );
+    for (let start = 0; start < backlog.length; start += BATCH_LIMIT) {
+      const claimed: Array<{ filename: string; entry: any }> = [];
+      for (const { filename, entry } of backlog.slice(start, start + BATCH_LIMIT)) {
+        const name = await claimForReplay(filename);
+        if (name) claimed.push({ filename: name, entry });
+      }
+      if (claimed.length === 0) continue;
+
+      let delivered = 0;
+      await sendSessionMessages(
+        this.fetchJSON,
+        sid,
+        claimed.map(({ entry }) => entry.payload),
+        {
+          onSent: async (count: number) => {
+            for (let i = 0; i < count; i++) await dequeue(claimed[delivered++].filename);
+          },
+        },
+      );
+      if (delivered === claimed.length) continue;
+
+      // Undelivered entries stay queued with one more retry; incrementRetry
+      // drops them once the retry budget is exhausted.
+      for (const { filename, entry } of claimed.slice(delivered)) {
+        await incrementRetry(filename, entry);
+      }
+      this.logger.log("drain", {
+        session: sid,
+        delivered,
+        retried: claimed.length - delivered,
+      });
+      return;
+    }
+  }
+
+  private fetchJSON = (path: string, init?: any) => this.client.fetchJSON(path, init, 10000);
 
   async syncBranch(branch: any[]): Promise<SyncBranchResult> {
     if (!this.ovSessionId) return { added: 0, tokens: 0, allDelivered: true };
 
     const extracted = extractBranchCapturePayloads(branch, this.syncedEntryCount, this.config);
     if (extracted.resetWatermark) this.syncedEntryCount = 0;
-    let added = 0;
+    const sent = await this.sendPayloads(extracted.payloads);
+    const added = sent.accepted;
     let tokens = 0;
-    let allDelivered = true;
-    for (const payload of extracted.payloads) {
-      const result = await this.addPayload(payload);
-      if (!result.accepted) break;
-      added++;
+    for (const payload of extracted.payloads.slice(0, added)) {
       tokens += estimatePayloadTokens(payload);
-      allDelivered = allDelivered && result.delivered;
     }
+    const allDelivered = sent.delivered === added;
     if (added === extracted.payloads.length) {
       this.syncedEntryCount = extracted.nextEntryCount;
     }
@@ -91,11 +140,31 @@ export class SyncManager {
   }
 
   async addPayload(payload: any): Promise<AddPayloadResult> {
-    if (!this.ovSessionId) return { accepted: false, delivered: false };
-    const ok = await this.client.addMessagePayload(this.ovSessionId, payload);
-    if (ok) return { accepted: true, delivered: true };
-    await enqueue("addMessage", this.ovSessionId, payload);
-    return { accepted: true, delivered: false };
+    const sent = await this.sendPayloads([payload]);
+    return { accepted: sent.accepted === 1, delivered: sent.delivered === 1 };
+  }
+
+  /**
+   * Send payloads in one batch request; retryable failures are queued to disk.
+   * Returns how many payloads were accepted (sent or queued, always a prefix)
+   * and how many of those were delivered to the server.
+   */
+  private async sendPayloads(payloads: any[]): Promise<{ accepted: number; delivered: number }> {
+    if (!this.ovSessionId || payloads.length === 0) return { accepted: 0, delivered: 0 };
+    const res = await sendSessionMessages(this.fetchJSON, this.ovSessionId, payloads, {
+      enqueueOnRetryable: true,
+    });
+    if (res.failed > 0 || res.enqueueFailed > 0) {
+      this.logger.log("send", {
+        session: this.ovSessionId,
+        sent: res.sent,
+        queued: res.queued,
+        failed: res.failed,
+        enqueueFailed: res.enqueueFailed,
+        error: res.lastError?.message || res.lastError?.code || "unknown",
+      });
+    }
+    return { accepted: res.sent + res.queued, delivered: res.sent };
   }
 
   async commitIfNeeded(): Promise<void> {
