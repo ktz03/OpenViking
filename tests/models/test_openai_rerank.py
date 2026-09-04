@@ -53,6 +53,8 @@ class TestBuildRequestBody:
         assert body["input"]["documents"] == ["doc1", "doc2"]
         assert body["parameters"]["return_documents"] is False
         assert body["parameters"]["top_n"] == 2
+        body3 = client._build_request_body("hello", ["d1", "d2", "d3"])
+        assert body3["parameters"]["top_n"] == 3
         assert body["model"] == "gte-rerank-v2"
         # flat keys should NOT be present at top level
         assert "query" not in body
