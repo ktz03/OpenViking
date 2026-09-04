@@ -52,3 +52,26 @@ async def test_copy_local_tree_honors_ignore_dirs_include_exclude(tmp_path: Path
     assert all("ignored.bin" not in uri for uri in fs.files)
     assert all("private.md" not in uri for uri in fs.files)
     assert all("skip.txt" not in uri for uri in fs.files)
+
+@pytest.mark.asyncio
+async def test_copy_local_tree_does_not_mkdir_empty_excluded_dirs(tmp_path: Path) -> None:
+    root = tmp_path / "tree"
+    (root / "docs").mkdir(parents=True)
+    (root / "large-data" / "nested").mkdir(parents=True)
+    (root / "docs" / "keep.md").write_text("# keep\n", encoding="utf-8")
+    (root / "large-data" / "nested" / "ignored.bin").write_bytes(b"x")
+
+    fs = _FakeVikingFS()
+    await _copy_local_tree(
+        root,
+        "viking://temp/t/source/tree",
+        fs,
+        SimpleNamespace(),
+        ignore_dirs="large-data",
+        include="*.md",
+    )
+
+    assert sorted(Path(uri).name for uri in fs.files) == ["keep.md"]
+    assert all("large-data" not in uri for uri in fs.dirs)
+    assert "viking://temp/t/source/tree" in fs.dirs
+    assert "viking://temp/t/source/tree/docs" in fs.dirs
