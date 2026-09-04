@@ -349,17 +349,29 @@ export async function cleanStale() {
  *
  * @param {Function} fetchJSON - the configured fetchJSON from makeFetchJSON
  * @param {Function} log - logger function
+ * @param {object} [options]
+ * @param {string} [options.sessionId] - when set, only replay entries for this session
  * @returns {{ replayed: number, failed: number, skipped: number, deferred: number }}
  */
-export async function replayPending(fetchJSON, log) {
-  const pending = await listPending();
+export async function replayPending(fetchJSON, log, options = {}) {
+  const sessionId = options.sessionId;
+  let pending = await listPending();
+  if (sessionId) {
+    // Takeover drains must not deliver other sessions' backlog as a side effect.
+    pending = pending.filter((item) => item.entry?.sessionId === sessionId);
+  }
 
   if (pending.length === 0) {
     return { replayed: 0, failed: 0, skipped: 0, deferred: 0 };
   }
 
   const replayLimit = getReplayLimit();
-  log("pending-queue", { count: pending.length, replayLimit, action: "replay-start" });
+  log("pending-queue", {
+    count: pending.length,
+    replayLimit,
+    action: "replay-start",
+    sessionId: sessionId || undefined,
+  });
 
   let replayed = 0;
   let failed = 0;
@@ -469,6 +481,7 @@ function countUndeliveredAddMessagesForSession(pending, sessionId) {
  * @param {Function} log
  * @param {object} [options]
  * @param {string} [options.sessionId] - when set, ok means no undelivered addMessage for this session
+ *   and each replay round is scoped to that session (no cross-session side deliveries)
  * @param {number} [options.maxRounds=40]
  * @param {number} [options.timeBudgetMs=60000]
  */
@@ -500,7 +513,7 @@ export async function drainPendingForSession(fetchJSON, log, options = {}) {
       };
     }
 
-    const stats = await replayPending(fetchJSON, log);
+    const stats = await replayPending(fetchJSON, log, sessionId ? { sessionId } : {});
     rounds++;
     totalReplayed += stats.replayed;
     totalFailed += stats.failed;
