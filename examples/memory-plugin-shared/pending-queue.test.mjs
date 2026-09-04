@@ -50,8 +50,15 @@ test("drainPendingForSession drains backlog larger than one replay window", asyn
       }
       return { ok: true, result: {} };
     };
+    const t0 = Date.now();
     for (let i = 0; i < 12; i++) {
-      await enqueue("addMessage", "drain-session", { role: "user", content: `m${i}` }, { createdAt: i + 1 });
+      // Use recent createdAt — epoch-small timestamps are wiped by cleanStale.
+      await enqueue(
+        "addMessage",
+        "drain-session",
+        { role: "user", content: `m${i}` },
+        { createdAt: t0 + i },
+      );
     }
     const result = await drainPendingForSession(fetchJSON, () => {}, {
       sessionId: "drain-session",
@@ -90,5 +97,28 @@ test("drainPendingForSession stops after retryable failure without exhausting re
     assert.equal(m0Attempts, 1);
     const pending = await listPending();
     assert.equal(pending.length, 2);
+  });
+});
+
+test("drainPendingForSession does not replay other sessions", async () => {
+  await withPendingDir(async () => {
+    const t0 = Date.now();
+    await enqueue("addMessage", "other-session", { role: "user", content: "other" }, { createdAt: t0 });
+    await enqueue("addMessage", "drain-session", { role: "user", content: "mine" }, { createdAt: t0 + 1 });
+
+    const calls = [];
+    const result = await drainPendingForSession(async (path, init) => {
+      if (String(path).includes("/messages") && init?.method === "POST") {
+        calls.push(path);
+        return { ok: true, result: {} };
+      }
+      return { ok: true, result: {} };
+    }, () => {}, { sessionId: "drain-session" });
+
+    assert.equal(result.ok, true);
+    assert.deepEqual(calls, ["/api/v1/sessions/drain-session/messages"]);
+    const pending = await listPending();
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0].entry.sessionId, "other-session");
   });
 });
