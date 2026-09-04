@@ -39,3 +39,42 @@ def test_add_tool_call_pair_uses_optimized_read_result():
     assert "truncated" in payload["result"]["content"]
     # Caller-held original remains full for apply/write paths
     assert len(original["content"]) == len(long_content)
+
+def test_optimize_tool_result_summarizes_error_with_room_for_diagnostics():
+    long_err = "patch failed: " + ("x" * 400)
+    optimized = optimize_tool_result("read", {"error": long_err})
+    assert optimized == {"error": long_err[:250]}
+    assert len(optimized["error"]) == 250
+
+
+def test_optimize_tool_result_preserves_known_error_labels():
+    optimized = optimize_tool_result("search", {"error": "File not found at viking://x"})
+    assert optimized == {"error": "File not found"}
+
+
+def test_optimize_tool_result_compacts_search_memories():
+    result = {
+        "memories": [
+            {"uri": "viking://a/profile.md", "score": 0.9, "extra": "drop"},
+            {"uri": "viking://a/note.abstract.md", "score": 0.8},
+            {"uri": "viking://a/keep.md", "score": 0.7},
+        ]
+    }
+    optimized = optimize_tool_result("search", result)
+    assert optimized == [
+        {"uri": "viking://a/profile.md", "score": 0.9},
+        {"uri": "viking://a/keep.md", "score": 0.7},
+    ]
+
+
+def test_add_tool_call_pair_uses_optimized_error_result():
+    messages = []
+    add_tool_call_pair_to_messages(
+        messages,
+        call_id="call_err",
+        tool_name="read",
+        params={"uri": "viking://x"},
+        result={"error": "Timeout while reading"},
+    )
+    payload = json.loads(messages[0]["content"])
+    assert payload["result"] == {"error": "Timeout"}

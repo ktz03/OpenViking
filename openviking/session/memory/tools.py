@@ -46,7 +46,11 @@ def optimize_search_result(result: Any, limit: int = 10) -> Any:
 
 
 def optimize_tool_result(tool_name: str, result: Any) -> Any:
-    """优化工具结果以减少 Token 消耗。"""
+    """优化工具结果以减少 Token 消耗。
+
+    Error payloads keep up to 250 chars of diagnostic text so ReAct loops
+    can still recover from patch/URI failures (#4486 review).
+    """
     if isinstance(result, dict) and "error" in result:
         return {"error": extract_error_summary(result["error"])}
     if tool_name == "search" and isinstance(result, dict) and "memories" in result:
@@ -65,7 +69,7 @@ def extract_error_summary(error: str) -> str:
         return "Permission denied"
     if "Timeout" in error:
         return "Timeout"
-    return error[:50]
+    return error[:250]
 
 
 def add_tool_call_pair_to_messages(
