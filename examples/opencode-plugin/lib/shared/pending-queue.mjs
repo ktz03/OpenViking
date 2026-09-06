@@ -403,10 +403,7 @@ export async function replayPending(fetchJSON, log) {
     }
     await incrementRetry(claimedFilename, entry);
     failed++;
-    if (entry.type === "addMessage") {
-      deferred += Math.max(0, pending.length - processed);
-      stop = true;
-    }
+    // addMessage never reaches finishClaimed (routed to replayAddMessageBatch).
   }
 
   async function replayAddMessageBatch(items) {
@@ -447,9 +444,41 @@ export async function replayPending(fetchJSON, log) {
 
     const remaining = claimed.slice(delivered);
     if (!sendResult?.retryable) {
-      for (const { filename } of remaining) {
-        await dequeue(filename);
-        skipped++;
+      // Non-retryable batch failures (e.g. 422) reject the whole request. Fall
+      // back to per-item POSTs so one poison payload cannot drop up to
+      // BATCH_LIMIT valid messages that shared the claimed batch (#4714 review).
+      for (let j = 0; j < remaining.length; j++) {
+        const { filename, entry } = remaining[j];
+        let res;
+        try {
+          const encodedSid = encodeURIComponent(entry.sessionId);
+          res = await fetchJSON(`/api/v1/sessions/${encodedSid}/messages`, {
+            method: "POST",
+            body: JSON.stringify(entry.payload),
+          });
+        } catch {
+          res = { ok: false };
+        }
+
+        if (res?.ok) {
+          await dequeue(filename);
+          replayed++;
+          continue;
+        }
+
+        if (!isRetryableReplayFailure(res)) {
+          await dequeue(filename);
+          skipped++;
+          continue;
+        }
+
+        for (let k = j; k < remaining.length; k++) {
+          await incrementRetry(remaining[k].filename, remaining[k].entry);
+          failed++;
+        }
+        deferred += Math.max(0, pending.length - processed);
+        stop = true;
+        return;
       }
       return;
     }

@@ -292,6 +292,36 @@ test("replayPending honors the per-run replay limit", async () => {
   });
 });
 
+test("replayPending non-retryable batch failure isolates poison via serial fallback", async () => {
+  await withPendingDir(async () => {
+    const t0 = Date.now();
+    await enqueue("addMessage", "cc-poison", { role: "user", content: "ok-a" }, { createdAt: t0 });
+    await enqueue("addMessage", "cc-poison", { role: "user", content: "POISON" }, { createdAt: t0 + 1 });
+    await enqueue("addMessage", "cc-poison", { role: "user", content: "ok-b" }, { createdAt: t0 + 2 });
+
+    const calls = [];
+    const result = await replayPending(async (path, init) => {
+      const body = JSON.parse(init.body);
+      calls.push({ path, body });
+      if (path.endsWith("/messages/batch")) {
+        return { ok: false, status: 422, error: { message: "invalid message in batch" } };
+      }
+      const content = body.content;
+      if (content === "POISON") {
+        return { ok: false, status: 422, error: { message: "schema" } };
+      }
+      return { ok: true };
+    }, () => {});
+
+    assert.equal(result.replayed, 2);
+    assert.equal(result.skipped, 1);
+    assert.equal(result.failed, 0);
+    assert.ok(calls.some((c) => c.path.endsWith("/messages/batch")));
+    assert.equal(calls.filter((c) => /\/messages$/.test(c.path)).length, 3);
+    assert.deepEqual(await listPending(), []);
+  });
+});
+
 test("claimForReplay atomically claims a file only once", async () => {
   await withPendingDir(async (dir) => {
     await enqueue("commitSession", "cc-claim", {});
