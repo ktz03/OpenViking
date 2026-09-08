@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { fetchTasks, MAX_TASKS } from './task-list'
+import { fetchTasks, getEffectiveTaskStatus, MAX_TASKS } from './task-list'
 
 const clientMocks = vi.hoisted(() => ({
   getTasks: vi.fn(),
@@ -51,21 +51,37 @@ describe('task list requests', () => {
     })
   })
 
-  it('keeps effective status filtering on the client', async () => {
-    clientMocks.getTasks.mockResolvedValue(
-      Array.from({ length: 9 }, (_, index) => ({
-        created_at: index + 1,
-        status: 'running',
-        task_id: `task-${index + 1}`,
-      })),
-    )
+  it('sends status to the API before the result limit is applied', async () => {
+    clientMocks.getTasks.mockResolvedValue([
+      {
+        created_at: 1,
+        status: 'failed',
+        task_id: 'old-failed',
+      },
+    ])
 
-    await expect(fetchTasks('all', 'pending')).resolves.toEqual([
-      expect.objectContaining({ task_id: 'task-9' }),
+    await expect(fetchTasks('session_commit', 'failed')).resolves.toEqual([
+      expect.objectContaining({ task_id: 'old-failed' }),
     ])
     expect(clientMocks.getTasks).toHaveBeenCalledWith({
-      query: { limit: MAX_TASKS },
+      query: {
+        limit: MAX_TASKS,
+        status: 'failed',
+        task_type: 'session_commit',
+      },
     })
+  })
+
+  it('does not reclassify surplus running tasks as pending', () => {
+    const tasks = Array.from({ length: 12 }, (_, index) => ({
+      created_at: index + 1,
+      status: 'running' as const,
+      task_id: `task-${index + 1}`,
+    }))
+
+    expect(tasks.map((task) => getEffectiveTaskStatus(task, tasks))).toEqual(
+      Array.from({ length: 12 }, () => 'running'),
+    )
   })
 
   it('propagates request failures to the query error state', async () => {
