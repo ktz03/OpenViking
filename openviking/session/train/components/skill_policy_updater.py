@@ -132,8 +132,7 @@ def _coerce_request_context(context: Any) -> RequestContext | None:
         value = getattr(context, attr, None)
         if value is not None:
             return value
-    # If it quacks like a RequestContext…
-    if hasattr(context, "user_id") or hasattr(context, "account_id"):
+    # If it quacks like a RequestContext鈥?    if hasattr(context, "user_id") or hasattr(context, "account_id"):
         return context  # type: ignore[return-value]
     return None
 
@@ -165,7 +164,17 @@ def _apply_items_to_snapshot(items: list[PolicyPlanItem], policy_set: PolicySet)
             policy_set, uri=None, name=item.target_name
         )
         metadata = dict(existing.metadata) if existing is not None else {}
-        metadata.update(item.metadata.get("patch_metadata", {}))
+        # PatchMergePolicyOptimizer stores extracted skill fields under
+        # merge_memory_fields (including description). Prefer those, then allow
+        # explicit patch_metadata to override. Reading only patch_metadata left
+        # new Skills with an empty description and SkillOperationUpdater rejected
+        # them (#4801).
+        merge_fields = item.metadata.get("merge_memory_fields") or {}
+        if isinstance(merge_fields, dict):
+            for key in ("description", "allowed_tools", "tags"):
+                if key in merge_fields and merge_fields[key] is not None:
+                    metadata[key] = merge_fields[key]
+        metadata.update(item.metadata.get("patch_metadata", {}) or {})
         metadata.setdefault("memory_type", item.memory_type or "skills")
         version = (existing.version + 1) if existing is not None else 1
         updated = Policy(
@@ -302,7 +311,7 @@ def _policy_to_memory_file(policy: Policy | None) -> MemoryFile | None:
 def _safe_skill_dirname(name: str) -> str:
     import re
 
-    cleaned = re.sub(r"[^a-zA-Z0-9_\-一-鿿]+", "_", name.strip()).strip("._-")
+    cleaned = re.sub(r"[^a-zA-Z0-9_\-涓€-榭縘+", "_", name.strip()).strip("._-")
     return cleaned or "new_skill"
 
 
