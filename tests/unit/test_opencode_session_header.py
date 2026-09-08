@@ -170,3 +170,53 @@ async def test_async_completion_injects_header(mock_async_openai_class):
     vlm = OpenAIVLM(_openai_config())
     assert await vlm.get_completion_async(prompt="hi") == "ok"
     assert OPENCODE_SESSION_HEADER in captured["extra_headers"]
+
+
+@patch("openviking.models.vlm.backends.litellm_vlm.completion")
+def test_litellm_completion_injects_opencode_session_header(mock_completion):
+    from openviking.models.vlm.backends.litellm_vlm import LiteLLMVLMProvider
+
+    choice = MagicMock()
+    choice.message.content = "ok"
+    choice.message.tool_calls = None
+    choice.finish_reason = "stop"
+    mock_completion.return_value = MagicMock(choices=[choice], usage=None)
+
+    vlm = LiteLLMVLMProvider(
+        {
+            "provider": "litellm",
+            "api_key": "sk-test",
+            "api_base": "https://opencode.ai/zen/go/v1",
+            "model": "openai/gpt-4o-mini",
+            "max_retries": 0,
+        }
+    )
+    assert vlm.get_completion(prompt="hi") == "ok"
+    call_kwargs = mock_completion.call_args.kwargs
+    assert OPENCODE_SESSION_HEADER in call_kwargs["extra_headers"]
+    assert call_kwargs["extra_headers"][OPENCODE_SESSION_HEADER].startswith("ov-")
+
+
+@patch("openviking.models.vlm.backends.litellm_vlm.completion")
+def test_litellm_explicit_header_wins(mock_completion):
+    from openviking.models.vlm.backends.litellm_vlm import LiteLLMVLMProvider
+
+    choice = MagicMock()
+    choice.message.content = "ok"
+    choice.message.tool_calls = None
+    choice.finish_reason = "stop"
+    mock_completion.return_value = MagicMock(choices=[choice], usage=None)
+
+    vlm = LiteLLMVLMProvider(
+        {
+            "provider": "litellm",
+            "api_key": "sk-test",
+            "api_base": "https://opencode.ai/zen/go/v1",
+            "model": "openai/gpt-4o-mini",
+            "max_retries": 0,
+            "extra_headers": {OPENCODE_SESSION_HEADER: "fixed-litellm"},
+        }
+    )
+    assert vlm.get_completion(prompt="hi") == "ok"
+    call_kwargs = mock_completion.call_args.kwargs
+    assert call_kwargs["extra_headers"][OPENCODE_SESSION_HEADER] == "fixed-litellm"
