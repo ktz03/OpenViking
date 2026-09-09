@@ -835,6 +835,22 @@ fn new_py_err(name: &str, msg: String) -> PyErr {
     })
 }
 
+/// Remap opaque plugin errors onto more specific Python exception types.
+///
+/// LocalFS historically leaked mkdir/create races as Plugin("... File exists"),
+/// which broke idempotent callers that only catch AGFSAlreadyExistsError (#4018 /
+/// #4772 follow-up). Keep the same remapping style as directory-not-empty.
+fn remap_plugin_exception_name(msg: &str) -> &'static str {
+    let err_msg = msg.to_lowercase();
+    if err_msg.contains("directory not empty") {
+        "AGFSDirectoryNotEmptyError"
+    } else if err_msg.contains("file exists") || err_msg.contains("already exists") {
+        "AGFSAlreadyExistsError"
+    } else {
+        "AGFSPluginError"
+    }
+}
+
 /// Convert a ragfs error into the appropriate Python exception
 fn to_py_err(e: ragfs::core::Error) -> PyErr {
     let msg = e.to_string();
@@ -849,13 +865,7 @@ fn to_py_err(e: ragfs::core::Error) -> PyErr {
         ragfs::core::Error::InvalidOperation(_) => new_py_err("AGFSInvalidOperationError", msg),
         ragfs::core::Error::Io(_) => new_py_err("AGFSIoError", msg),
         ragfs::core::Error::Plugin(_) => {
-            // Check if the plugin error message contains known patterns
-            let err_msg = msg.to_lowercase();
-            if err_msg.contains("directory not empty") {
-                new_py_err("AGFSDirectoryNotEmptyError", msg)
-            } else {
-                new_py_err("AGFSPluginError", msg)
-            }
+            new_py_err(remap_plugin_exception_name(&msg), msg)
         }
         ragfs::core::Error::Config(_) => new_py_err("AGFSConfigError", msg),
         ragfs::core::Error::MountPointNotFound(_) => new_py_err("AGFSMountPointNotFoundError", msg),
@@ -2871,6 +2881,26 @@ mod tests {
     use super::*;
     use pyo3::types::PyDict;
     use std::fs;
+
+    #[test]
+    fn remap_plugin_exists_messages_to_already_exists() {
+        assert_eq!(
+            remap_plugin_exception_name("failed to create directory: File exists (os error 17)"),
+            "AGFSAlreadyExistsError"
+        );
+        assert_eq!(
+            remap_plugin_exception_name("path already exists"),
+            "AGFSAlreadyExistsError"
+        );
+        assert_eq!(
+            remap_plugin_exception_name("directory not empty: /tmp/x"),
+            "AGFSDirectoryNotEmptyError"
+        );
+        assert_eq!(
+            remap_plugin_exception_name("backend unavailable"),
+            "AGFSPluginError"
+        );
+    }
 
     #[test]
     fn detach_blocking_helper_runs_without_python_objects() {
