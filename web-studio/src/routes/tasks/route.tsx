@@ -52,7 +52,7 @@ import { TaskDetailSheet } from '#/routes/tasks/-components/task-detail-sheet'
 import { normalizeTaskStatus } from '#/routes/tasks/-lib/task-record'
 import type { TaskRecord } from '#/routes/tasks/-lib/task-record'
 import { formatTaskDuration, getTaskDate } from '#/routes/tasks/-lib/task-time'
-import { fetchTasks, MAX_TASKS } from './-lib/task-list'
+import { fetchTaskSummary, fetchTasks, MAX_TASKS } from './-lib/task-list'
 import type { TaskStatusFilter, TaskTypeFilter } from './-lib/task-list'
 import { getTaskPipelineGroups } from './-lib/task-pipeline'
 
@@ -97,6 +97,11 @@ function TasksRoute() {
   const tasksQuery = useQuery({
     queryFn: () => fetchTasks(taskType, statusFilter),
     queryKey: ['tasks', identityScopeKey, taskType, statusFilter],
+    refetchInterval: 10_000,
+  })
+  const summaryQuery = useQuery({
+    queryFn: () => fetchTaskSummary(),
+    queryKey: ['tasks-summary', identityScopeKey],
     refetchInterval: 10_000,
   })
   const rawTasks = tasksQuery.data ?? []
@@ -489,7 +494,13 @@ function TasksRoute() {
     const running = rawRunning
     const pending = rawPending
 
-    const successRate = total > 0 ? (completed / total) * 100 : 100
+    const summary = summaryQuery.data
+    const successRate =
+      summary && summary.success_rate !== null && summary.success_rate !== undefined
+        ? summary.success_rate
+        : null
+    const summaryCompleted = summary?.completed ?? 0
+    const summaryFailed = summary?.failed ?? 0
 
     const durations = allTasks
       .map((item) => {
@@ -578,12 +589,14 @@ function TasksRoute() {
       pending,
       failed,
       successRate,
+      summaryCompleted,
+      summaryFailed,
       avgDurationSec,
       topType,
       topCount,
       typeRows,
     }
-  }, [allTasks, t])
+  }, [allTasks, summaryQuery.data, t])
 
   return (
     <div className="flex w-full min-w-0 flex-col gap-4">
@@ -617,18 +630,24 @@ function TasksRoute() {
         <Card className="flex flex-col gap-1 p-3 shadow-none transition-colors hover:border-primary/40">
           <div className="flex items-center justify-between text-xs text-muted-foreground">
             <span className="font-medium">
-              {i18n.language.startsWith('zh') ? '任务成功率' : 'Success Rate'}
+              {i18n.language.startsWith('zh') ? '24小时成功率' : '24h Success Rate'}
             </span>
           </div>
           <div className="flex items-baseline gap-1">
             <span className="font-mono text-xl font-bold tabular-nums text-foreground">
-              {kpiData.successRate.toFixed(1)}%
+              {kpiData.successRate === null
+                ? '—'
+                : `${kpiData.successRate.toFixed(1)}%`}
             </span>
           </div>
           <p className="text-[11px] text-muted-foreground truncate">
             {i18n.language.startsWith('zh')
-              ? `共 ${kpiData.total} 条任务 (${kpiData.failed} 异常)`
-              : `Total ${kpiData.total} (${kpiData.failed} Failed)`}
+              ? kpiData.successRate === null
+                ? '近 24 小时暂无已结束任务'
+                : `近 24 小时 ${kpiData.summaryCompleted} 成功 / ${kpiData.summaryFailed} 失败`
+              : kpiData.successRate === null
+                ? 'No terminal attempts in 24h'
+                : `24h ${kpiData.summaryCompleted} ok / ${kpiData.summaryFailed} failed`}
           </p>
         </Card>
 
@@ -655,7 +674,7 @@ function TasksRoute() {
         <Card className="flex flex-col gap-1 p-3 shadow-none transition-colors hover:border-primary/40">
           <div className="flex items-center justify-between text-xs text-muted-foreground">
             <span className="font-medium">
-              {i18n.language.startsWith('zh') ? '任务总数' : 'Total Tasks'}
+              {i18n.language.startsWith('zh') ? '列表条目' : 'List Entries'}
             </span>
           </div>
           <div className="flex items-baseline gap-1">

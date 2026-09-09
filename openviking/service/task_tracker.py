@@ -1040,6 +1040,63 @@ class TaskTracker:
         tasks.sort(key=lambda t: t.created_at, reverse=True)
         return tasks[:limit]
 
+    async def summarize_tasks(
+        self,
+        *,
+        account_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        include_internal: bool = False,
+        window_seconds: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Summarize terminal tasks in a trailing window for Studio KPIs.
+
+        Counts completed and failed attempts by ``updated_at`` within
+        ``window_seconds`` (default: TTL_COMPLETED / 24h), using the same owner
+        and internal-task visibility rules as :meth:`list_tasks`, but without
+        list limits or resource folding.
+        """
+        window = self.TTL_COMPLETED if window_seconds is None else int(window_seconds)
+        return await self._dispatcher.run(
+            lambda: self._summarize_tasks_on_owner(
+                account_id,
+                user_id,
+                include_internal,
+                window,
+            )
+        )
+
+    async def _summarize_tasks_on_owner(
+        self,
+        account_id: Optional[str],
+        user_id: Optional[str],
+        include_internal: bool,
+        window_seconds: int,
+    ) -> Dict[str, Any]:
+        if account_id is not None:
+            self._merge_loaded_tasks(await self._load_all_from_store(account_id, user_id))
+        now = time.time()
+        cutoff = now - max(window_seconds, 0)
+        completed = 0
+        failed = 0
+        for task in self._cache_snapshot():
+            if not self._matches_owner(task, account_id, user_id):
+                continue
+            if not include_internal and task.meta.get("internal") is True:
+                continue
+            if task.updated_at < cutoff:
+                continue
+            if task.status == TaskStatus.COMPLETED:
+                completed += 1
+            elif task.status == TaskStatus.FAILED:
+                failed += 1
+        eligible = completed + failed
+        return {
+            "window_seconds": window_seconds,
+            "completed": completed,
+            "failed": failed,
+            "success_rate": (completed / eligible * 100.0) if eligible else None,
+        }
+
     async def has_running(
         self,
         task_type: str,

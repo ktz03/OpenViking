@@ -827,3 +827,35 @@ async def test_feishu_response_checkpoint_survives_reload(tracker):
     restored = TaskTracker(store=tracker._store)
     record = await restored.get(task.task_id, **_owner_kwargs())
     assert record.meta["feishu_responses"] == {"nested/doc": "response-1"}
+
+
+async def test_summarize_tasks_uses_trailing_window_not_list_mix(tracker: TaskTracker):
+    """24h success rate ignores older retained failures and unfinished work (#4777)."""
+    recent_ok = await tracker.create("session_commit", resource_id="a", **_owner_kwargs())
+    recent_fail = await tracker.create("session_commit", resource_id="b", **_owner_kwargs())
+    old_fail = await tracker.create("session_commit", resource_id="c", **_owner_kwargs())
+    pending = await tracker.create("session_commit", resource_id="d", **_owner_kwargs())
+
+    await tracker.complete(recent_ok.task_id, {}, **_owner_kwargs())
+    await tracker.fail(recent_fail.task_id, "boom", **_owner_kwargs())
+    await tracker.fail(old_fail.task_id, "old", **_owner_kwargs())
+    # pending stays unfinished and must not affect the rate
+
+    tracker._tasks[old_fail.task_id].updated_at = time.time() - tracker.TTL_COMPLETED - 60
+
+    summary = await tracker.summarize_tasks(**_owner_kwargs())
+    assert summary["completed"] == 1
+    assert summary["failed"] == 1
+    assert summary["success_rate"] == 50.0
+    assert summary["window_seconds"] == tracker.TTL_COMPLETED
+    assert pending.status == TaskStatus.PENDING
+
+
+async def test_summarize_tasks_returns_no_rate_without_terminal_attempts(
+    tracker: TaskTracker,
+):
+    await tracker.create("session_commit", **_owner_kwargs())
+    summary = await tracker.summarize_tasks(**_owner_kwargs())
+    assert summary["completed"] == 0
+    assert summary["failed"] == 0
+    assert summary["success_rate"] is None

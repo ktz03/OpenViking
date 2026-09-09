@@ -25,6 +25,33 @@ from openviking_cli.exceptions import (
 router = APIRouter(prefix="/api/v1", tags=["tasks"])
 
 
+@router.get("/tasks/summary")
+async def summarize_tasks(
+    include_internal: bool = Query(False, description="Include internal Connector child tasks"),
+    window_seconds: Optional[int] = Query(
+        None,
+        ge=1,
+        description="Trailing window in seconds (default: 24h completed retention)",
+    ),
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Summarize terminal task outcomes in a trailing window for Studio KPIs."""
+    tracker = get_task_tracker()
+    if _ctx.role == Role.ROOT:
+        summary = await tracker.summarize_tasks(
+            include_internal=include_internal,
+            window_seconds=window_seconds,
+        )
+    else:
+        summary = await tracker.summarize_tasks(
+            account_id=_ctx.account_id,
+            user_id=_ctx.user.user_id,
+            include_internal=include_internal,
+            window_seconds=window_seconds,
+        )
+    return Response(status="ok", result=summary)
+
+
 @router.get("/tasks/{task_id}")
 async def get_task(
     task_id: str,

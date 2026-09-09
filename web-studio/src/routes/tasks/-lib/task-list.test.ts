@@ -1,14 +1,26 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { fetchTasks, getEffectiveTaskStatus, MAX_TASKS } from './task-list'
+import {
+  fetchTaskSummary,
+  fetchTasks,
+  getEffectiveTaskStatus,
+  MAX_TASKS,
+} from './task-list'
 
 const clientMocks = vi.hoisted(() => ({
   getTasks: vi.fn(),
+  clientGet: vi.fn(),
 }))
 
 vi.mock('#/lib/ov-client', () => ({
   getOvResult: async (value: unknown) => value,
   getTasks: clientMocks.getTasks,
+}))
+
+vi.mock('#/gen/ov-client/client.gen', () => ({
+  client: {
+    get: (...args: unknown[]) => clientMocks.clientGet(...args),
+  },
 }))
 
 beforeEach(() => {
@@ -88,5 +100,24 @@ describe('task list requests', () => {
     clientMocks.getTasks.mockRejectedValue(new Error('request failed'))
 
     await expect(fetchTasks('all', 'all')).rejects.toThrow('request failed')
+  })
+
+  it('loads the trailing-window success summary independently of the list', async () => {
+    clientMocks.clientGet.mockResolvedValue({
+      completed: 8,
+      failed: 2,
+      success_rate: 80,
+      window_seconds: 86_400,
+    })
+
+    await expect(fetchTaskSummary()).resolves.toEqual({
+      completed: 8,
+      failed: 2,
+      success_rate: 80,
+      window_seconds: 86_400,
+    })
+    expect(clientMocks.clientGet).toHaveBeenCalledWith({
+      url: '/api/v1/tasks/summary',
+    })
   })
 })

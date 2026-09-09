@@ -1,3 +1,4 @@
+import { client } from '#/gen/ov-client/client.gen'
 import { getOvResult, getTasks } from '#/lib/ov-client'
 import {
   normalizeTasks,
@@ -19,6 +20,13 @@ export type TaskTypeFilter =
   | 'all'
 
 export const MAX_TASKS = 200
+
+export type TaskSummary = {
+  window_seconds: number
+  completed: number
+  failed: number
+  success_rate: number | null
+}
 
 /** Prefer the API status; do not invent pending from a running-slot cap. */
 export function getEffectiveTaskStatus(
@@ -45,4 +53,21 @@ export async function fetchTasks(
     (left, right) =>
       Number(right.created_at || 0) - Number(left.created_at || 0),
   )
+}
+
+export async function fetchTaskSummary(): Promise<TaskSummary> {
+  const result = await getOvResult<TaskSummary>(
+    client.get({
+      url: '/api/v1/tasks/summary',
+    }),
+  )
+  return {
+    window_seconds: Number(result.window_seconds) || 86_400,
+    completed: Number(result.completed) || 0,
+    failed: Number(result.failed) || 0,
+    success_rate:
+      result.success_rate === null || result.success_rate === undefined
+        ? null
+        : Number(result.success_rate),
+  }
 }
