@@ -507,6 +507,69 @@ async def test_compile_api_client_session_protocol_retry_and_cancellation(monkey
 
 
 @pytest.mark.asyncio
+async def test_chat_proxy_strips_client_openviking_connection_in_dev_mode(monkeypatch):
+    """Dev/no-API-key proxy must not forward a browser-supplied connection.
+
+    The Bot gateway trusts loopback openviking_connection from this proxy, so
+    leaving a client-claimed identity intact would let Studio forge account/user
+    /actor_peer on the --with-bot path (#4650 trust-model follow-up).
+    """
+    forwarded = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = '{"session_id": "session-1", "message": "ok"}'
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"session_id": "session-1", "message": "ok"}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, json, headers, timeout):
+            forwarded["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(bot_router_module, "BOT_API_URL", "http://127.0.0.1:18790")
+    monkeypatch.setattr(bot_router_module, "BOT_API_KEY", "")
+    monkeypatch.setattr(bot_router_module, "_create_bot_proxy_client", lambda: FakeClient())
+
+    app = FastAPI()
+    app.state.config = SimpleNamespace(get_effective_auth_mode=lambda: AuthMode.DEV)
+    app.state.auth_plugin = DevAuthPlugin()
+    app.include_router(bot_router_module.router, prefix="/bot/v1")
+    transport = httpx.ASGITransport(app=app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.post(
+            "/bot/v1/chat",
+            json={
+                "message": "hello",
+                "openviking_connection": {
+                    "account_id": "forged-acct",
+                    "user_id": "forged-user",
+                    "actor_peer_id": "forged-peer",
+                    "agent_id": "forged-agent",
+                    "role": "root",
+                    "api_key_type": "root",
+                    "server_url": "http://evil.example",
+                },
+            },
+        )
+
+    assert response.status_code == 200
+    assert "openviking_connection" not in forwarded["json"]
+    assert forwarded["json"].get("user_id") == "default"
+
+
+@pytest.mark.asyncio
 async def test_chat_stream_proxy_preserves_sse_event_boundaries(monkeypatch):
     payload = (
         'data: {"event":"reasoning_delta","data":"thinking"}\n\n'
