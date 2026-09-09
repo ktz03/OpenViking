@@ -388,19 +388,39 @@ export function createMemoryOpenVikingContextEngine(params: {
       });
     },
 
-    // Capture still happens in afterTurn (host calls it per LLM call + on finalize);
-    // commitTurn only acknowledges the accepted turn so OpenClaw drains its outbox.
-    // ponytail: in-memory key set, not durable across restarts — the host outbox is.
-    async commitTurn({ advancementKey, sessionId }): Promise<{ status: "committed" | "duplicate" }> {
+    // OpenClaw >=2026.9.3 suppresses afterTurn when durable turn advancement is
+    // active and delivers the closed turn only via commitTurn({ messages, ... }).
+    // Persist those messages before acknowledging so the host can drain its outbox.
+    async commitTurn(commitParams): Promise<{ status: "committed" | "duplicate" }> {
+      const { advancementKey, sessionId, messages, isHeartbeat } = commitParams;
       if (committedTurnKeys.has(advancementKey)) {
         diag("commitTurn_duplicate", sessionId, { advancementKey });
         return { status: "duplicate" };
       }
+
+      await afterTurnOpenVikingSession({
+        sessionId,
+        sessionKey: resolveSessionKey(commitParams),
+        messages: messages ?? [],
+        // messages is already the closed-turn range from the transcript anchors.
+        prePromptMessageCount: 0,
+        isHeartbeat,
+        tokenBudget: 128_000,
+        runtimeContext: undefined,
+        cfg,
+        getClient,
+        logger,
+        resolveAgentId,
+        rememberSessionAgentId,
+        isBypassedSession,
+        diag,
+      });
+
       committedTurnKeys.add(advancementKey);
       if (committedTurnKeys.size > 1024) {
         committedTurnKeys.delete(committedTurnKeys.values().next().value as string);
       }
-      diag("commitTurn", sessionId, { advancementKey });
+      diag("commitTurn", sessionId, { advancementKey, messageCount: (messages ?? []).length });
       return { status: "committed" };
     },
 
