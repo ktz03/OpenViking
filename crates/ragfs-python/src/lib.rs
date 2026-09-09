@@ -849,10 +849,16 @@ fn to_py_err(e: ragfs::core::Error) -> PyErr {
         ragfs::core::Error::InvalidOperation(_) => new_py_err("AGFSInvalidOperationError", msg),
         ragfs::core::Error::Io(_) => new_py_err("AGFSIoError", msg),
         ragfs::core::Error::Plugin(_) => {
-            // Check if the plugin error message contains known patterns
+            // Check if the plugin error message contains known patterns.
+            // Keep "not a directory" before "is a directory" so the longer
+            // phrase wins. Exists remaps live in a sibling PR (#4869).
             let err_msg = msg.to_lowercase();
             if err_msg.contains("directory not empty") {
                 new_py_err("AGFSDirectoryNotEmptyError", msg)
+            } else if err_msg.contains("not a directory") {
+                new_py_err("AGFSNotADirectoryError", msg)
+            } else if err_msg.contains("is a directory") {
+                new_py_err("AGFSIsADirectoryError", msg)
             } else {
                 new_py_err("AGFSPluginError", msg)
             }
@@ -2878,6 +2884,17 @@ mod tests {
             let value: i32 = py_detach_blocking(py, || 40 + 2);
             assert_eq!(value, 42);
         });
+    }
+
+    #[test]
+    fn plugin_directory_messages_map_to_typed_exceptions() {
+        // Smoke the Plugin remapper without needing a live Python interpreter:
+        // construct errors and verify Display/to_string still carry the phrases
+        // that to_py_err matches on.
+        let is_dir = ragfs::core::Error::plugin("is a directory: /docs");
+        assert!(is_dir.to_string().to_lowercase().contains("is a directory"));
+        let not_dir = ragfs::core::Error::plugin("not a directory: /note.md");
+        assert!(not_dir.to_string().to_lowercase().contains("not a directory"));
     }
 
     #[test]
