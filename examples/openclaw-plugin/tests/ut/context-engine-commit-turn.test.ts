@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const afterTurnOpenVikingSession = vi.fn().mockResolvedValue(undefined);
+const { afterTurnOpenVikingSession } = vi.hoisted(() => ({
+  afterTurnOpenVikingSession: vi.fn().mockResolvedValue(undefined),
+}));
 
 vi.mock("../../services/context-lifecycle-service.js", async () => {
   const actual = await vi.importActual<typeof import("../../services/context-lifecycle-service.js")>(
