@@ -872,6 +872,31 @@ impl LocalFileSystem {
             base_path.join(relative)
         }
     }
+
+    /// Map create/mkdir races to `AlreadyExists` instead of a generic plugin error.
+    ///
+    /// Concurrent callers can lose the `exists()` check and still hit EEXIST.
+    /// Some hosts surface that as `ErrorKind::Other` with a "File exists" message
+    /// (see #4018), which previously leaked as `AGFSPluginError` and broke
+    /// idempotent TaskStore directory init. Same classification spirit as #4772.
+    fn map_create_exists_error(path: &str, error: std::io::Error, what: &str) -> Error {
+        if Self::is_already_exists_io(&error) {
+            return Error::AlreadyExists(path.to_string());
+        }
+        Error::plugin(format!("failed to create {what}: {error}"))
+    }
+
+    fn is_already_exists_io(error: &std::io::Error) -> bool {
+        if error.kind() == ErrorKind::AlreadyExists {
+            return true;
+        }
+        // Unix EEXIST=17; Windows ERROR_ALREADY_EXISTS=183 / ERROR_FILE_EXISTS=80.
+        matches!(error.raw_os_error(), Some(17 | 80 | 183))
+            || {
+                let message = error.to_string().to_ascii_lowercase();
+                message.contains("file exists") || message.contains("already exists")
+            }
+    }
 }
 
 #[async_trait]
@@ -891,9 +916,12 @@ impl FileSystem for LocalFileSystem {
             }
         }
 
-        // Create empty file
-        fs::File::create(&local_path)
-            .map_err(|e| Error::plugin(format!("failed to create file: {}", e)))?;
+        // create_new avoids truncating a loser of the exists()-check race.
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&local_path)
+            .map_err(|e| Self::map_create_exists_error(path, e, "file"))?;
 
         Ok(())
     }
@@ -915,10 +943,7 @@ impl FileSystem for LocalFileSystem {
 
         match fs::create_dir(&local_path) {
             Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
-                Err(Error::AlreadyExists(path.to_string()))
-            }
-            Err(e) => Err(Error::plugin(format!("failed to create directory: {}", e))),
+            Err(e) => Err(Self::map_create_exists_error(path, e, "directory")),
         }
     }
 
@@ -1496,6 +1521,43 @@ mod tests {
 
         let err = fs.read_internal_dir("/local/note.md").await.unwrap_err();
         assert!(matches!(err, Error::NotADirectory(_)));
+    }
+
+    #[tokio::test]
+    async fn test_localfs_mkdir_race_maps_to_already_exists() {
+        let (_dir, fs) = fallback_localfs();
+        fs.mkdir("/tasks", 0o755).await.unwrap();
+
+        let err = fs.mkdir("/tasks", 0o755).await.unwrap_err();
+        assert!(
+            matches!(err, Error::AlreadyExists(_)),
+            "expected AlreadyExists, got {err:?}"
+        );
+
+        // Simulate hosts that report EEXIST as ErrorKind::Other ("File exists").
+        let mapped = LocalFileSystem::map_create_exists_error(
+            "/tasks",
+            std::io::Error::new(ErrorKind::Other, "File exists (os error 17)"),
+            "directory",
+        );
+        assert!(matches!(mapped, Error::AlreadyExists(_)));
+    }
+
+    #[tokio::test]
+    async fn test_localfs_create_race_maps_to_already_exists_without_truncate() {
+        let (_dir, fs) = fallback_localfs();
+        fs.write("/note.md", b"keep-me", 0, WriteFlag::Create)
+            .await
+            .unwrap();
+
+        let err = fs.create("/note.md").await.unwrap_err();
+        assert!(
+            matches!(err, Error::AlreadyExists(_)),
+            "expected AlreadyExists, got {err:?}"
+        );
+
+        let content = fs.read("/note.md", 0, 0).await.unwrap();
+        assert_eq!(content, b"keep-me");
     }
 
     #[tokio::test]
