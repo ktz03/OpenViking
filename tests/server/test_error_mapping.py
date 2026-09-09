@@ -8,6 +8,7 @@ from openviking.pyagfs.exceptions import (
     AGFSHTTPError,
     AGFSIsADirectoryError,
     AGFSNotSupportedError,
+    AGFSPluginError,
     AGFSResourceExhaustedError,
     GitConcurrentCommitError,
 )
@@ -15,6 +16,7 @@ from openviking.server.error_mapping import map_exception
 from openviking.server.models import ERROR_CODE_TO_HTTP_STATUS
 from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
 from openviking_cli.exceptions import (
+    ConflictError,
     FailedPreconditionError,
     InvalidArgumentError,
     InvalidURIError,
@@ -89,6 +91,32 @@ def test_agfs_is_directory_maps_to_structured_invalid_argument():
         "expected": "file",
         "actual": "directory",
     }
+
+
+def test_agfs_plugin_is_directory_message_maps_before_unavailable():
+    mapped = map_exception(
+        AGFSPluginError("is a directory: /docs"),
+        resource="viking://resources/docs",
+        resource_type="file",
+    )
+
+    assert isinstance(mapped, InvalidArgumentError)
+    assert mapped.code == "INVALID_ARGUMENT"
+    assert mapped.details == {
+        "resource": "viking://resources/docs",
+        "expected": "file",
+        "actual": "directory",
+    }
+
+
+def test_agfs_plugin_already_exists_message_maps_to_conflict():
+    mapped = map_exception(
+        AGFSPluginError("failed to create directory: File exists (os error 17)"),
+        resource="viking://user/default/tasks",
+    )
+
+    assert isinstance(mapped, ConflictError)
+    assert mapped.code == "CONFLICT"
 
 
 def test_agfs_not_supported_maps_to_unimplemented():

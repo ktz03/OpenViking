@@ -521,6 +521,9 @@ def map_exception(
         return ResourceExhaustedError(str(exc), details=_resource_details(resource))
     if isinstance(exc, AGFSInvalidOperationError):
         return InvalidArgumentError(str(exc), details=_resource_details(resource))
+
+    # Opaque plugin/IO errors often still carry typed phrases from older backends.
+    # Remap those before collapsing the whole class into Unavailable (#4772 follow-up).
     if isinstance(
         exc,
         (
@@ -533,7 +536,19 @@ def map_exception(
             AGFSSerializationError,
         ),
     ):
-        return UnavailableError("storage backend", reason=str(exc))
+        message = str(exc)
+        lowered = message.lower()
+        if "not a directory" in lowered:
+            return FailedPreconditionError(message, details=_resource_details(resource))
+        if "is a directory" in lowered:
+            return InvalidArgumentError(message, details=_file_directory_details(resource))
+        if "directory not empty" in lowered:
+            return FailedPreconditionError(message, details=_resource_details(resource))
+        if "file exists" in lowered or "already exists" in lowered:
+            return ConflictError(message, resource=resource)
+        if "permission denied" in lowered:
+            return PermissionDeniedError(message, resource=resource)
+        return UnavailableError("storage backend", reason=message)
     if isinstance(exc, AGFSClientError):
         message = str(exc)
         if is_not_found_error(exc):
@@ -544,7 +559,7 @@ def map_exception(
         if "not a directory" in lowered:
             return FailedPreconditionError(message, details=_resource_details(resource))
         if "is a directory" in lowered:
-            return InvalidArgumentError(message, details=_resource_details(resource))
+            return InvalidArgumentError(message, details=_file_directory_details(resource))
         if "directory not empty" in lowered:
             return FailedPreconditionError(message, details=_resource_details(resource))
         if "permission denied" in lowered:
