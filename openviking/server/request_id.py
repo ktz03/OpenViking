@@ -17,7 +17,9 @@ from openviking_cli.utils.logger import bind_log_request_id
 
 REQUEST_ID_HEADER = "X-Request-ID"
 _REQUEST_ID_HEADER_BYTES = b"x-request-id"
-_REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+# Allow '/' so gateway/tunnel trace ids like OpenAI Secure MCP Tunnel
+# (`<uuid>/<suffix>`) are accepted instead of failing the request (#4830).
+_REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._:/-]{1,128}")
 _IGNORED_COMPLETION_ROUTES = frozenset({"/health", "/ready", "/metrics"})
 
 _completion_logger = logging.getLogger("openviking.observability.http")
@@ -88,7 +90,7 @@ class RequestIdMiddleware:
                                 "code": "INVALID_ARGUMENT",
                                 "message": (
                                     "X-Request-ID must be supplied once and contain 1-128 "
-                                    "characters from [A-Za-z0-9._:-]"
+                                    "characters from [A-Za-z0-9._:/-]"
                                 ),
                             },
                         },

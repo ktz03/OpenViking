@@ -81,6 +81,21 @@ async def test_client_request_id_is_returned_and_reused_by_observability() -> No
     assert response.json()["observability_request_id"] == "resource-import-20260728-001"
 
 
+async def test_slash_separated_tunnel_request_id_is_accepted() -> None:
+    """OpenAI Secure MCP Tunnel forwards X-Request-Id as ``<uuid>/<suffix>`` (#4830)."""
+    app = _make_test_app()
+    tunnel_id = "4257d51f-61c7-49d4-b78d-773e19a2c461/g6hr"
+
+    @app.get("/mcp")
+    async def mcp():
+        return {"ok": True}
+
+    response = await _request(app, "/mcp", headers={REQUEST_ID_HEADER: tunnel_id})
+
+    assert response.status_code == 200
+    assert response.headers[REQUEST_ID_HEADER] == tunnel_id
+
+
 async def test_missing_request_id_generates_uuid_for_health_and_cors_exposes_it() -> None:
     app = _make_test_app()
 
