@@ -909,6 +909,19 @@ class OpenAPIChannel(BaseChannel):
             rebuilt["agent_id"] = agent_id
             return OpenVikingConnection(**rebuilt)
 
+        # Keyless forwards are only valid for trusted/dev upstreams. In api_key
+        # mode, unauthenticated /health still returns 200 with auth_mode and no
+        # resolved identity, so claimed account/user/role must not be accepted
+        # without a real API key (Web Studio review on #4866).
+        if auth_mode not in {"trusted", "dev"}:
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "OpenViking API key required on forwarded connection "
+                    f"when upstream auth_mode is {auth_mode or 'unknown'}"
+                ),
+            )
+
         # Trusted / DEV forwards may omit api_key; keep proxy-asserted identity
         # but never honor a client-chosen upstream URL.
         values["server_url"] = self._ov_server_url()
