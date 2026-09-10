@@ -476,7 +476,7 @@ class LiteLLMVLMProvider(VLMBase):
         kwargs = self._build_text_kwargs(
             prompt, thinking, tools, tool_choice, messages, max_tokens=max_tokens
         )
-        # 鐢?tracer.info 鎵撳嵃璇锋眰锛堜汉绫诲彲璇绘牸寮忥級
+        # 用 tracer.info 打印请求（人类可读格式）
         tracer.info(
             "llm_input_messages="
             + format_messages(redact_image_data_urls(kwargs.get("messages", [])))

@@ -378,7 +378,7 @@ class OpenAIVLM(VLMBase):
                 return self._build_vlm_response(response, has_tools=True)
             return await self._extract_completion_content_async(response, elapsed)
 
-        # 鐢?tracer.info 鎵撳嵃璇锋眰锛堜汉绫诲彲璇绘牸寮忥級
+        # 用 tracer.info 打印请求（人类可读格式）
         tracer.info(
             "llm_input_messages="
             + format_messages(redact_image_data_urls(kwargs.get("messages", [])))
