@@ -47,6 +47,7 @@ jobs:
             examples/codex-memory-plugin/scripts/session-state.test.mjs \
             examples/codex-memory-plugin/scripts/config.test.mjs \
             examples/claude-code-memory-plugin/scripts/auto-capture.test.mjs \
+            examples/claude-code-memory-plugin/scripts/auto-recall-filters.test.mjs \
             examples/claude-code-memory-plugin/scripts/config.test.mjs \
             examples/claude-code-memory-plugin/scripts/marketplace.test.mjs \
             examples/claude-code-memory-plugin/scripts/skill-experience.test.mjs \
@@ -83,6 +84,7 @@ jobs:
             examples/memory-plugin-shared/plugin-known-keys.test.mjs \
             examples/memory-plugin-shared/uri-guard.test.mjs \
             examples/memory-plugin-shared/capture-utils.test.mjs \
+            examples/memory-plugin-shared/input-filters.test.mjs \
             examples/dsh-memory-plugin/*.test.mjs \
             examples/opencode-plugin/tests/*.test.mjs \
             examples/opencode-plugin/servers/mcp-proxy.test.mjs \

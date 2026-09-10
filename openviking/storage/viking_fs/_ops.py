@@ -995,15 +995,20 @@ class _OpsMixin:
         return resolved
 
     async def stat(
-        self, uri: str, ctx: Optional[RequestContext] = None, skip_count: bool = False
+        self,
+        uri: str,
+        ctx: Optional[RequestContext] = None,
+        skip_count: bool = False,
+        include_lock_status: bool = False,
     ) -> Dict[str, Any]:
         """
         File/directory information.
 
-        example: {'name': 'resources', 'size': 128, 'mode': 2147484141, 'modTime': '2026-02-10T21:26:02.934376379+08:00', 'isDir': True, 'isLocked': False, 'count': 42, 'meta': {'Name': 'localfs', 'Type': 'local', 'Content': {'local_path': '...'}}}
+        example: {'name': 'resources', 'size': 128, 'mode': 2147484141, 'modTime': '2026-02-10T21:26:02.934376379+08:00', 'isDir': True, 'count': 42, 'meta': {'Name': 'localfs', 'Type': 'local', 'Content': {'local_path': '...'}}}
 
         Extra fields:
-            isLocked (bool): Whether the path is currently held by a path lock
+            isLocked (bool): When ``include_lock_status`` is True, whether the
+                path is currently held by a path lock
                 (either the path itself or any ancestor directory). Returns
                 False when the pathlock system is not enabled or the lookup
                 fails.
@@ -1023,6 +1028,9 @@ class _OpsMixin:
             skip_count: If True, skip the vector_store.count() call for directories.
                 Use this when the count field is not needed (e.g. in grep) to avoid
                 an extra VikingDB API call.
+            include_lock_status: If True, include ``isLocked`` in the result.
+                Leave disabled for internal metadata checks to avoid the extra
+                PathLock filesystem lookup.
         """
         real_ctx = self._ctx_or_default(ctx)
         uri = await self.resolve_uri(uri, real_ctx)
@@ -1045,18 +1053,21 @@ class _OpsMixin:
         else:
             if self._is_session_root_uri(uri):
                 now = datetime.now(timezone.utc).isoformat()
-                return {
+                result = {
                     "name": "session",
                     "size": 0,
                     "mode": 0o755,
                     "modTime": now,
                     "isDir": True,
-                    "isLocked": False,
                 }
+                if include_lock_status:
+                    result["isLocked"] = False
+                return result
             raise NotFoundError(uri, "file") from last_not_found
         if isinstance(result, dict):
             result["uri"] = uri
-            result["isLocked"] = await self._is_path_locked_async(path)
+            if include_lock_status:
+                result["isLocked"] = await self._is_path_locked_async(path)
             # Add deterministic vector record id for files (level 2).
             # This matches the ID used in VikingDB so callers can cross-reference
             # vector records without an extra lookup.
@@ -1967,15 +1978,35 @@ class _OpsMixin:
                     "access": "denied",
                 }
             else:
-                new_entry = dict(entry)
+                new_entry = self._normalize_ls_entry(dict(entry))
                 new_entry["uri"] = entry_uri
-            if entry.get("isDir"):
+            if new_entry.get("isDir"):
                 all_entries.append(new_entry)
             elif not name.startswith("."):
                 all_entries.append(new_entry)
             elif show_all_hidden:
                 all_entries.append(new_entry)
         return all_entries
+
+    @staticmethod
+    def _normalize_ls_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+        """Fill synthetic metadata for virtual directory rows (#4859).
+
+        S3/TOS CommonPrefixes under ``directory_marker_mode=none`` may omit
+        ``modTime`` / ``size``. Keep those rows listable instead of letting
+        downstream WebDAV/CLI paths treat them as incomplete and drop them.
+        """
+        is_dir = bool(entry.get("isDir", False))
+        mode = entry.get("mode")
+        # Some backends omit isDir but still advertise a directory mode bit.
+        if not is_dir and isinstance(mode, int) and (mode & 0o170000) == 0o040000:
+            is_dir = True
+            entry["isDir"] = True
+        if is_dir:
+            entry.setdefault("size", 0)
+            if not entry.get("modTime") and entry.get("mtime") is None:
+                entry["modTime"] = format_iso8601(datetime.now(timezone.utc))
+        return entry
 
     async def _ls_browsable_items(
         self,

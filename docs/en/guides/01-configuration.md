@@ -646,7 +646,7 @@ Vision Language Model for semantic extraction (L0/L1 generation).
 | `timeout` | float | Per-request HTTP timeout in seconds passed to the underlying OpenAI/LiteLLM client. Increase for slow endpoints (e.g., DashScope, local inference). Must be `> 0` (default: `600.0`) |
 | `extra_headers` | object | Custom HTTP headers for compatible HTTP providers. `kimi` also accepts header overrides, but already injects the required subscription headers by default |
 | `extra_request_body` | object | Extra JSON body fields for OpenAI-compatible completion requests, useful for provider-specific options such as Ollama `{"think": false}` |
-| `reasoning_effort` | str | Reasoning effort for OpenAI Codex Responses requests. Leave unset to use the model default |
+| `reasoning_effort` | str | Reasoning effort for `openai`, `azure`, `kimi`, `glm`, and `openai-codex`; explicit values are forwarded, and accepted values depend on the model. When unset, GPT-5/o-series names retain `low`; other models omit the field. For Chat Completions, `extra_request_body.reasoning_effort` takes precedence |
 | `media` | object | Audio/video runtime controls. Media understanding reuses this VLM's provider, model, credentials, client, timeout, retry, headers, output-token limit, failover, and token accounting |
 | `media.enabled` | bool | Enable audio/video understanding (default: `false`) |
 | `media.max_concurrent` | int | Maximum concurrent audio/video calls (default: `2`) |
@@ -1470,7 +1470,7 @@ Supports cloud-deployed VikingDB on Volcengine
 
 ##### ACL schema
 
-ACL data exists only in the context collection. In addition to `acl_mode: string` (`none` or `inherit`), add these scalar-indexed `list<string>` fields:
+ACL data exists only in the context collection. In addition to `acl_mode: string` (`none`, `inherit`, or `restricted`), add these scalar-indexed `list<string>` fields:
 
 ```text
 acl_direct_grants

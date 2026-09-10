@@ -296,8 +296,11 @@ enum AclCommands {
     },
     Set {
         uri: String,
-        #[arg(long = "entry", required = true)]
+        #[arg(long = "entry")]
         entries: Vec<String>,
+        /// Whether this node uses inherited grants or direct grants only
+        #[arg(long, value_parser = ["inherit", "restricted"])]
+        acl_mode: Option<String>,
     },
     Grant {
         uri: String,
@@ -1164,27 +1167,12 @@ enum Commands {
         /// Skill directory or SKILL.md Viking URI
         #[arg(long, value_name = "uri")]
         skill: String,
-        /// Description of this organization task
+        /// Additional instructions for this Compile task
         #[arg(long, value_name = "text")]
-        reason: Option<String>,
-        /// Wait for the Compile task to finish
-        #[arg(long)]
-        wait: bool,
-        /// Local wait timeout in seconds; does not cancel the task
-        #[arg(
-            long,
-            requires = "wait",
-            value_parser = config::parse_positive_timeout,
-            value_name = "seconds"
-        )]
-        timeout: Option<f64>,
-        /// Server-side runtime limit in seconds; reaching it saves partial resource output
-        #[arg(
-            long = "runtime-timeout",
-            value_parser = config::parse_positive_timeout,
-            value_name = "seconds"
-        )]
-        runtime_timeout: Option<f64>,
+        instruction: Option<String>,
+        /// Provider arguments as a JSON object
+        #[arg(long, value_name = "json")]
+        args: Option<String>,
     },
 
     // --- Status & Observability ---
@@ -3675,10 +3663,8 @@ async fn main() {
             from_uris,
             to,
             skill,
-            reason,
-            wait,
-            timeout,
-            runtime_timeout,
+            instruction,
+            args,
         } => {
             let client = ctx.get_client();
             commands::compile::run(
@@ -3686,10 +3672,8 @@ async fn main() {
                 from_uris,
                 to,
                 skill,
-                reason,
-                wait,
-                timeout,
-                runtime_timeout,
+                instruction,
+                args,
                 ctx.output_format,
                 ctx.compact,
             )
@@ -4131,29 +4115,24 @@ mod tests {
             "viking://resources/wiki",
             "--skill",
             "viking://agent/skills/wiki",
-            "--wait",
-            "--timeout",
-            "10",
-            "--runtime-timeout",
-            "86400",
+            "--instruction",
+            "Keep supporting evidence.",
+            "--args",
+            r#"{"model_name":"endpoint-1"}"#,
         ])
         .expect("compile flags should parse");
         match cli.command {
             Commands::Compile {
                 from_uris,
                 skill,
-                reason,
-                wait,
-                timeout,
-                runtime_timeout,
+                instruction,
+                args,
                 ..
             } => {
                 assert_eq!(from_uris.len(), 3);
                 assert_eq!(skill, "viking://agent/skills/wiki");
-                assert!(reason.is_none());
-                assert!(wait);
-                assert_eq!(timeout, Some(10.0));
-                assert_eq!(runtime_timeout, Some(86_400.0));
+                assert_eq!(instruction.as_deref(), Some("Keep supporting evidence."));
+                assert_eq!(args.as_deref(), Some(r#"{"model_name":"endpoint-1"}"#));
             }
             _ => panic!("expected compile command"),
         }
@@ -4166,21 +4145,6 @@ mod tests {
                 "viking://resources/a",
                 "--to",
                 "viking://resources/wiki",
-            ])
-            .is_err()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "ov",
-                "compile",
-                "--from",
-                "viking://resources/a",
-                "--to",
-                "viking://resources/wiki",
-                "--skill",
-                "viking://agent/skills/wiki",
-                "--timeout",
-                "10",
             ])
             .is_err()
         );
@@ -5059,18 +5023,6 @@ mod tests {
                 "viking://resources/item",
                 "--content",
                 "value",
-                "--timeout",
-            ],
-            vec![
-                "ov",
-                "compile",
-                "--from",
-                "viking://resources/source",
-                "--to",
-                "viking://resources/target",
-                "--skill",
-                "viking://user/skills/compiler",
-                "--wait",
                 "--timeout",
             ],
             vec!["ov", "wait", "--timeout"],
