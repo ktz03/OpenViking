@@ -7,7 +7,8 @@ Provides file system operations: ls, mkdir, rm, mv, tree, stat, read, abstract, 
 """
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from collections.abc import Coroutine
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional
 
 from openviking.core.context import ContextLevel
 from openviking.core.namespace import classify_uri, context_type_for_uri, uri_leaf_name
@@ -22,10 +23,11 @@ from openviking.server.identity import RequestContext
 from openviking.session.memory.memory_updater import MemoryUpdater
 from openviking.session.memory.utils.content_visibility import visible_content
 from openviking.storage.abstract_overview import (
+    mark_abstract_overview_pending,
     plan_abstract_overview_refresh,
     render_abstract_overview,
 )
-from openviking.storage.acl import CreatorAclGrant
+from openviking.storage.acl import AclAction, AclMode, CreatorAclGrant
 from openviking.storage.content_write import ContentWriteCoordinator
 from openviking.storage.expr import And, Eq, In, Or
 from openviking.storage.queuefs import SemanticMsg, get_queue_manager
@@ -176,6 +178,52 @@ class FSService:
             result_entries.append(entry)
         return result_entries
 
+    async def _collect_tagged_page(
+        self,
+        fetch_page: Callable[[int, Optional[int]], Awaitable[List[Dict[str, Any]]]],
+        ctx: RequestContext,
+        tags: List[str],
+        include_tags: bool,
+        offset: int,
+        node_limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Collect a visible page after tag filtering.
+
+        Args:
+            fetch_page: Loads one pre-tag page by offset and limit.
+            ctx: Request identity used for tag lookup.
+            tags: Required retrieval tags.
+            include_tags: Whether to retain tags in returned entries.
+            offset: Number of matched entries to skip.
+            node_limit: Maximum matched entries to return.
+
+        Returns:
+            The requested page of tag-filtered entries.
+        """
+        if node_limit <= 0:
+            entries = await fetch_page(0, None)
+            entries = await self._attach_and_filter_tags(entries, ctx, tags, include_tags)
+            return entries[offset:]
+
+        batch_size = max(node_limit, 256)
+        source_offset = 0
+        remaining_offset = offset
+        result: List[Dict[str, Any]] = []
+        while len(result) < node_limit:
+            entries = await fetch_page(source_offset, batch_size)
+            filtered = await self._attach_and_filter_tags(entries, ctx, tags, include_tags)
+            if remaining_offset >= len(filtered):
+                remaining_offset -= len(filtered)
+            else:
+                result.extend(
+                    filtered[remaining_offset : remaining_offset + node_limit - len(result)]
+                )
+                remaining_offset = 0
+            if len(entries) < batch_size:
+                break
+            source_offset += len(entries)
+        return result
+
     async def ls(
         self,
         uri: str,
@@ -192,6 +240,7 @@ class FSService:
         extra_fields: Optional[List[str]] = None,
         tags: Optional[List[str]] = None,
         include_tags: bool = False,
+        offset: int = 0,
     ) -> List[Any]:
         """List directory contents.
 
@@ -209,63 +258,62 @@ class FSService:
         """
         viking_fs = self._ensure_initialized()
         extra_fields = extra_fields or []
-
         use_simple_paths = simple and not extra_fields
 
-        if use_simple_paths:
-            # Only return URIs — skip expensive abstract fetching to save tokens
+        async def fetch_page(page_offset: int, page_limit: Optional[int]) -> List[Dict[str, Any]]:
+            """Fetch and return one pre-tag page."""
             if recursive:
-                entries = await viking_fs.tree(
+                return await viking_fs.tree(
                     uri,
                     ctx=ctx,
-                    output="original",
+                    output="original" if tags or use_simple_paths else output,
+                    abs_limit=abs_limit,
                     show_all_hidden=show_all_hidden,
-                    node_limit=None if tags else node_limit,
+                    node_limit=page_limit,
                     level_limit=level_limit,
-                )
-            else:
-                entries = await viking_fs.ls(
-                    uri,
-                    ctx=ctx,
-                    output="original",
-                    show_all_hidden=show_all_hidden,
-                    node_limit=None if tags else node_limit,
+                    offset=page_offset,
                     sort_by=sort_by,
                     sort_order=sort_order,
+                    extra_fields=None if tags or use_simple_paths else extra_fields,
                 )
-            entries = await self._attach_and_filter_tags(entries, ctx, tags, include_tags=False)
-            if tags and node_limit > 0:
-                entries = entries[:node_limit]
-            return [e.get("uri", "") for e in entries]
-
-        if recursive:
-            entries = await viking_fs.tree(
+            return await viking_fs.ls(
                 uri,
                 ctx=ctx,
-                output=output,
+                output="original" if tags or use_simple_paths else output,
                 abs_limit=abs_limit,
                 show_all_hidden=show_all_hidden,
-                node_limit=None if tags else node_limit,
-                level_limit=level_limit,
-                extra_fields=extra_fields,
-            )
-        else:
-            entries = await viking_fs.ls(
-                uri,
-                ctx=ctx,
-                output=output,
-                abs_limit=abs_limit,
-                show_all_hidden=show_all_hidden,
-                node_limit=None if tags else node_limit,
+                node_limit=page_limit,
+                offset=page_offset,
                 sort_by=sort_by,
                 sort_order=sort_order,
-                extra_fields=extra_fields,
+                extra_fields=None if tags or use_simple_paths else extra_fields,
             )
-        entries = await self._attach_and_filter_tags(
-            entries, ctx, tags, include_tags or bool(tags) or "tags" in extra_fields
-        )
-        if tags and node_limit > 0:
-            entries = entries[:node_limit]
+
+        if tags:
+            entries = await self._collect_tagged_page(
+                fetch_page,
+                ctx,
+                tags,
+                False if use_simple_paths else include_tags or bool(tags) or "tags" in extra_fields,
+                offset,
+                node_limit,
+            )
+        else:
+            entries = await fetch_page(offset, node_limit)
+            entries = await self._attach_and_filter_tags(
+                entries, ctx, None, include_tags or "tags" in extra_fields
+            )
+        if use_simple_paths:
+            return [entry.get("uri", "") for entry in entries]
+        if tags and (output != "original" or extra_fields):
+            return await viking_fs._finalize_listing_entries(
+                entries,
+                output,
+                abs_limit,
+                extra_fields,
+                recursive,
+                ctx=ctx,
+            )
         return entries
 
     async def mkdir(
@@ -313,9 +361,7 @@ class FSService:
             overview="",
             context_type=context_type_for_uri(directory_uri),
             ctx=ctx,
-            creator_acl_grant=(
-                CreatorAclGrant.DIRECT if not directory_preexisting else None
-            ),
+            creator_acl_grant=(CreatorAclGrant.DIRECT if not directory_preexisting else None),
             include_overview=False,
         )
 
@@ -529,6 +575,62 @@ class FSService:
             raise
         return decision.action
 
+    async def _enqueue_copy_refresh(
+        self,
+        *,
+        root_uri: str,
+        source_uri: str,
+        copied_uri: str,
+        context_type: str,
+        ctx: RequestContext,
+        change_kind: Literal["added", "deleted"] = "added",
+    ) -> str:
+        """Queue a parent-only semantic refresh after a committed transfer."""
+        await mark_abstract_overview_pending(
+            viking_fs=self._viking_fs,
+            dir_uri=root_uri,
+            changed_entries=1,
+            ctx=ctx,
+        )
+        try:
+            queue_manager = get_queue_manager()
+        except RuntimeError as exc:
+            logger.warning("QueueManager not available, skipping copy refresh: %s", exc)
+            return "skipped"
+
+        semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
+        telemetry_id = get_current_telemetry().telemetry_id
+        msg = SemanticMsg(
+            uri=root_uri,
+            context_type=context_type,
+            recursive=False,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            peer_id=ctx.user.user_id,
+            role=str(ctx.role),
+            skip_vectorization=False,
+            telemetry_id=telemetry_id,
+            coalesce_key=build_semantic_coalesce_key(
+                context_type=context_type,
+                uri=root_uri,
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+                peer_id=ctx.user.user_id,
+            ),
+            changes={change_kind: [copied_uri]},
+            generation_trigger="content_copy",
+            copy_source_uri=source_uri,
+        )
+        if telemetry_id:
+            get_request_wait_tracker().register_semantic_root(telemetry_id, msg.id)
+        try:
+            await semantic_queue.enqueue(msg)
+        except Exception as exc:
+            if telemetry_id:
+                get_request_wait_tracker().mark_semantic_failed(telemetry_id, msg.id, str(exc))
+            raise
+        return "queued"
+
     async def _wait_for_refresh(self, *, timeout: Optional[float]) -> Dict[str, Any]:
         telemetry_id = get_current_telemetry().telemetry_id
         if telemetry_id:
@@ -544,31 +646,119 @@ class FSService:
         except TimeoutError as exc:
             raise DeadlineExceededError("queue processing", timeout) from exc
 
+    async def cp(
+        self,
+        from_uri: str,
+        to_uri: str,
+        recursive: bool,
+        ctx: RequestContext,
+    ) -> Dict[str, Any]:
+        """Copy a resource without exposing a cancellable partial transaction."""
+        from_uri = VikingFS._normalize_transfer_uri(from_uri)
+        to_uri = VikingFS._normalize_transfer_uri(to_uri)
+        return await self._finish_transfer_after_caller_cancel(
+            self._cp_and_refresh(from_uri, to_uri, recursive=recursive, ctx=ctx),
+            operation="copy",
+        )
+
+    async def _cp_and_refresh(
+        self,
+        from_uri: str,
+        to_uri: str,
+        *,
+        recursive: bool,
+        ctx: RequestContext,
+    ) -> Dict[str, Any]:
+        """Commit copy and enqueue its parent refresh as one cancellation-safe unit."""
+        viking_fs = self._ensure_initialized()
+        async with self._uri_mutation_coordinator.mutation(
+            ctx.account_id,
+            [from_uri, to_uri],
+        ):
+            transfer_result = await viking_fs.cp(
+                from_uri,
+                to_uri,
+                recursive=recursive,
+                ctx=ctx,
+            )
+
+        result = dict(transfer_result or {})
+        result.setdefault("from", from_uri)
+        result.setdefault("to", to_uri)
+        result.setdefault("recursive", recursive)
+        context_type = context_type_for_uri(to_uri)
+        refresh_parent_uri = self._semantic_refresh_parent_uri(to_uri, context_type)
+        if not refresh_parent_uri:
+            return result
+
+        result["semantic_root_uri"] = refresh_parent_uri
+        try:
+            result["semantic_status"] = await self._enqueue_copy_refresh(
+                root_uri=refresh_parent_uri,
+                source_uri=from_uri,
+                copied_uri=to_uri,
+                context_type=context_type,
+                ctx=ctx,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Copy committed but parent semantic refresh failed for %s: %s",
+                to_uri,
+                exc,
+            )
+            result["semantic_status"] = "failed"
+            result["semantic_error"] = str(exc)
+        return result
+
     async def mv(self, from_uri: str, to_uri: str, ctx: RequestContext) -> None:
-        """Move resource."""
+        """Move a resource without exposing a cancellable partial transaction."""
+        from_uri = VikingFS._normalize_transfer_uri(from_uri)
+        to_uri = VikingFS._normalize_transfer_uri(to_uri)
+        await self._finish_transfer_after_caller_cancel(
+            self._mv_and_refresh(from_uri, to_uri, ctx=ctx),
+            operation="move",
+        )
+
+    async def _mv_and_refresh(
+        self,
+        from_uri: str,
+        to_uri: str,
+        *,
+        ctx: RequestContext,
+    ) -> None:
+        """Commit move/watch state and enqueue all affected parent refreshes."""
         viking_fs = self._ensure_initialized()
         watch_manager = self._get_watch_manager()
-        if not watch_manager or context_type_for_uri(from_uri) != "resource":
+        use_watch_transaction = (
+            watch_manager is not None
+            and context_type_for_uri(from_uri) == "resource"
+            and context_type_for_uri(to_uri) == "resource"
+            and not is_watch_task_control_uri(from_uri)
+            and not is_watch_task_control_uri(to_uri)
+        )
+        if not use_watch_transaction:
             await viking_fs.mv(from_uri, to_uri, ctx=ctx)
-            return
-        if context_type_for_uri(to_uri) != "resource":
-            await viking_fs.mv(from_uri, to_uri, ctx=ctx)
-            return
-        if is_watch_task_control_uri(from_uri) or is_watch_task_control_uri(to_uri):
-            await viking_fs.mv(from_uri, to_uri, ctx=ctx)
-            return
-
-        transaction_task = asyncio.create_task(
-            self._move_resource_with_watch_transaction(
+        else:
+            assert watch_manager is not None
+            await self._move_resource_with_watch_transaction(
                 viking_fs,
                 watch_manager,
                 from_uri,
                 to_uri,
                 ctx,
             )
-        )
+        await self._refresh_move_parents(from_uri=from_uri, to_uri=to_uri, ctx=ctx)
+
+    async def _finish_transfer_after_caller_cancel(
+        self,
+        transaction: Coroutine[Any, Any, Any],
+        *,
+        operation: str,
+    ) -> Any:
+        """Finish an already-started transfer before propagating caller cancellation."""
+        transaction_task = asyncio.create_task(transaction)
         try:
-            await asyncio.shield(transaction_task)
+            return await asyncio.shield(transaction_task)
         except asyncio.CancelledError:
             while not transaction_task.done():
                 try:
@@ -583,10 +773,51 @@ class FSService:
                 pass
             except Exception:
                 logger.error(
-                    "Resource move transaction failed while caller was cancelled",
+                    "Filesystem %s transaction failed while caller was cancelled",
+                    operation,
                     exc_info=True,
                 )
             raise
+
+    async def _refresh_move_parents(
+        self,
+        *,
+        from_uri: str,
+        to_uri: str,
+        ctx: RequestContext,
+    ) -> None:
+        """Queue transfer refreshes for both affected parents after mv commits."""
+        if is_watch_task_control_uri(from_uri) or is_watch_task_control_uri(to_uri):
+            return
+
+        source_context_type = context_type_for_uri(from_uri)
+        target_context_type = context_type_for_uri(to_uri)
+        source_parent_uri = self._semantic_refresh_parent_uri(from_uri, source_context_type)
+        target_parent_uri = self._semantic_refresh_parent_uri(to_uri, target_context_type)
+
+        refreshes: List[tuple[str, str, Literal["added", "deleted"], str]] = []
+        if source_parent_uri and source_parent_uri != target_parent_uri:
+            refreshes.append((source_parent_uri, from_uri, "deleted", source_context_type))
+        if target_parent_uri:
+            refreshes.append((target_parent_uri, to_uri, "added", target_context_type))
+
+        for parent_uri, changed_uri, change_kind, context_type in refreshes:
+            try:
+                await self._enqueue_copy_refresh(
+                    root_uri=parent_uri,
+                    source_uri=from_uri,
+                    copied_uri=changed_uri,
+                    change_kind=change_kind,
+                    context_type=context_type,
+                    ctx=ctx,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Move committed but %s parent semantic refresh failed for %s: %s",
+                    change_kind,
+                    parent_uri,
+                    exc,
+                )
 
     async def _move_resource_with_watch_transaction(
         self,
@@ -653,30 +884,70 @@ class FSService:
         extra_fields: Optional[List[str]] = None,
         tags: Optional[List[str]] = None,
         include_tags: bool = False,
+        offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """Get directory tree."""
         viking_fs = self._ensure_initialized()
-        result = await viking_fs.tree(
-            uri,
-            ctx=ctx,
-            output=output,
-            abs_limit=abs_limit,
-            show_all_hidden=show_all_hidden,
-            node_limit=None if tags else node_limit,
-            level_limit=level_limit,
-            extra_fields=extra_fields,
-        )
-        result = await self._attach_and_filter_tags(
-            result, ctx, tags, include_tags or bool(tags) or "tags" in (extra_fields or [])
-        )
-        if tags and node_limit > 0:
-            result = result[:node_limit]
-        return result
 
-    async def stat(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
+        async def fetch_page(page_offset: int, page_limit: Optional[int]) -> List[Dict[str, Any]]:
+            """Fetch and return one pre-tag tree page."""
+            return await viking_fs.tree(
+                uri,
+                ctx=ctx,
+                output="original" if tags else output,
+                abs_limit=abs_limit,
+                show_all_hidden=show_all_hidden,
+                node_limit=page_limit,
+                level_limit=level_limit,
+                extra_fields=None if tags else extra_fields,
+                offset=page_offset,
+            )
+
+        if tags:
+            result = await self._collect_tagged_page(
+                fetch_page,
+                ctx,
+                tags,
+                include_tags or bool(tags) or "tags" in (extra_fields or []),
+                offset,
+                node_limit,
+            )
+            if output != "original" or extra_fields:
+                return await viking_fs._finalize_listing_entries(
+                    result,
+                    output,
+                    abs_limit,
+                    extra_fields,
+                    True,
+                    ctx=ctx,
+                )
+            return result
+
+        result = await fetch_page(offset, node_limit)
+        return await self._attach_and_filter_tags(
+            result, ctx, None, include_tags or "tags" in (extra_fields or [])
+        )
+
+    async def stat(
+        self,
+        uri: str,
+        ctx: RequestContext,
+        skip_count: bool = False,
+        include_lock_status: bool = False,
+    ) -> Dict[str, Any]:
         """Get resource status."""
         viking_fs = self._ensure_initialized()
-        return await viking_fs.stat(uri, ctx=ctx)
+        return await viking_fs.stat(
+            uri,
+            ctx=ctx,
+            skip_count=skip_count,
+            include_lock_status=include_lock_status,
+        )
+
+    async def ensure_write_access(self, uri: str, ctx: RequestContext) -> None:
+        """Validate write access without mutating the target."""
+        viking_fs = self._ensure_initialized()
+        await viking_fs._ensure_access(uri, ctx, action=AclAction.WRITE)
 
     async def system_sync_status(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
         """Return multi-write sync status for one Viking URI subtree."""
@@ -799,7 +1070,9 @@ class FSService:
                 uri=uri,
                 node_limit=None if normalized_tags else node_limit,
                 ctx=ctx,
-                extra_fields=extra_fields if extra_fields is not None else ([] if project_tags else None),
+                extra_fields=extra_fields
+                if extra_fields is not None
+                else ([] if project_tags else None),
             )
         )
         if not project_tags:
@@ -889,18 +1162,22 @@ class FSService:
         return await self._ensure_initialized().get_acl(uri, ctx=ctx)
 
     async def set_acl(
-        self, uri: str, entries: List[Dict[str, str]], ctx: RequestContext
+        self,
+        uri: str,
+        entries: Optional[List[Dict[str, str]]],
+        ctx: RequestContext,
+        acl_mode: Optional[AclMode] = None,
     ) -> Dict[str, Any]:
-        return await self._ensure_initialized().set_acl(uri, entries, ctx=ctx)
+        return await self._ensure_initialized().set_acl(
+            uri, entries, ctx=ctx, acl_mode=acl_mode
+        )
 
     async def grant_acl(
         self, uri: str, principal: str, level: str, ctx: RequestContext
     ) -> Dict[str, Any]:
         return await self._ensure_initialized().grant_acl(uri, principal, level, ctx=ctx)
 
-    async def revoke_acl(
-        self, uri: str, principal: str, ctx: RequestContext
-    ) -> Dict[str, Any]:
+    async def revoke_acl(self, uri: str, principal: str, ctx: RequestContext) -> Dict[str, Any]:
         return await self._ensure_initialized().revoke_acl(uri, principal, ctx=ctx)
 
     async def delete_acl(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:

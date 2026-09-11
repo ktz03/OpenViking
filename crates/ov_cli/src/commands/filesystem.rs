@@ -171,6 +171,10 @@ pub async fn ls(
     abs_limit: i32,
     show_all_hidden: bool,
     node_limit: i32,
+    offset: i32,
+    limit: Option<i32>,
+    sort_by: Option<&str>,
+    sort_order: Option<&str>,
     output_format: OutputFormat,
     compact: bool,
     fields: Option<Vec<String>>,
@@ -188,6 +192,10 @@ pub async fn ls(
             abs_limit,
             show_all_hidden,
             node_limit,
+            offset,
+            limit,
+            sort_by,
+            sort_order,
             &extra,
             tags,
             fields.as_ref().is_some_and(|items| items.iter().any(|item| item == "tags")) || !tags.is_empty(),
@@ -205,6 +213,8 @@ pub async fn tree(
     show_all_hidden: bool,
     node_limit: i32,
     level_limit: i32,
+    offset: i32,
+    limit: Option<i32>,
     output_format: OutputFormat,
     compact: bool,
     simple: bool,
@@ -220,6 +230,8 @@ pub async fn tree(
             show_all_hidden,
             node_limit,
             level_limit,
+            offset,
+            limit,
             &extra,
             tags,
             fields.as_ref().is_some_and(|items| items.iter().any(|item| item == "tags")) || !tags.is_empty(),
@@ -865,6 +877,24 @@ pub async fn mv(
     output_message_result(
         result,
         format!("Moved: {} -> {}", from_uri, to_uri),
+        output_format,
+        compact,
+    );
+    Ok(())
+}
+
+pub async fn cp(
+    client: &HttpClient,
+    from_uri: &str,
+    to_uri: &str,
+    recursive: bool,
+    output_format: OutputFormat,
+    compact: bool,
+) -> Result<()> {
+    let result = client.cp(from_uri, to_uri, recursive).await?;
+    output_message_result(
+        result,
+        format!("Copied: {} -> {}", from_uri, to_uri),
         output_format,
         compact,
     );
