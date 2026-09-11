@@ -251,8 +251,6 @@ const workspace = {
       title: 'Experience settings',
       description:
         'Agent Evolution switch for the target account. When off, new session commits in that account stop extracting experiences and trajectories.',
-      targetAccount: 'Target account: {{account}}',
-      unknownAccount: 'Unconfirmed',
       scopeMismatch:
         'The API target account differs from the current account or cannot be confirmed. Changes are disabled. Use an administrator credential for the current account.',
       loading: 'Reading switch status...',
@@ -406,6 +404,27 @@ const workspace = {
         'This task did not return a result. See the failure reason above.',
       noResultCancelledDescription:
         'This task was cancelled before it returned a result.',
+    },
+    events: {
+      title: 'Task execution log',
+      description:
+        'Reported task events. Times show when the backend recorded each event.',
+      created: 'Task registered',
+      statusChanged: 'Task status changed to {{status}}',
+      stageChanged: 'Reported stage changed to {{stage}}',
+      errorRecorded: 'Backend recorded an error',
+      waitingForDescendants:
+        'Unfinished work remains; waiting for owned work to settle',
+      stageContext: 'Last reported stage: {{stage}}',
+      operation: 'Operation: {{operation}}',
+      partial: 'Only events recorded after tracking began are available.',
+      truncated: '{{count}} earlier events were truncated.',
+      unsupported: 'The server did not provide task events.',
+      empty: 'No execution events were recorded for this task.',
+      copy: 'Copy events',
+      copied: 'Events copied',
+      copyFailed: 'Could not copy events',
+      context: 'Current task context',
     },
     filters: {
       label: 'Filter',

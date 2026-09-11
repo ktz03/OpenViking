@@ -22,8 +22,8 @@ import {
 } from '../-lib/api'
 
 /**
- * Admin/root-only settings popover that toggles the deployment Agent
- * Evolution switch (`GET/PUT /api/v1/admin/agent-evolution`).
+ * Admin/root-only settings popover that toggles the selected account Agent
+ * Evolution switch (`GET/PATCH /api/v1/admin/accounts/{account_id}/settings`).
  *
  * When disabled, new session commits stop extracting experiences and
  * trajectories, which is the most common reason the impact panel stays empty.
@@ -43,8 +43,9 @@ export function EvolutionSettingsPopover() {
     (connectionRole === 'admin' || connectionRole === 'root')
 
   const statusQuery = useQuery({
-    enabled: canManage,
-    queryFn: ({ signal }) => fetchAgentEvolutionStatus(signal),
+    enabled: canManage && Boolean(connection.accountId),
+    queryFn: ({ signal }) =>
+      fetchAgentEvolutionStatus(connection.accountId, signal),
     queryKey: ['agent-evolution-status', identityScopeKey],
     staleTime: 30_000,
   })
@@ -58,7 +59,7 @@ export function EvolutionSettingsPopover() {
       if (!matchesCurrentAccount) {
         throw new Error(t('settings.scopeMismatch'))
       }
-      return setAgentEvolutionEnabled(enabled)
+      return setAgentEvolutionEnabled(connection.accountId, enabled)
     },
     onSuccess: (status) => {
       queryClient.setQueryData(
@@ -120,11 +121,6 @@ export function EvolutionSettingsPopover() {
           ) : statusQuery.data ? (
             <div className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5">
               <div className="grid gap-0.5">
-                <span className="break-all text-xs text-muted-foreground">
-                  {t('settings.targetAccount', {
-                    account: targetAccountId || t('settings.unknownAccount'),
-                  })}
-                </span>
                 <span className="text-sm font-medium">
                   {statusQuery.data.enabled
                     ? t('settings.statusEnabled')

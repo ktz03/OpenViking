@@ -49,6 +49,7 @@ import {
   lintPeerScopeDowngrade,
   WORKSPACE_PEER_HINT,
 } from "./shared/doctor-core.mjs";
+import { describeInputFilters } from "./shared/input-filters.mjs";
 import { resolveEffectivePeerId } from "./shared/workspace-peer.mjs";
 
 const PLUGIN_ROOT = resolvePath(dirname(fileURLToPath(import.meta.url)), "..");
@@ -455,6 +456,20 @@ function checkConfig(report, cfg) {
   const toggles = [`auto-inject ${cfg.noAutoInject ? "OFF" : "on"}`, `auto-recall ${cfg.autoRecall ? "on" : "OFF"}`, `auto-capture ${cfg.autoCapture ? "on" : "OFF"}`, `commit on compact ${cfg.autoCommitOnCompact ? "on" : "OFF"}`, `recall compress ${cfg.recallCompress ? "on" : "off"}`, `write path ${cfg.writePathAsync ? "async" : "sync"}`];
   report.info(`toggles  ${toggles.join(", ")}`);
   if (!cfg.autoRecall || !cfg.autoCapture || cfg.noAutoInject) report.warn("one or more injection paths are switched off", toggles.join(", "), "check OPENVIKING_AUTO_RECALL / OPENVIKING_AUTO_CAPTURE / OPENVIKING_NO_AUTO_INJECT and ovcli.conf plugin.codex");
+  for (const filters of describeInputFilters(cfg)) {
+    if (!filters.total) continue;
+    report.info(`${filters.label}  ${filters.summary}`);
+    for (const e of filters.errors) {
+      const where = `${filters.env} or ovcli.conf plugin.codex.${filters.key}`;
+      report.warn(
+        `${filters.key}[${e.index}]: ${e.message}`,
+        e.source ? `rule: ${e.source}` : "this rule is skipped, the rest still apply",
+        e.message.startsWith("invalid regular expression")
+          ? `fix the pattern in ${where} (the u flag rejects escapes that are legal without it)`
+          : `fix the rule in ${where}`,
+      );
+    }
+  }
   report.info(`debug log ${cfg.debug ? "on" : "off"} → ${homeShort(cfg.debugLogPath)}${cfg.debug ? "" : " (set OPENVIKING_DEBUG=1 in Codex's environment to record hook errors)"}`);
 
   const env = collectEnv();

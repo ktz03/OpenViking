@@ -91,13 +91,17 @@ class PersistentTaskStore:
         return tasks
 
     async def delete(self, task_id: str, *, account_id: str, user_id: Optional[str] = None) -> None:
+        """Delete a task record, succeeding if it has already been removed."""
         if not user_id:
             return
-        await self._agfs.rm(
-            self._task_path(account_id, user_id, task_id),
-            force=True,
-            auto_pathlock=False,
-        )
+        try:
+            await self._agfs.rm(
+                self._task_path(account_id, user_id, task_id),
+                force=True,
+                auto_pathlock=False,
+            )
+        except (AGFSNotFoundError, FileNotFoundError):
+            return
 
     async def _write_task(self, task: Any) -> None:
         account_id = getattr(task, "account_id", None)
@@ -174,6 +178,7 @@ class PersistentTaskStore:
 def _task_to_payload(task: Any) -> Dict[str, Any]:
     status = getattr(task, "status", None)
     return {
+        **deepcopy(getattr(task, "_extra_fields", {})),
         "task_id": task.task_id,
         "task_type": task.task_type,
         "status": status.value if hasattr(status, "value") else status,
@@ -186,6 +191,7 @@ def _task_to_payload(task: Any) -> Dict[str, Any]:
         "stage": task.stage,
         "result": deepcopy(task.result),
         "error": task.error,
+        "execution_events": deepcopy(task.execution_events),
         "auth": deepcopy(task.auth),
     }
 

@@ -34,18 +34,8 @@ _DASHSCOPE_HOSTS = {
 }
 
 
-_REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
-
-
-def _is_reasoning_model(model: Optional[str]) -> bool:
-    """OpenAI reasoning-model families reject `max_tokens` and non-default `temperature`.
-
-    They require `max_completion_tokens` and only accept `temperature=1` (server default).
-    """
-    if not model:
-        return False
-    name = model.lower()
-    return any(name.startswith(p) for p in _REASONING_MODEL_PREFIXES)
+# These names select existing OpenAI request defaults, not general reasoning capability.
+_OPENAI_REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
 
 
 def _build_openai_client_kwargs(
@@ -84,7 +74,7 @@ class OpenAIVLM(VLMBase):
         self._sync_client = None
         self._async_client_cache = LoopScopedAsyncClientCache()
         self.api_version = config.get("api_version")
-        self.reasoning_effort = config.get("reasoning_effort", "low")
+        self.reasoning_effort = config.get("reasoning_effort")
 
     def get_client(self):
         """Get sync client"""
@@ -143,8 +133,23 @@ class OpenAIVLM(VLMBase):
 
         return host.lower() in _DASHSCOPE_HOSTS
 
-    def _apply_provider_specific_extra_body(self, kwargs: Dict[str, Any], thinking: bool) -> None:
-        """Attach provider-specific raw body parameters understood by compatible APIs."""
+    def _apply_completion_params(
+        self, kwargs: Dict[str, Any], thinking: bool, max_tokens: Optional[int] = None
+    ) -> None:
+        """Apply model defaults, explicit settings, and provider-specific body fields."""
+        if kwargs["model"].lower().startswith(_OPENAI_REASONING_MODEL_PREFIXES):
+            max_tokens_param = "max_completion_tokens"
+            kwargs["reasoning_effort"] = "low"
+        else:
+            max_tokens_param = "max_tokens"
+            kwargs["temperature"] = self.temperature
+
+        effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        if effective_max_tokens is not None:
+            kwargs[max_tokens_param] = effective_max_tokens
+        if self.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.reasoning_effort
+
         extra_body = dict(self.extra_request_body)
         if self._supports_enable_thinking():
             extra_body["enable_thinking"] = bool(thinking)
@@ -227,23 +232,15 @@ class OpenAIVLM(VLMBase):
         max_tokens: Optional[int] = None,
     ) -> Dict[str, Any]:
         effective_thinking = self.thinking if thinking is None else thinking
-        effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
         kwargs_messages = sanitize_openai_messages(
             messages or [{"role": "user", "content": prompt}]
         )
         model = self.model or "gpt-4o-mini"
-        is_reasoning = _is_reasoning_model(model)
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": kwargs_messages,
         }
-        if is_reasoning:
-            kwargs["reasoning_effort"] = self.reasoning_effort
-        else:
-            kwargs["temperature"] = self.temperature
-        self._apply_provider_specific_extra_body(kwargs, effective_thinking)
-        if effective_max_tokens is not None:
-            kwargs["max_completion_tokens" if is_reasoning else "max_tokens"] = effective_max_tokens
+        self._apply_completion_params(kwargs, effective_thinking, max_tokens=max_tokens)
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
@@ -270,18 +267,11 @@ class OpenAIVLM(VLMBase):
             kwargs_messages = sanitize_openai_messages([{"role": "user", "content": content}])
 
         model = self.model or "gpt-4o-mini"
-        is_reasoning = _is_reasoning_model(model)
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": kwargs_messages,
         }
-        if is_reasoning:
-            kwargs["reasoning_effort"] = self.reasoning_effort
-        else:
-            kwargs["temperature"] = self.temperature
-        self._apply_provider_specific_extra_body(kwargs, effective_thinking)
-        if self.max_tokens is not None:
-            kwargs["max_completion_tokens" if is_reasoning else "max_tokens"] = self.max_tokens
+        self._apply_completion_params(kwargs, effective_thinking)
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"

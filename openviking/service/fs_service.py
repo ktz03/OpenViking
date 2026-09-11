@@ -27,7 +27,7 @@ from openviking.storage.abstract_overview import (
     plan_abstract_overview_refresh,
     render_abstract_overview,
 )
-from openviking.storage.acl import CreatorAclGrant
+from openviking.storage.acl import AclAction, AclMode, CreatorAclGrant
 from openviking.storage.content_write import ContentWriteCoordinator
 from openviking.storage.expr import And, Eq, In, Or
 from openviking.storage.queuefs import SemanticMsg, get_queue_manager
@@ -928,10 +928,26 @@ class FSService:
             result, ctx, None, include_tags or "tags" in (extra_fields or [])
         )
 
-    async def stat(self, uri: str, ctx: RequestContext, skip_count: bool = False) -> Dict[str, Any]:
+    async def stat(
+        self,
+        uri: str,
+        ctx: RequestContext,
+        skip_count: bool = False,
+        include_lock_status: bool = False,
+    ) -> Dict[str, Any]:
         """Get resource status."""
         viking_fs = self._ensure_initialized()
-        return await viking_fs.stat(uri, ctx=ctx, skip_count=skip_count)
+        return await viking_fs.stat(
+            uri,
+            ctx=ctx,
+            skip_count=skip_count,
+            include_lock_status=include_lock_status,
+        )
+
+    async def ensure_write_access(self, uri: str, ctx: RequestContext) -> None:
+        """Validate write access without mutating the target."""
+        viking_fs = self._ensure_initialized()
+        await viking_fs._ensure_access(uri, ctx, action=AclAction.WRITE)
 
     async def system_sync_status(self, uri: str, ctx: RequestContext) -> Dict[str, Any]:
         """Return multi-write sync status for one Viking URI subtree."""
@@ -1146,9 +1162,15 @@ class FSService:
         return await self._ensure_initialized().get_acl(uri, ctx=ctx)
 
     async def set_acl(
-        self, uri: str, entries: List[Dict[str, str]], ctx: RequestContext
+        self,
+        uri: str,
+        entries: Optional[List[Dict[str, str]]],
+        ctx: RequestContext,
+        acl_mode: Optional[AclMode] = None,
     ) -> Dict[str, Any]:
-        return await self._ensure_initialized().set_acl(uri, entries, ctx=ctx)
+        return await self._ensure_initialized().set_acl(
+            uri, entries, ctx=ctx, acl_mode=acl_mode
+        )
 
     async def grant_acl(
         self, uri: str, principal: str, level: str, ctx: RequestContext
