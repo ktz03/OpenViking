@@ -466,33 +466,8 @@ enum Commands {
         #[command(flatten)]
         upload_options: UploadCliOptions,
     },
-    /// [Data] Add a skill into OpenViking
-    AddSkill {
-        /// Skill directory, SKILL.md, or raw content
-        #[arg(value_name = "skill-path-or-content")]
-        data: String,
-        /// Wait until processing is complete
-        #[arg(long, help_heading = "Common options")]
-        wait: bool,
-        /// Wait timeout in seconds
-        #[arg(
-            long,
-            value_parser = config::parse_positive_timeout,
-            value_name = "seconds",
-            help_heading = "Common options"
-        )]
-        timeout: Option<f64>,
-        /// Parent skill root URI (e.g. viking://agent/skills); defaults to user-private skills
-        #[arg(
-            short = 'p',
-            long = "parent-auto-create",
-            value_name = "uri",
-            help_heading = "Skill options"
-        )]
-        parent: Option<String>,
-        #[command(flatten)]
-        upload_options: UploadCliOptions,
-    },
+    /// [Data] Add skills from a source (same as `skills add`)
+    AddSkill(SkillAddArgs),
     /// [Data] Manage installed skills
     Skills {
         #[command(subcommand)]
@@ -1167,9 +1142,9 @@ enum Commands {
         /// Skill directory or SKILL.md Viking URI
         #[arg(long, value_name = "uri")]
         skill: String,
-        /// Description of this organization task
+        /// Additional instructions for this Compile task
         #[arg(long, value_name = "text")]
-        reason: Option<String>,
+        instruction: Option<String>,
         /// Provider arguments as a JSON object
         #[arg(long, value_name = "json")]
         args: Option<String>,
@@ -1299,7 +1274,14 @@ impl Commands {
     }
 
     fn supports_upload_options(&self) -> bool {
-        matches!(self, Self::AddResource { .. } | Self::AddSkill { .. })
+        matches!(
+            self,
+            Self::AddResource { .. }
+                | Self::AddSkill(_)
+                | Self::Skills {
+                    action: SkillCommands::Add(_)
+                }
+        )
     }
 }
 
@@ -1309,7 +1291,7 @@ fn legacy_upload_option_error(
 ) -> Option<&'static str> {
     if options.is_set() && !command.supports_upload_options() {
         Some(
-            "--progress, --no-progress, and --verbose are only supported for add-resource and add-skill.",
+            "--progress, --no-progress, and --verbose are only supported for add-resource, add-skill, and skills add.",
         )
     } else {
         None
@@ -1644,29 +1626,34 @@ enum SessionConfigCommands {
     },
 }
 
+#[derive(Args)]
+struct SkillAddArgs {
+    /// Local skill file/directory, Git repository or GitHub tree URL, or raw content
+    #[arg(value_name = "source")]
+    source: String,
+    /// Install only the named skill(s); use '*' to install all skills in a source
+    #[arg(short = 's', long = "skill", value_name = "NAME", num_args = 1.., value_delimiter = ',')]
+    skills: Vec<String>,
+    /// List available skills in the source without installing
+    #[arg(short = 'l', long = "list")]
+    list: bool,
+    /// Wait until processing is complete
+    #[arg(short = 'w', long)]
+    wait: bool,
+    /// Skip confirmation prompt
+    #[arg(short = 'y', long = "yes")]
+    yes: bool,
+    /// Parent skill root URI (e.g. viking://agent/skills); defaults to user-private skills
+    #[arg(short = 'p', long = "parent-auto-create", value_name = "uri")]
+    parent: Option<String>,
+    #[command(flatten)]
+    upload_options: UploadCliOptions,
+}
+
 #[derive(Subcommand)]
 enum SkillCommands {
     /// Add skills from a source
-    Add {
-        /// Skill source
-        #[arg(value_name = "source")]
-        source: String,
-        /// Install only the named skill(s); use '*' to install all skills in a source
-        #[arg(short = 's', long = "skill", value_name = "NAME", num_args = 1.., value_delimiter = ',')]
-        skills: Vec<String>,
-        /// List available skills in the source without installing
-        #[arg(short = 'l', long = "list")]
-        list: bool,
-        /// Wait until processing is complete
-        #[arg(short = 'w', long)]
-        wait: bool,
-        /// Skip confirmation prompt
-        #[arg(short = 'y', long = "yes")]
-        yes: bool,
-        /// Parent skill root URI (e.g. viking://agent/skills); defaults to user-private skills
-        #[arg(short = 'p', long = "parent-auto-create", value_name = "uri")]
-        parent: Option<String>,
-    },
+    Add(SkillAddArgs),
     /// List installed agent skills
     #[command(alias = "ls")]
     List {
@@ -3297,41 +3284,12 @@ async fn main() {
                 ))
             }
         }
-        Commands::AddSkill {
-            data,
-            wait,
-            timeout,
-            parent,
-            upload_options,
-        } => {
-            let ctx =
-                ctx.with_upload_options(upload_options.merged_with_legacy(legacy_upload_options));
-            handlers::handle_add_skill(data, wait, timeout, parent, ctx).await
+        Commands::AddSkill(args) => {
+            handlers::handle_add_skill(args, legacy_upload_options, ctx).await
         }
         Commands::Skills { action } => match action {
-            SkillCommands::Add {
-                source,
-                skills,
-                list,
-                wait,
-                yes,
-                parent,
-            } => {
-                let client = ctx.get_client();
-                commands::skills::add(
-                    &client,
-                    &source,
-                    skills,
-                    list,
-                    wait,
-                    yes,
-                    ctx.should_show_progress(),
-                    ctx.is_verbose(),
-                    ctx.output_format,
-                    ctx.compact,
-                    parent.as_deref(),
-                )
-                .await
+            SkillCommands::Add(args) => {
+                handlers::handle_add_skill(args, legacy_upload_options, ctx).await
             }
             SkillCommands::List { node_limit, parent } => {
                 let client = ctx.get_client();
@@ -3663,7 +3621,7 @@ async fn main() {
             from_uris,
             to,
             skill,
-            reason,
+            instruction,
             args,
         } => {
             let client = ctx.get_client();
@@ -3672,7 +3630,7 @@ async fn main() {
                 from_uris,
                 to,
                 skill,
-                reason,
+                instruction,
                 args,
                 ctx.output_format,
                 ctx.compact,
@@ -4115,6 +4073,8 @@ mod tests {
             "viking://resources/wiki",
             "--skill",
             "viking://agent/skills/wiki",
+            "--instruction",
+            "Keep supporting evidence.",
             "--args",
             r#"{"model_name":"endpoint-1"}"#,
         ])
@@ -4123,13 +4083,13 @@ mod tests {
             Commands::Compile {
                 from_uris,
                 skill,
-                reason,
+                instruction,
                 args,
                 ..
             } => {
                 assert_eq!(from_uris.len(), 3);
                 assert_eq!(skill, "viking://agent/skills/wiki");
-                assert!(reason.is_none());
+                assert_eq!(instruction.as_deref(), Some("Keep supporting evidence."));
                 assert_eq!(args.as_deref(), Some(r#"{"model_name":"endpoint-1"}"#));
             }
             _ => panic!("expected compile command"),
@@ -4647,13 +4607,13 @@ mod tests {
         let add_skill = Cli::try_parse_from(["ov", "add-skill", "./skill", "--no-progress"])
             .expect("add-skill upload flags should parse");
         match add_skill.command {
-            Commands::AddSkill { upload_options, .. } => {
-                assert!(upload_options.no_progress);
+            Commands::AddSkill(args) => {
+                assert!(args.upload_options.no_progress);
             }
             _ => panic!("expected add-skill command"),
         }
 
-        assert!(Cli::try_parse_from(["ov", "skills", "add", "./skill", "--progress"]).is_err());
+        assert!(Cli::try_parse_from(["ov", "skills", "add", "./skill", "--progress"]).is_ok());
         assert!(Cli::try_parse_from(["ov", "skills", "update", "--progress"]).is_err());
     }
 
@@ -4790,35 +4750,35 @@ mod tests {
             _ => panic!("expected skills update"),
         }
 
-        let add_selected = Cli::try_parse_from([
-            "ov",
-            "skills",
-            "add",
-            "https://github.com/acme/skills.git",
-            "--skill",
-            "foo",
-            "bar",
-            "--list",
-            "--yes",
-        ])
-        .expect("skills add RFC flags should parse");
-        match add_selected.command {
-            Commands::Skills {
-                action:
-                    SkillCommands::Add {
-                        source,
-                        skills,
-                        list,
-                        yes,
-                        ..
-                    },
-            } => {
-                assert_eq!(source, "https://github.com/acme/skills.git");
-                assert_eq!(skills, vec!["foo", "bar"]);
-                assert!(list);
-                assert!(yes);
-            }
-            _ => panic!("expected skills add"),
+        for mut argv in [vec!["ov", "add-skill"], vec!["ov", "skills", "add"]] {
+            argv.extend([
+                "https://github.com/acme/skills.git",
+                "--skill",
+                "foo",
+                "bar",
+                "--list",
+                "--yes",
+                "--wait",
+                "--parent-auto-create",
+                "viking://agent/skills",
+                "--no-progress",
+            ]);
+            let add_selected = Cli::try_parse_from(argv)
+                .expect("both skill add commands should accept the same options");
+            let args = match add_selected.command {
+                Commands::AddSkill(args)
+                | Commands::Skills {
+                    action: SkillCommands::Add(args),
+                } => args,
+                _ => panic!("expected skill add command"),
+            };
+            assert_eq!(args.source, "https://github.com/acme/skills.git");
+            assert_eq!(args.skills, vec!["foo", "bar"]);
+            assert!(args.list);
+            assert!(args.yes);
+            assert!(args.wait);
+            assert_eq!(args.parent.as_deref(), Some("viking://agent/skills"));
+            assert!(args.upload_options.no_progress);
         }
 
         let show = Cli::try_parse_from([
@@ -4916,7 +4876,7 @@ mod tests {
         assert_eq!(
             legacy_upload_option_error(upload_options, &tree.command),
             Some(
-                "--progress, --no-progress, and --verbose are only supported for add-resource and add-skill."
+                "--progress, --no-progress, and --verbose are only supported for add-resource, add-skill, and skills add."
             )
         );
 
@@ -4926,12 +4886,7 @@ mod tests {
 
         let skills_add = Cli::try_parse_from(["ov", "--progress", "skills", "add", "./skill"])
             .expect("hidden legacy flag still parses before runtime validation");
-        assert_eq!(
-            legacy_upload_option_error(upload_options, &skills_add.command),
-            Some(
-                "--progress, --no-progress, and --verbose are only supported for add-resource and add-skill."
-            )
-        );
+        assert!(legacy_upload_option_error(upload_options, &skills_add.command).is_none());
     }
 
     #[test]
@@ -5013,7 +4968,6 @@ mod tests {
     fn all_timeout_options_require_positive_finite_seconds() {
         let command_prefixes = [
             vec!["ov", "add-resource", "https://example.com", "--timeout"],
-            vec!["ov", "add-skill", "skill", "--timeout"],
             vec!["ov", "rm", "viking://resources/item", "--timeout"],
             vec![
                 "ov",

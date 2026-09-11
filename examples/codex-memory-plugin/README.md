@@ -162,6 +162,33 @@ export OPENVIKING_DEBUG=1
 
 Full list: see the `Misc env vars` block in `scripts/config.mjs`. Tuning fields have `OPENVIKING_*` counterparts and env vars win for those tuning fields.
 
+#### Input filters
+
+Two knobs put an ordered list of regex rules in front of the text the plugin sends: `recallQueryFilters` / `OPENVIKING_RECALL_QUERY_FILTERS` shapes the prompt before it becomes a search query, and `captureFilters` / `OPENVIKING_CAPTURE_FILTERS` shapes every turn on the write path before it is stored.
+
+Rules are sed-style strings applied in order to one piece of text: `s<d>pattern<d>replacement<d>[flags]` substitutes, `d<d>pattern<d>[flags]` drops the text on a match, and `k<d>pattern<d>[flags]` keeps it only on a match (chain them for AND). `<d>` is any punctuation delimiter — `/`, `|`, `#`, `:` — escaped with `\` inside the pattern; flags are `i`, `m`, `s`, `u`, `g`. A `user:` or `assistant:` prefix limits a rule to that role.
+
+```sh
+# strip a thinking-keyword prefix, and don't recall on slash / bash-mode prompts
+export OPENVIKING_RECALL_QUERY_FILTERS='s/^\s*(ultrathink|think harder?)\s+//i,d|^\s*[/!]|'
+# redact tokens before they are stored, and never store /clear or /compact turns
+export OPENVIKING_CAPTURE_FILTERS='s/\b(sk|ghp|xoxb)_[A-Za-z0-9_-]+/[redacted]/g,user:d/^\s*\/(clear|compact)\b/'
+```
+
+The env vars are comma-separated lists, split before parsing, so a rule needing a literal comma — a bounded `{10,}` quantifier, say — belongs in the `ovcli.conf` array instead, where only trimming happens:
+
+```json
+{
+  "plugin": {
+    "codex": {
+      "captureFilters": ["s/\\b(sk|ghp)_[A-Za-z0-9_-]{10,}/[redacted]/g"]
+    }
+  }
+}
+```
+
+Rules run top to bottom and the first `d` that matches (or `k` that does not) ends the decision; text a substitution empties is not a drop, just too short to recall on. Filters run before `OPENVIKING_MIN_QUERY_LENGTH` and before the built-in ack / slash-command heuristics. A capture rule shapes what is sent, not what is already stored, and anything already in the pending queue carries the rules that were in effect when it was enqueued; adding a `d`/`k` rule mid-session also shortens the turn list the cursor counts, which reads as a transcript rewrite and replays from the last user turn. A rule that fails to compile is skipped, never fatal — `ov-memory-doctor` lists the active rules and reports the exact error for the ones it could not parse.
+
 #### Workspace configuration files
 
 A repository can carry its own plugin settings in `<repo-root>/.openviking/config.json`, which the team commits, and `<repo-root>/.openviking/config.local.json`, which stays private and gitignored. A third layer, this machine's entry under `~/.openviking/workspaces/`, outranks both, and all three outrank `ovcli.conf`.
@@ -277,6 +304,7 @@ Config knobs:
 | `OPENVIKING_RECALL_MAX_TOKENS` | `1600` | Token budget the server assembles the context block within, independent of the local compressor input limit. |
 | `OPENVIKING_RECALL_DEDUP_TURNS` | `5` | Cross-turn cooldown: URIs served in the last N turns are skipped. |
 | `OPENVIKING_RECALL_QUERY_EXPANSION` | `auto` | `auto` lets the server widen short prompts using session context; `off` disables it. |
+| `OPENVIKING_RECALL_QUERY_FILTERS` | `""` | Comma-separated regex rules applied to the prompt before it becomes a query — see [Input filters](#input-filters). |
 
 Recall now asks the server to assemble the context block in one request
 (`POST /api/v1/search/search` with `mode="context"`), so budgeting, detail tiers
@@ -297,7 +325,7 @@ layers; resolution order is env vars → the workspace layers → `plugin.codex`
 
 ### Stop (turn end → `add_message`, threshold commit)
 
-`auto-capture.mjs` derives one long-lived OpenViking session id per Codex `session_id` as `cx-<safe-session-id>` and incrementally appends every new user/assistant turn via `/api/v1/sessions/{id}/messages`. The `/messages` endpoint auto-creates the session on first append. Per-codex-session state lives at `~/.openviking/codex-plugin-state/<safe-session-id>.json`. Capture sanitizes obvious hook noise, metadata wrappers, and plugin-injected `<openviking-context ...>` blocks before append. Tool calls and results become dedicated `tool` parts and `tool_output` is reported verbatim — the server externalizes anything larger than `tool_output_externalization.threshold_chars` (default `20000`) and leaves a synopsis stub plus `tool_output_ref`, so the original stays readable via `/api/v1/sessions/{id}/tool-results`. `OPENVIKING_CAPTURE_TOOL_MAX_CHARS` (default `1000000`) is only a guard against pathological payloads.
+`auto-capture.mjs` derives one long-lived OpenViking session id per Codex `session_id` as `cx-<safe-session-id>` and incrementally appends every new user/assistant turn via `/api/v1/sessions/{id}/messages`. The `/messages` endpoint auto-creates the session on first append. Per-codex-session state lives at `~/.openviking/codex-plugin-state/<safe-session-id>.json`. Capture sanitizes obvious hook noise, metadata wrappers, and plugin-injected `<openviking-context ...>` blocks before append. Tool calls and results become dedicated `tool` parts and `tool_output` is reported verbatim — the server externalizes anything larger than `tool_output_externalization.threshold_chars` (default `20000`) and leaves a synopsis stub plus `tool_output_ref`, so the original stays readable via `/api/v1/sessions/{id}/tool-results`. `OPENVIKING_CAPTURE_TOOL_MAX_CHARS` (default `1000000`) is only a guard against pathological payloads. Configured `captureFilters` rules run last, just before the payload is sent — see [Input filters](#input-filters).
 
 After a successful append, Stop reads the session meta and commits when `pending_tokens >= OPENVIKING_COMMIT_TOKEN_THRESHOLD` (default `20000`). Threshold commits pass `keep_recent_count=OPENVIKING_COMMIT_KEEP_RECENT_COUNT` (default `10`) so the newest turns remain live for continuity while older context is archived and extracted. `PreCompact` still commits everything before compaction.
 

@@ -33,6 +33,7 @@ import {
   postRecall,
 } from "./shared/recall-core.mjs";
 import { compressRecallContext } from "./shared/recall-compress-core.mjs";
+import { applyInputFilters, compileInputFilters } from "./shared/input-filters.mjs";
 import { resolveEffectivePeerId } from "./shared/workspace-peer.mjs";
 
 let cfg = loadConfig();
@@ -576,7 +577,7 @@ async function main() {
     return;
   }
 
-  const userPrompt = (input.prompt || "").trim();
+  let userPrompt = (input.prompt || "").trim();
   const codexSessionId = typeof input.session_id === "string" ? input.session_id.trim() : "";
   const recallSessionId = resolveRecallSessionId(codexSessionId);
   log("start", {
@@ -591,6 +592,21 @@ async function main() {
       recallPeerScope: cfg.recallPeerScope,
     },
   });
+
+  // Filters run before the length gate, so a prompt whose only content was a
+  // stripped prefix is a short query rather than a search for the empty string.
+  const queryFilters = compileInputFilters(cfg.recallQueryFilters);
+  if (queryFilters.rules.length) {
+    const verdict = applyInputFilters(userPrompt, queryFilters.rules, { role: "user" });
+    if (verdict.dropped) {
+      log("skip", { stage: "query_filter", reason: "query_filtered", rule: verdict.ruleIndex, op: verdict.op });
+      emit();
+      return;
+    }
+    if (verdict.changed) log("query_filter", { rawLength: userPrompt.length, length: verdict.text.length });
+    userPrompt = verdict.text;
+  }
+  if (queryFilters.errors.length) log("query_filter_errors", { errors: queryFilters.errors });
 
   if (!userPrompt || userPrompt.length < cfg.minQueryLength) {
     log("skip", { stage: "query_check", reason: "query too short or empty" });

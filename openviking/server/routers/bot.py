@@ -105,8 +105,14 @@ def _attach_openviking_connection(
     The OpenViking proxy authenticates the browser request before forwarding it to
     vikingbot. Bot tools must keep using that same identity instead of falling back
     to vikingbot's static root/user-key configuration.
+
+    Client-supplied ``openviking_connection`` is always stripped: the Bot gateway
+    trusts loopback forwards from this proxy, so a browser body must not be able
+    to smuggle a forged identity through the no-API-key / non-trusted branch.
     """
     enriched = dict(body)
+    # Drop any client-claimed connection before deciding what (if anything) to attach.
+    enriched.pop("openviking_connection", None)
     api_key = _extract_forward_api_key(request)
     plugin = getattr(request.app.state, "auth_plugin", None)
     effective_auth_mode = _auth_mode(request)

@@ -834,3 +834,86 @@ test("the actor peer comes from the workspace named by the payload's cwd", async
     await rm(stateDir, { recursive: true, force: true });
   }
 });
+
+function filterEnv(stateDir, baseUrl, filters) {
+  return {
+    OPENVIKING_AUTO_RECALL: "1",
+    OPENVIKING_CODEX_STATE_DIR: stateDir,
+    OPENVIKING_STATE_DIR: stateDir,
+    OPENVIKING_CONFIG_FILE: join(stateDir, "missing-ov.conf"),
+    OPENVIKING_CLI_CONFIG_FILE: join(stateDir, "missing-ovcli.conf"),
+    OPENVIKING_CREDENTIAL_SOURCE: "env",
+    OPENVIKING_RECALL_COMPRESS: "0",
+    OPENVIKING_RECALL_TIMEOUT_MS: "10000",
+    OPENVIKING_MIN_QUERY_LENGTH: "3",
+    OPENVIKING_SCORE_THRESHOLD: "0",
+    OPENVIKING_TIMEOUT_MS: "5000",
+    OPENVIKING_URL: baseUrl,
+    OPENVIKING_RECALL_QUERY_FILTERS: filters,
+  };
+}
+
+test("a recall query filter drop ends the turn before any request", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "ov-auto-recall-filter-drop-"));
+  const requests = [];
+  try {
+    await withMockOpenViking(async (req, res) => {
+      requests.push(req.url);
+      writeJson(res, { status: "ok", result: {} });
+    }, async (baseUrl) => {
+      const result = await runAutoRecall(
+        { prompt: "/status please", session_id: "codex:filter-drop" },
+        filterEnv(stateDir, baseUrl, "d|^\\s*[/!]|"),
+      );
+      assert.deepEqual(JSON.parse(result.stdout.trim()), {});
+    });
+    assert.deepEqual(requests, []);
+  } finally {
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("a recall query filter rewrites the query the server is asked for", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "ov-auto-recall-filter-sub-"));
+  const queries = [];
+  try {
+    await withMockOpenViking(async (req, res) => {
+      const url = new URL(req.url, "http://127.0.0.1");
+      if (req.method === "GET" && url.pathname === "/health") {
+        writeJson(res, { status: "ok", result: { ok: true } });
+        return;
+      }
+      const body = await readRequestBody(req);
+      if (body?.query) queries.push(body.query);
+      writeJson(res, { status: "ok", result: { entries: [], rendered: "", stats: {} } });
+    }, async (baseUrl) => {
+      await runAutoRecall(
+        { prompt: "ultrathink what did we decide about retries", session_id: "codex:filter-sub" },
+        filterEnv(stateDir, baseUrl, "s/^\\s*ultrathink\\s+//i"),
+      );
+    });
+    assert.ok(queries.length > 0, "the hook made no query request");
+    for (const query of queries) assert.equal(query, "what did we decide about retries");
+  } finally {
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("a query stripped to nothing never reaches the server", async () => {
+  const stateDir = await mkdtemp(join(tmpdir(), "ov-auto-recall-filter-empty-"));
+  const requests = [];
+  try {
+    await withMockOpenViking(async (req, res) => {
+      requests.push(req.url);
+      writeJson(res, { status: "ok", result: {} });
+    }, async (baseUrl) => {
+      await runAutoRecall(
+        { prompt: "ultrathink", session_id: "codex:filter-empty" },
+        filterEnv(stateDir, baseUrl, "s/^ultrathink$//"),
+      );
+    });
+    assert.deepEqual(requests, []);
+  } finally {
+    await rm(stateDir, { recursive: true, force: true });
+  }
+});

@@ -20,7 +20,7 @@ from openviking.service.external_task_service import (
     ExternalTaskSnapshot,
 )
 from openviking.service.fs_service import FSService
-from openviking.service.task_tracker import TaskRecord
+from openviking.service.task_tracker import SENSITIVE_TASK_KEYS, TaskRecord
 from openviking_cli.exceptions import (
     InvalidArgumentError,
     NotFoundError,
@@ -39,8 +39,16 @@ class CompileRequest(BaseModel):
     from_: list[str] = Field(alias="from", min_length=1)
     to: str = Field(min_length=1)
     skill: str = Field(min_length=1)
-    reason: str | None = None
+    instruction: str | None = None
     args: dict[str, Any] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_reason(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "reason" in data:
+            data = dict(data)
+            data.setdefault("instruction", data.pop("reason"))
+        return data
 
     @model_validator(mode="after")
     def _normalize(self) -> "CompileRequest":
@@ -54,7 +62,7 @@ class CompileRequest(BaseModel):
         self.from_ = sources
         self.to = self.to.strip().rstrip("/")
         self.skill = self.skill.strip().rstrip("/")
-        self.reason = self.reason.strip() if self.reason and self.reason.strip() else None
+        self.instruction = self.instruction.strip() if self.instruction and self.instruction.strip() else None
         self.args = dict(self.args) if self.args else None
         if not self.to:
             raise ValueError("to must not be empty")
@@ -249,6 +257,9 @@ class CompileService:
     def poll_interval_seconds(self) -> float:
         return self._endpoint().poll_interval_ms / 1000.0
 
+    def serialization_key(self, payload: Mapping[str, Any]) -> str:
+        return payload["to"]
+
     def configure_local_backend(self, base_url: str, gateway_token: str) -> None:
         if self._config.base_url:
             return
@@ -421,12 +432,14 @@ class CompileService:
     def _split_payload(request: CompileRequest) -> tuple[dict[str, Any], dict[str, Any]]:
         payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
         args = payload.get("args")
-        if not isinstance(args, dict) or "user_key" not in args:
+        if not isinstance(args, dict):
             return payload, {}
-        private_payload = {"args": {"user_key": args.pop("user_key")}}
+        private_args = {key: args.pop(key) for key in SENSITIVE_TASK_KEYS if key in args}
+        if not private_args:
+            return payload, {}
         if not args:
             payload.pop("args", None)
-        return payload, private_payload
+        return payload, {"args": private_args}
 
     @staticmethod
     def _snapshot(task: CompileSessionStatus) -> ExternalTaskSnapshot:
