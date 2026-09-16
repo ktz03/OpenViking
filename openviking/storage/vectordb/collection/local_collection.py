@@ -475,15 +475,19 @@ class LocalCollection(ICollection):
     def update_index(
         self,
         index_name: str,
-        scalar_index: Optional[Dict[str, Any]] = None,
+        scalar_index: Optional[List[str]] = None,
         description: Optional[str] = None,
     ) -> None:
-        with self._index_mutation_barrier.mutation() as mutation:
+        with self._index_mutation_barrier.exclusive_mutation():
             index = self.indexes.get(index_name)
             if not index:
                 return
-            index.update(scalar_index, description)
-            mutation.mark_changed()
+            if scalar_index is not None:
+                if not self.store_mgr:
+                    raise RuntimeError("Store manager is not initialized")
+                index.rebuild_scalar_index(scalar_index, self.store_mgr.iter_all_cands_fields())
+            if description is not None:
+                index.update(None, description)
 
     def get_index_meta_data(self, index_name: str) -> Optional[Dict[str, Any]]:
         index = self.indexes.get(index_name)
@@ -691,6 +695,7 @@ class LocalCollection(ICollection):
         offset: int = 0,
         filters: Optional[Dict[str, Any]] = None,
         output_fields: Optional[List[str]] = None,
+        advance: Optional[Dict[str, Any]] = None,
     ) -> SearchResult:
         dense_vector = [random.uniform(-1, 1) for _ in range(self.meta.vector_dim)]
         return self.search_by_vector(

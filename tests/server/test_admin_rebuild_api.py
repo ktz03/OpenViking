@@ -8,6 +8,7 @@ import pytest
 
 from openviking.core.context import ContextLevel
 from openviking.server.identity import RequestContext, Role
+from openviking.storage.queuefs.process_result import ProcessResult
 from openviking_cli.exceptions import OpenVikingError, PermissionDeniedError
 from openviking_cli.session.user_id import UserIdentifier
 from tests.server.test_admin_api import ROOT_KEY
@@ -23,6 +24,14 @@ ROOT_ACCOUNT_HEADERS = {
     "X-API-Key": ROOT_KEY,
     "X-OpenViking-Account": "default",
 }
+
+
+@pytest.fixture
+def semantic_config(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_openviking_config",
+        lambda: SimpleNamespace(vlm=SimpleNamespace(max_concurrent=2)),
+    )
 
 
 def _make_reindex_run(ctx, counters):
@@ -562,26 +571,32 @@ async def test_reindex_prune_existing_file_uses_exact_lock(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reindex_prune_missing_target_keeps_tree_lock(monkeypatch):
+@pytest.mark.parametrize("locked", [False, True])
+async def test_reindex_prune_missing_target_does_not_lock(monkeypatch, locked):
+    """A missing prune target must not acquire a lock: doing so creates the directory."""
     from types import SimpleNamespace
 
     from openviking.service.reindex_executor import ReindexExecutor
+    from openviking.storage.errors import ResourceBusyError
 
     calls = []
 
     class FakeAGFS:
         async def pathlock_acquire_exact(self, path):
-            raise AssertionError("missing target must retain tree lock scope")
+            raise AssertionError("missing target must not acquire a lock")
 
         async def pathlock_acquire_tree(self, path):
-            calls.append(("tree", path))
-            return {"id": "lease-1"}
+            raise AssertionError("missing target must not acquire a lock")
+
+        async def pathlock_is_locked(self, path):
+            calls.append(("is_locked", path))
+            return locked
 
         async def pathlock_as_borrowed(self, lease):
-            return lease
+            raise AssertionError("no lease to borrow")
 
         async def pathlock_release(self, lease):
-            calls.append(("release", lease["id"]))
+            raise AssertionError("no lease to release")
 
     class FakeFS:
         _async_agfs = FakeAGFS()
@@ -610,19 +625,19 @@ async def test_reindex_prune_missing_target_keeps_tree_lock(monkeypatch):
         role=Role.ROOT,
     )
 
-    result = await executor._run(
+    run = executor._run(
         uri="viking://resources/missing",
         object_type="resource",
         mode="prune_orphans",
         dry_run=True,
         ctx=ctx,
     )
-
-    assert result["status"] == "completed"
-    assert calls == [
-        ("tree", "/local/default/resources/missing"),
-        ("release", "lease-1"),
-    ]
+    if locked:
+        with pytest.raises(ResourceBusyError):
+            await run
+    else:
+        assert (await run)["status"] == "completed"
+    assert calls == [("is_locked", "/local/default/resources/missing")]
 
 
 @pytest.mark.asyncio
@@ -748,7 +763,9 @@ async def test_reindex_upsert_uses_uri_owner_for_user_scoped_records(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_reindex_semantic_processor_uses_uri_owner_for_user_scoped_records(monkeypatch):
+async def test_reindex_semantic_processor_uses_uri_owner_for_user_scoped_records(
+    monkeypatch, semantic_config
+):
     from openviking.service.reindex_executor import ReindexExecutor
 
     captured = {}
@@ -760,6 +777,7 @@ async def test_reindex_semantic_processor_uses_uri_owner_for_user_scoped_records
         async def on_dequeue(self, payload, lock=None):
             captured["payload"] = payload
             captured["lock"] = lock
+            return ProcessResult.success()
 
     monkeypatch.setattr(
         "openviking.service.reindex_executor.SemanticProcessor",
@@ -922,10 +940,11 @@ async def test_prune_orphans_dry_run_preserves_resource_l1_fallback_and_skips_un
 
 
 @pytest.mark.asyncio
-async def test_prune_orphans_deletes_stale_memory_chunk_with_uri_owner_ctx(monkeypatch):
+@pytest.mark.parametrize("filename", ["theme.md", "report#chunk_notes.md", "report#chunk_0000"])
+async def test_prune_orphans_deletes_stale_memory_chunk_with_uri_owner_ctx(monkeypatch, filename):
     from openviking.service.reindex_executor import ReindexExecutor, _ReindexCounters
 
-    base_uri = "viking://user/bob/memories/preferences/theme.md"
+    base_uri = f"viking://user/bob/memories/preferences/{filename}"
     deleted = {}
 
     class FakeVikingFS:
@@ -1362,6 +1381,7 @@ async def test_reindex_semantic_processor_uses_configured_vlm_concurrency(monkey
 
         async def on_dequeue(self, data, lock=None):
             seen["data"] = data
+            return ProcessResult.success()
 
     monkeypatch.setattr(reindex_mod, "SemanticProcessor", FakeSemanticProcessor)
     monkeypatch.setattr(
@@ -2130,7 +2150,9 @@ async def test_reindex_resource_vectors_parallelize_files_and_isolate_failures(m
 
 
 @pytest.mark.asyncio
-async def test_reindex_semantic_processor_runs_with_skip_vectorization(monkeypatch):
+async def test_reindex_semantic_processor_runs_with_skip_vectorization(
+    monkeypatch, semantic_config
+):
     from openviking.service.reindex_executor import ReindexExecutor
 
     seen = {}
@@ -2141,6 +2163,7 @@ async def test_reindex_semantic_processor_runs_with_skip_vectorization(monkeypat
 
         async def on_dequeue(self, payload, lock=None):
             seen["payload"] = payload
+            return ProcessResult.success()
 
     monkeypatch.setattr(
         "openviking.service.reindex_executor.SemanticProcessor",
@@ -2169,7 +2192,9 @@ async def test_reindex_semantic_processor_runs_with_skip_vectorization(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_reindex_semantic_processor_passes_non_recursive_message(monkeypatch):
+async def test_reindex_semantic_processor_passes_non_recursive_message(
+    monkeypatch, semantic_config
+):
     from openviking.service.reindex_executor import ReindexExecutor
 
     seen = {}
@@ -2180,6 +2205,7 @@ async def test_reindex_semantic_processor_passes_non_recursive_message(monkeypat
 
         async def on_dequeue(self, payload, lock=None):
             seen["payload"] = payload
+            return ProcessResult.success()
 
     monkeypatch.setattr(
         "openviking.service.reindex_executor.SemanticProcessor",
@@ -2205,7 +2231,9 @@ async def test_reindex_semantic_processor_passes_non_recursive_message(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_reindex_semantic_processor_sets_memory_aggregation_policy(monkeypatch):
+async def test_reindex_semantic_processor_sets_memory_aggregation_policy(
+    monkeypatch, semantic_config
+):
     from openviking.service.reindex_executor import ReindexExecutor
 
     seen = {}
@@ -2216,6 +2244,7 @@ async def test_reindex_semantic_processor_sets_memory_aggregation_policy(monkeyp
 
         async def on_dequeue(self, payload, lock=None):
             seen["payload"] = payload
+            return ProcessResult.success()
 
     monkeypatch.setattr(
         "openviking.service.reindex_executor.SemanticProcessor",

@@ -39,7 +39,15 @@ class RagfsBindingConfig:
         queue_backend = getattr(queuefs, "backend", None)
         cachefs = getattr(self.agfs, "cachefs", None)
         cachefs_backend = getattr(cachefs, "backend", "local")
-        uses_runtime = cachefs_backend == "cache" or queue_backend == "cache"
+        pathlock = self.agfs.pathlock.model_dump(mode="json", exclude_none=True)
+        pathlock_uses_cache = pathlock.get("provider") == "cache"
+        uses_runtime = cachefs_backend == "cache" or queue_backend == "cache" or pathlock_uses_cache
+        if (
+            pathlock_uses_cache
+            and self.cache is not None
+            and self.cache.provider.strip() != "redis"
+        ):
+            raise ValueError("cache-backed PathLock requires top-level cache.provider=redis")
         if self.cache is not None and uses_runtime:
             cache_config = _build_provider_cache_config(
                 self.cache,
@@ -52,12 +60,13 @@ class RagfsBindingConfig:
         else:
             if uses_runtime:
                 raise ValueError(
-                    "top-level cache config is required when CacheFS or QueueFS uses backend=cache"
+                    "top-level cache config is required when CacheFS, QueueFS, or cache-backed PathLock "
+                    "uses the shared Runtime"
                 )
             cache_config = _disabled_cache_config(cachefs)
         binding_config: Dict[str, Any] = {
             "cache": cache_config,
-            "pathlock": self.agfs.pathlock.model_dump(mode="json"),
+            "pathlock": pathlock,
         }
 
         if self.log is not None:
@@ -383,7 +392,6 @@ def _serialize_s3_plugin_params(s3_config: Any) -> Dict[str, Any]:
         "prefix": _get_config_value(s3_config, "prefix", ""),
         "disable_ssl": not _get_config_value(s3_config, "use_ssl", True),
         "use_path_style": _get_config_value(s3_config, "use_path_style", True),
-        "s3_vendor": _get_config_value(s3_config, "s3_vendor", "standard"),
         "directory_marker_mode": directory_marker_mode.value
         if hasattr(directory_marker_mode, "value")
         else directory_marker_mode,

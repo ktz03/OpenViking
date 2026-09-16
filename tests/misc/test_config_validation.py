@@ -601,7 +601,6 @@ def test_generate_plugin_config_materializes_multiwrite_backups(tmp_path):
         "prefix": "backup-prefix",
         "disable_ssl": True,
         "use_path_style": False,
-        "s3_vendor": "standard",
         "directory_marker_mode": None,
         "disable_batch_delete": False,
         "normalize_encoding_chars": "#?",
@@ -729,20 +728,65 @@ def test_ragfs_binding_enables_runtime_for_queuefs_cache_backend(tmp_path):
 
 
 def test_agfs_pathlock_config_validates_provider_and_expiry(tmp_path):
-    """PathLock config accepts built-ins and rejects unsafe expiry values."""
+    """PathLock config validates Redis namespace and expiry boundaries."""
     config = AGFSConfig(
         path=str(tmp_path),
         backend="local",
-        pathlock={"provider": "memory", "lock_expire_secs": 60.0},
+        pathlock={
+            "provider": "cache",
+            "namespace": "prod-a",
+            "lock_expire_secs": 60.0,
+        },
     )
 
-    assert config.pathlock.provider == "memory"
+    assert config.pathlock.provider == "cache"
+    assert config.pathlock.namespace == "prod-a"
     assert config.pathlock.lock_expire_secs == 60.0
 
-    with pytest.raises(ValueError, match="pathlock provider"):
-        AGFSConfig(path=str(tmp_path), pathlock={"provider": "redis"})
+    with pytest.raises(ValueError, match="namespace"):
+        AGFSConfig(path=str(tmp_path), pathlock={"provider": "cache"})
+    with pytest.raises(ValueError, match="namespace"):
+        AGFSConfig(
+            path=str(tmp_path),
+            pathlock={"provider": "cache", "namespace": "bad{name}"},
+        )
     with pytest.raises(ValueError, match="lock_expire_secs"):
         AGFSConfig(path=str(tmp_path), pathlock={"lock_expire_secs": 0.0})
+
+
+def test_redis_pathlock_enables_shared_runtime_without_cachefs(tmp_path):
+    """Redis PathLock alone should enable the configured Redis Runtime."""
+    config = OpenVikingConfig.from_dict(
+        {
+            "cache": {
+                "provider": "redis",
+                "params": {"endpoints": ["redis://redis:6379"]},
+            },
+            "storage": {
+                "workspace": str(tmp_path),
+                "agfs": {
+                    "pathlock": {
+                        "provider": "cache",
+                        "namespace": "prod-a",
+                    }
+                },
+            },
+        }
+    )
+
+    binding = RagfsBindingConfig(
+        agfs=config.storage.agfs,
+        cache=config.cache,
+    ).to_binding_dict()
+
+    assert binding["cache"]["enabled"] is False
+    assert binding["cache"]["runtime_enabled"] is True
+    assert binding["pathlock"] == {
+        "provider": "cache",
+        "namespace": "prod-a",
+        "lock_expire_secs": 30.0,
+        "lock_timeout_secs": 0.0,
+    }
 
 
 def test_create_agfs_client_uses_single_binding_config_object(monkeypatch, tmp_path):

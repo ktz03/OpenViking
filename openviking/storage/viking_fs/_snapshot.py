@@ -31,6 +31,7 @@ from openviking_cli.exceptions import (
 def _pkg():
     return sys.modules[__package__]
 
+
 class _SnapshotMixin:
     """Snapshot/git-like version control (commit/restore/show/diff/log)."""
 
@@ -95,8 +96,7 @@ class _SnapshotMixin:
                 write_targets.append(uri)
 
         delete_targets = [
-            self._tree_path_to_uri(f"{tree_dir}/{path}".strip("/"))
-            for path in diff["to_delete"]
+            self._tree_path_to_uri(f"{tree_dir}/{path}".strip("/")) for path in diff["to_delete"]
         ]
         if write_targets:
             await self._ensure_access_many(
@@ -272,7 +272,9 @@ class _SnapshotMixin:
             {self._uri_to_path(uri, ctx=real_ctx) for uri in paths},
             key=lambda value: (value.count("/"), value),
         ):
-            if not any(path == root or path.startswith(f"{root.rstrip('/')}/") for root in lock_paths):
+            if not any(
+                path == root or path.startswith(f"{root.rstrip('/')}/") for root in lock_paths
+            ):
                 lock_paths.append(path)
         try:
             lease = await self._async_agfs.pathlock_acquire_tree_batch(lock_paths)
@@ -370,6 +372,14 @@ class _SnapshotMixin:
         # trusted internal callers. Keep its existing dry-run path unchanged.
         if dry_run and real_ctx.role == Role.ROOT:
             return await self._async_agfs.run("git_restore", **kwargs)
+        # A dry run only computes a plan; it must not take the tree lock,
+        # which would recreate a deleted project_dir to hold lock metadata.
+        if dry_run:
+            assert acl_project_dir is not None
+            await self._ensure_access(acl_project_dir, real_ctx)
+            plan = await self._async_agfs.run("git_restore", **kwargs)
+            await self._ensure_restore_plan_access(plan, tree_dir=tree_dir or "", ctx=real_ctx)
+            return plan
 
         from openviking.pyagfs.exceptions import GitRestoreWritebackPartialError
         from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
@@ -406,8 +416,6 @@ class _SnapshotMixin:
                     tree_dir=tree_dir or "",
                     ctx=real_ctx,
                 )
-                if dry_run:
-                    return plan
             try:
                 result = await self._async_agfs.run("git_restore", **kwargs)
             except GitRestoreWritebackPartialError as exc:
