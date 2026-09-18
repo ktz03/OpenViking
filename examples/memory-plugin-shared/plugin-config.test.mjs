@@ -41,13 +41,13 @@ const LOADERS = {
   dsh: {
     harness: "dsh",
     load: (cwd) => loadDsh({}, process.env, cwd),
-    options: { manifestUrl: new URL("../dsh-memory-plugin/package.json", import.meta.url), deriveEffectivePeer: true },
+    options: { version: "0.4.2", deriveEffectivePeer: true },
     owns: ["peerId"],
   },
   pi: {
     harness: "pi",
     load: (cwd) => loadPi(cwd),
-    options: { manifestUrl: new URL("../pi-coding-agent-extension/package.json", import.meta.url), deriveEffectivePeer: true },
+    options: { version: "0.3.1", deriveEffectivePeer: true },
     owns: ["peerId"],
   },
   cursor: { harness: "cursor", load: (cwd) => loadAgentHookConfig("cursor", cwd), options: { logFile: "cursor-hooks.log" }, owns: [] },
