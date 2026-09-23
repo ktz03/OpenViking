@@ -19,6 +19,11 @@ from openviking.telemetry import tracer
 from openviking.utils.message_format import format_messages, sanitize_openai_messages
 from openviking.utils.model_retry import retry_async, retry_sync
 from openviking.utils.multimodal import redact_image_data_urls
+from openviking.models.vlm.request_session import (
+    OPENCODE_SESSION_HEADER,
+    get_or_create_vlm_session_id,
+    header_name_ci_match,
+)
 from openviking_cli.utils import get_logger
 
 from ..base import ToolCall, VLMBase, VLMResponse
@@ -195,7 +200,7 @@ class LiteLLMVLMProvider(VLMBase):
         """Resolve model name by applying provider prefixes."""
         if _has_litellm_prefix(model, EXPLICIT_LITELLM_PREFIXES):
             return model
-        if model.lower().startswith(("openai/", *OLLAMA_LITELLM_PREFIXES)):
+        if model.lower().startswith("openai/"):
             return model
 
         provider = self._detected_provider or detect_provider_by_model(model)
@@ -303,8 +308,13 @@ class LiteLLMVLMProvider(VLMBase):
             is_google_endpoint = _is_google_generate_language_endpoint(self.api_base)
             if not is_google_endpoint:
                 kwargs["api_base"] = self.api_base
-        if self._extra_headers:
-            kwargs["extra_headers"] = self._extra_headers
+        headers = dict(self._extra_headers or {})
+        # Same OpenCode Go MissingSessionID gap as OpenAIVLM (#4782): inject a
+        # sticky per-context session id unless the caller already set one.
+        if not header_name_ci_match(headers, OPENCODE_SESSION_HEADER):
+            headers[OPENCODE_SESSION_HEADER] = get_or_create_vlm_session_id()
+        if headers:
+            kwargs["extra_headers"] = headers
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
@@ -315,16 +325,9 @@ class LiteLLMVLMProvider(VLMBase):
         # truncates long prompts to its 4096-token default; thinking models left
         # in thinking mode emit only reasoning and stall on CPU. Set safe
         # defaults, but let extra_request_body override either.
-        #
-        # ``num_ctx`` must be a top-level argument, not part of ``extra_body``:
-        # LiteLLM forwards ``extra_body`` verbatim as top-level JSON while Ollama
-        # only reads ``num_ctx`` from ``options``, so an ``extra_body`` value is
-        # silently ignored and the window stays at the 4096 default. ``think`` is
-        # accepted top-level by Ollama either way.
         if _has_litellm_prefix(model, OLLAMA_LITELLM_PREFIXES):
             extra = kwargs.get("extra_body", {})
-            num_ctx = extra.pop("num_ctx", None)
-            kwargs["num_ctx"] = num_ctx if num_ctx is not None else OLLAMA_DEFAULT_NUM_CTX
+            extra.setdefault("num_ctx", OLLAMA_DEFAULT_NUM_CTX)
             extra.setdefault("think", self._effective_thinking(thinking))
             kwargs["extra_body"] = extra
 
