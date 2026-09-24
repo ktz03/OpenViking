@@ -1,0 +1,170 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""CLI filesystem operation tests (ls, tree, stat, mkdir, rm, mv)."""
+
+import os
+import tempfile
+import uuid
+
+import pytest
+from conftest import ov, ov_add_resource, ov_cp, ov_mkdir, ov_mv, ov_rm
+
+pytestmark = pytest.mark.cli_remote
+
+
+class TestFsLs:
+    def test_ls_root(self):
+        r = ov(["ls", "viking://", "-o", "json"])
+        if r["exit_code"] != 0:
+            r = ov(["ls", "viking://resources", "-o", "json"])
+        assert r["exit_code"] == 0, (
+            f"ov ls should exit 0, got {r['exit_code']}: {r['stderr'][:300]}"
+        )
+        data = r["json"]
+        assert data is not None, f"ov ls should return JSON, got stdout: {r['stdout'][:200]}"
+        assert data.get("ok") is True, f"Expected ok=true, got {data.get('ok')}"
+        assert "result" in data, "'result' field should exist"
+        assert isinstance(data["result"], list), "'result' should be a list"
+
+    def test_ls_resources(self):
+        r = ov(["ls", "viking://resources", "-o", "json"])
+        assert r["exit_code"] == 0, (
+            f"ov ls viking://resources should exit 0, got {r['exit_code']}: {r['stderr'][:300]}"
+        )
+        data = r["json"]
+        assert data is not None and data.get("ok") is True, "Expected ok=true"
+
+    def test_ls_simple(self):
+        r = ov(["ls", "viking://resources", "-s", "-o", "json"])
+        assert r["exit_code"] == 0, (
+            f"ov ls --simple should exit 0, got {r['exit_code']}: {r['stderr'][:300]}"
+        )
+
+    def test_ls_recursive(self):
+        r = ov(["ls", "viking://resources", "-r", "-o", "json", "-n", "5"])
+        assert r["exit_code"] == 0, (
+            f"ov ls --recursive should exit 0, got {r['exit_code']}: {r['stderr'][:300]}"
+        )
+
+
+class TestFsTree:
+    def test_tree_resources(self, test_dir_uri):
+        r = ov(["tree", test_dir_uri, "-o", "json"])
+        assert r["exit_code"] == 0, (
+            f"ov tree should exit 0, got {r['exit_code']}: {r['stderr'][:300]}"
+        )
+        data = r["json"]
+        assert data is not None and data.get("ok") is True, "Expected ok=true"
+        assert "result" in data, "'result' field should exist"
+
+
+class TestFsStat:
+    def test_stat_root(self):
+        r = ov(["stat", "viking://", "-o", "json"])
+        assert r["exit_code"] == 0, (
+            f"ov stat should exit 0, got {r['exit_code']}: {r['stderr'][:300]}"
+        )
+        data = r["json"]
+        assert data is not None, f"ov stat should return JSON, got stdout: {r['stdout'][:200]}"
+        assert data.get("ok") is True, f"Expected ok=true, got {data.get('ok')}"
+        assert "result" in data, "'result' field should exist"
+        result = data["result"]
+        assert "isDir" in result, (
+            f"'isDir' should exist in stat result, got keys: {list(result.keys())}"
+        )
+        assert result["isDir"] is True, "root should be a directory"
+
+    def test_stat_file(self, test_file_uri):
+        r = ov(["stat", test_file_uri, "-o", "json"])
+        assert r["exit_code"] == 0, (
+            f"ov stat on file should exit 0, got {r['exit_code']}: {r['stderr'][:300]}"
+        )
+        data = r["json"]
+        assert data is not None and data.get("ok") is True, "Expected ok=true"
+        result = data["result"]
+        assert result.get("isDir") is False, "file stat should have isDir=false"
+
+
+class TestFsMkdir:
+    def test_mkdir(self, test_dir_uri):
+        sub_dir = f"{test_dir_uri}/mkdir_test"
+        r = ov_mkdir(sub_dir)
+        assert r["exit_code"] == 0, (
+            f"ov mkdir should exit 0, got {r['exit_code']}: {r['stderr'][:300]}"
+        )
+        assert "Directory created" in r["stdout"] or (r["json"] and r["json"].get("ok")), (
+            f"mkdir should confirm creation, got: {r['stdout'][:200]}"
+        )
+        ov_rm(sub_dir)
+
+    def test_mkdir_with_description(self, test_dir_uri):
+        sub_dir = f"{test_dir_uri}/mkdir_desc"
+        r = ov_mkdir(sub_dir, "--description", "CLI test directory")
+        assert r["exit_code"] == 0, (
+            f"ov mkdir with description should exit 0, got {r['exit_code']}: {r['stderr'][:300]}"
+        )
+        ov_rm(sub_dir)
+
+
+class TestFsRm:
+    def test_rm_directory(self, test_dir_uri):
+        sub_dir = f"{test_dir_uri}/rm_test"
+        ov_mkdir(sub_dir)
+        r = ov_rm(sub_dir)
+        assert r["exit_code"] == 0, (
+            f"ov rm should exit 0, got {r['exit_code']}: {r['stderr'][:300]}"
+        )
+        assert "Removed" in r["stdout"] or (r["json"] and r["json"].get("ok")), (
+            f"rm should confirm removal, got: {r['stdout'][:200]}"
+        )
+
+
+class TestFsMv:
+    def test_mv_directory(self, test_dir_uri):
+        src_uri = f"{test_dir_uri}/mv_src_{uuid.uuid4().hex[:6]}"
+        dst_uri = f"{test_dir_uri}/mv_dst_{uuid.uuid4().hex[:6]}"
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w") as f:
+            f.write("move me")
+            temp_path = f.name
+        try:
+            ov_add_resource(temp_path, src_uri)
+        finally:
+            os.unlink(temp_path)
+        r = ov_mv(src_uri, dst_uri)
+        assert r["exit_code"] == 0, (
+            f"ov mv should exit 0, got {r['exit_code']}: {r['stderr'][:300]}"
+        )
+        ov_rm(dst_uri)
+
+
+class TestFsCp:
+    def test_cp_file_json_and_human_output(self, test_dir_uri, test_file_uri):
+        suffix = uuid.uuid4().hex[:6]
+        json_target = f"{test_dir_uri}/cp_json_{suffix}.txt"
+        human_target = f"{test_dir_uri}/cp_human_{suffix}.txt"
+        try:
+            json_result = ov_cp(test_file_uri, json_target)
+            assert json_result["exit_code"] == 0, json_result["stderr"]
+            assert json_result["json"] and json_result["json"].get("ok") is True
+
+            human_result = ov_cp(test_file_uri, human_target, output=None)
+            assert human_result["exit_code"] == 0, human_result["stderr"]
+            assert "Copied:" in human_result["stdout"]
+        finally:
+            ov_rm(json_target)
+            ov_rm(human_target)
+
+    def test_cp_directory_requires_recursive(self, test_dir_uri):
+        suffix = uuid.uuid4().hex[:6]
+        source = f"{test_dir_uri}/cp_dir_source_{suffix}"
+        target = f"{test_dir_uri}/cp_dir_target_{suffix}"
+        try:
+            assert ov_mkdir(source)["exit_code"] == 0
+            without_recursive = ov_cp(source, target)
+            assert without_recursive["exit_code"] != 0
+
+            recursive = ov_cp(source, target, recursive=True)
+            assert recursive["exit_code"] == 0, recursive["stderr"]
+        finally:
+            ov_rm(source)
+            ov_rm(target)

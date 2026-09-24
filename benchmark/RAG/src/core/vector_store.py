@@ -1,0 +1,116 @@
+import os
+import sys
+import time
+from pathlib import Path
+from typing import List
+
+sys.path.append(str(Path(__file__).parent.parent))
+
+import tiktoken
+from adapters.base import StandardDoc
+from openviking_sdk import SyncHTTPClient
+
+
+class VikingStoreWrapper:
+    def __init__(self):
+        self.client = SyncHTTPClient()
+        self.client.initialize()
+
+        try:
+            self.enc = tiktoken.get_encoding("cl100k_base")
+        except Exception as e:
+            print(f"[Warning] tiktoken init failed: {e}")
+            self.enc = None
+
+    def count_tokens(self, text: str) -> int:
+        if not text or not self.enc:
+            return 0
+        return len(self.enc.encode(str(text)))
+
+    def ingest(
+        self, samples: List[StandardDoc], max_workers=10, monitor=None, ingest_mode="per_file"
+    ) -> dict:
+        start_time = time.time()
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_embedding_tokens = 0
+
+        if not samples:
+            return {"time": time.time() - start_time, "input_tokens": 0, "output_tokens": 0}
+
+        if ingest_mode == "directory":
+            doc_paths = [os.path.abspath(s.doc_path) for s in samples]
+            common_ancestor = None
+            if doc_paths:
+                try:
+                    common_ancestor = os.path.commonpath(doc_paths)
+                except ValueError:
+                    common_ancestor = None
+
+            if common_ancestor:
+                result = self.client.add_resource(
+                    path=common_ancestor,
+                    wait=True,
+                    options={"telemetry": True},
+                )
+                telemetry = result.get("telemetry", {})
+                summary = telemetry.get("summary", {})
+                tokens = summary.get("tokens", {})
+                llm_tokens = tokens.get("llm", {})
+                embedding_tokens = tokens.get("embedding", {})
+                total_input_tokens = llm_tokens.get("input", 0)
+                total_output_tokens = llm_tokens.get("output", 0)
+                total_embedding_tokens = embedding_tokens.get("total", 0)
+            else:
+                for sample in samples:
+                    result = self.client.add_resource(
+                        path=sample.doc_path,
+                        wait=True,
+                        options={"telemetry": True},
+                    )
+                    telemetry = result.get("telemetry", {})
+                    summary = telemetry.get("summary", {})
+                    tokens = summary.get("tokens", {})
+                    llm_tokens = tokens.get("llm", {})
+                    embedding_tokens = tokens.get("embedding", {})
+                    total_input_tokens += llm_tokens.get("input", 0)
+                    total_output_tokens += llm_tokens.get("output", 0)
+                    total_embedding_tokens += embedding_tokens.get("total", 0)
+        else:
+            for sample in samples:
+                result = self.client.add_resource(
+                    path=sample.doc_path,
+                    wait=True,
+                    options={"telemetry": True},
+                )
+                telemetry = result.get("telemetry", {})
+                summary = telemetry.get("summary", {})
+                tokens = summary.get("tokens", {})
+                llm_tokens = tokens.get("llm", {})
+                embedding_tokens = tokens.get("embedding", {})
+                total_input_tokens += llm_tokens.get("input", 0)
+                total_output_tokens += llm_tokens.get("output", 0)
+                total_embedding_tokens += embedding_tokens.get("total", 0)
+
+        return {
+            "time": time.time() - start_time,
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
+            "embedding_tokens": total_embedding_tokens,
+        }
+
+    def retrieve(self, query: str, topk: int, target_uri: str = "viking://resources"):
+        """Execute retrieval"""
+        return self.client.find(
+            query=query,
+            target_uri=target_uri,
+            limit=topk,
+        )
+
+    def read_resource(self, uri: str) -> str:
+        """Read resource content"""
+        return str(self.client.read(uri))
+
+    def clear(self):
+        """Clear the store"""
+        self.client.rm("viking://resources", recursive=True)

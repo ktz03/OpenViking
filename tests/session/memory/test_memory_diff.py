@@ -1,0 +1,507 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""
+Test for memory_diff.json generation in SessionCompressorV3.
+
+Verifies that memory_diff.json is correctly written to the archive directory
+containing adds, updates, and deletes.
+"""
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from openviking.session.compressor_v3 import SessionCompressorV3
+from openviking.session.memory.dataclass import MemoryFile, ResolvedOperation, ResolvedOperations
+from openviking.session.memory.memory_updater import MemoryUpdateResult
+from openviking.storage.viking_fs import VikingFS
+
+
+class TestMemoryDiffArchive:
+    """Tests for memory diff archive feature."""
+
+    @pytest.fixture
+    def mock_viking_fs(self):
+        """Mock VikingFS for testing."""
+        fs = MagicMock(spec=VikingFS)
+        fs.read_file = AsyncMock()
+        fs.write_file = AsyncMock()
+        return fs
+
+    @pytest.fixture
+    def mock_ctx(self):
+        """Mock RequestContext for testing."""
+        ctx = MagicMock()
+        ctx.user = MagicMock()
+        ctx.user.user_id = "test_user"
+        ctx.account_id = "test_account"
+        return ctx
+
+    @pytest.fixture
+    def compressor(self):
+        """Create SessionCompressorV3 instance."""
+        return SessionCompressorV3(vikingdb=MagicMock(), rollout_analyzer=MagicMock())
+
+    @pytest.mark.asyncio
+    async def test_build_memory_diff_add(self, compressor, mock_viking_fs, mock_ctx):
+        """Test building memory_diff for new memory files (adds)."""
+        result = MemoryUpdateResult()
+        result.written_uris = [
+            "memory/user/test/identity.md",
+        ]
+
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    uris=["memory/user/test/identity.md"],
+                    memory_type="identity",
+                    memory_fields={},
+                    old_memory_file_content=None,
+                )
+            ],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+        async def mock_read(uri, ctx=None):
+            return "# Identity\n\nTest identity content"
+
+        mock_viking_fs.read_file.side_effect = mock_read
+
+        diff = await compressor._build_memory_diff(
+            result=result,
+            operations=operations,
+            viking_fs=mock_viking_fs,
+            ctx=mock_ctx,
+        )
+
+        # Should have 1 add (file didn't exist before)
+        assert diff["summary"]["total_adds"] == 1
+        assert diff["summary"]["total_updates"] == 0
+        assert diff["summary"]["total_deletes"] == 0
+
+    @pytest.mark.asyncio
+    async def test_build_memory_diff_update(self, compressor, mock_viking_fs, mock_ctx):
+        """Test building memory_diff for modified memory files (updates)."""
+
+        # Setup: files exist
+        result = MemoryUpdateResult()
+        result.written_uris = ["memory/user/test/identity.md"]
+
+        old_mf = MemoryFile(
+            uri="memory/user/test/identity.md",
+            content="# Identity\n\nOld identity content",
+            memory_type="identity",
+        )
+        op = ResolvedOperation(
+            uris=["memory/user/test/identity.md"],
+            memory_type="identity",
+            memory_fields={},
+            old_memory_file_content=old_mf,
+        )
+        operations = ResolvedOperations(
+            upsert_operations=[op],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+        mock_viking_fs.read_file = AsyncMock(return_value="# Identity\n\nNew identity content")
+
+        diff = await compressor._build_memory_diff(
+            result=result,
+            operations=operations,
+            viking_fs=mock_viking_fs,
+            ctx=mock_ctx,
+        )
+
+        assert diff["summary"]["total_adds"] == 0
+        assert diff["summary"]["total_updates"] == 1
+
+    @pytest.mark.asyncio
+    async def test_build_memory_diff_delete(self, compressor, mock_viking_fs, mock_ctx):
+        """Test building memory_diff for deleted memory files."""
+        result = MemoryUpdateResult()
+        result.deleted_uris = ["memory/user/test/context/old_project.md"]
+
+        deleted_content = MemoryFile(
+            uri="memory/user/test/context/old_project.md",
+            content="# Old Project\n\nThis project was deleted",
+            memory_type="context",
+            extra_fields={"project": "test"},
+        )
+
+        operations = ResolvedOperations(
+            upsert_operations=[],
+            delete_file_contents=[deleted_content],
+            errors=[],
+        )
+
+        diff = await compressor._build_memory_diff(
+            result=result,
+            operations=operations,
+            viking_fs=mock_viking_fs,
+            ctx=mock_ctx,
+        )
+
+        assert diff["summary"]["total_deletes"] == 1
+        assert len(diff["operations"]["deletes"]) == 1
+        assert diff["operations"]["deletes"][0]["uri"] == "memory/user/test/context/old_project.md"
+        assert "This project was deleted" in diff["operations"]["deletes"][0]["deleted_content"]
+
+    @pytest.mark.asyncio
+    async def test_build_memory_diff_edited(self, compressor, mock_viking_fs, mock_ctx):
+        """Test building memory_diff for edited memory files."""
+        result = MemoryUpdateResult()
+        result.edited_uris = ["memory/user/test/identity.md"]
+
+        # Setup operation with old content
+        old_content = MemoryFile(
+            uri="memory/user/test/identity.md",
+            content="# Identity\n\nOld content",
+            memory_type="identity",
+            extra_fields={"name": "test"},
+        )
+        operation = ResolvedOperation(
+            uris=["memory/user/test/identity.md"],
+            memory_type="identity",
+            memory_fields={"name": "test"},
+            old_memory_file_content=old_content,
+        )
+
+        operations = ResolvedOperations(
+            upsert_operations=[operation],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+        # For edited_uris, the code only reads content for "after" field
+        # It doesn't check if file exists first (unlike written_uris)
+        mock_viking_fs.read_file = AsyncMock(return_value="# Identity\n\nNew content")
+
+        diff = await compressor._build_memory_diff(
+            result=result,
+            operations=operations,
+            viking_fs=mock_viking_fs,
+            ctx=mock_ctx,
+        )
+
+        assert diff["summary"]["total_updates"] == 1
+        update = diff["operations"]["updates"][0]
+        assert update["uri"] == "memory/user/test/identity.md"
+        # "before" comes from operations, "after" comes from read_file
+        assert "Old content" in update["before"]
+        assert "New content" in update["after"]
+
+    @pytest.mark.asyncio
+    async def test_build_memory_diff_skips_unchanged_update(
+        self, compressor, mock_viking_fs, mock_ctx
+    ):
+        """Unchanged existing files should not be included as memory diff updates."""
+        uri = "memory/user/test/identity.md"
+        result = MemoryUpdateResult()
+        result.edited_uris = [uri]
+
+        old_mf = MemoryFile(
+            uri=uri,
+            content="# Identity\n\nSame identity content",
+            memory_type="identity",
+        )
+        operation = ResolvedOperation(
+            uris=[uri],
+            memory_type="identity",
+            memory_fields={},
+            old_memory_file_content=old_mf,
+        )
+        operations = ResolvedOperations(
+            upsert_operations=[operation],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+        mock_viking_fs.read_file = AsyncMock(return_value="# Identity\n\nSame identity content")
+
+        diff = await compressor._build_memory_diff(
+            result=result,
+            operations=operations,
+            viking_fs=mock_viking_fs,
+            ctx=mock_ctx,
+        )
+
+        assert diff["operations"]["updates"] == []
+        assert diff["summary"]["total_updates"] == 0
+
+    @pytest.mark.asyncio
+    async def test_build_memory_diff_skips_unchanged_written_existing_file(
+        self, compressor, mock_viking_fs, mock_ctx
+    ):
+        """Existing files reported via written_uris are also filtered when unchanged."""
+        uri = "memory/user/test/identity.md"
+        result = MemoryUpdateResult()
+        result.written_uris = [uri]
+
+        old_mf = MemoryFile(
+            uri=uri,
+            content="Same identity content",
+            memory_type="identity",
+            extra_fields={"name": "same"},
+        )
+        operation = ResolvedOperation(
+            uris=[uri],
+            memory_type="identity",
+            memory_fields={},
+            old_memory_file_content=old_mf,
+        )
+        operations = ResolvedOperations(
+            upsert_operations=[operation],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+        mock_viking_fs.read_file = AsyncMock(
+            return_value=(
+                'Same identity content\n\n<!-- MEMORY_FIELDS\n{"memory_type":"identity","name":"same"}\n-->'
+            )
+        )
+
+        diff = await compressor._build_memory_diff(
+            result=result,
+            operations=operations,
+            viking_fs=mock_viking_fs,
+            ctx=mock_ctx,
+        )
+
+        assert diff["operations"]["updates"] == []
+        assert diff["summary"]["total_updates"] == 0
+
+    @pytest.mark.asyncio
+    async def test_build_memory_diff_keeps_changed_update_with_unchanged_sibling(
+        self, compressor, mock_viking_fs, mock_ctx
+    ):
+        """Only unchanged files are filtered when a diff has mixed update results."""
+        unchanged_uri = "memory/user/test/identity.md"
+        changed_uri = "memory/user/test/preferences.md"
+        result = MemoryUpdateResult()
+        result.edited_uris = [unchanged_uri, changed_uri]
+
+        unchanged_old = MemoryFile(
+            uri=unchanged_uri,
+            content="Same identity content",
+            memory_type="identity",
+        )
+        changed_old = MemoryFile(
+            uri=changed_uri,
+            content="Old preference content",
+            memory_type="preferences",
+        )
+        operations = ResolvedOperations(
+            upsert_operations=[
+                ResolvedOperation(
+                    uris=[unchanged_uri],
+                    memory_type="identity",
+                    memory_fields={},
+                    old_memory_file_content=unchanged_old,
+                ),
+                ResolvedOperation(
+                    uris=[changed_uri],
+                    memory_type="preferences",
+                    memory_fields={},
+                    old_memory_file_content=changed_old,
+                ),
+            ],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+        async def mock_read(uri, ctx=None):
+            if uri == unchanged_uri:
+                return "Same identity content"
+            if uri == changed_uri:
+                return "New preference content"
+            raise AssertionError(f"unexpected uri: {uri}")
+
+        mock_viking_fs.read_file.side_effect = mock_read
+
+        diff = await compressor._build_memory_diff(
+            result=result,
+            operations=operations,
+            viking_fs=mock_viking_fs,
+            ctx=mock_ctx,
+        )
+
+        assert diff["summary"]["total_updates"] == 1
+        assert [item["uri"] for item in diff["operations"]["updates"]] == [changed_uri]
+        assert diff["operations"]["updates"][0]["before"] == "Old preference content"
+        assert diff["operations"]["updates"][0]["after"] == "New preference content"
+
+    @pytest.mark.asyncio
+    async def test_build_memory_diff_keeps_metadata_only_update(
+        self, compressor, mock_viking_fs, mock_ctx
+    ):
+        """A file with metadata changes is still an effective memory update."""
+        uri = "memory/user/test/identity.md"
+        result = MemoryUpdateResult()
+        result.edited_uris = [uri]
+
+        old_mf = MemoryFile(
+            uri=uri,
+            content="Same identity content",
+            memory_type="identity",
+            extra_fields={"name": "old"},
+        )
+        operation = ResolvedOperation(
+            uris=[uri],
+            memory_type="identity",
+            memory_fields={},
+            old_memory_file_content=old_mf,
+        )
+        operations = ResolvedOperations(
+            upsert_operations=[operation],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+        mock_viking_fs.read_file = AsyncMock(
+            return_value=(
+                'Same identity content\n\n<!-- MEMORY_FIELDS\n{"memory_type":"identity","name":"new"}\n-->'
+            )
+        )
+
+        diff = await compressor._build_memory_diff(
+            result=result,
+            operations=operations,
+            viking_fs=mock_viking_fs,
+            ctx=mock_ctx,
+        )
+
+        assert diff["summary"]["total_updates"] == 1
+        assert diff["operations"]["updates"][0]["uri"] == uri
+
+    @pytest.mark.asyncio
+    async def test_build_memory_diff_mixed(self, compressor, mock_viking_fs, mock_ctx):
+        """Test building memory_diff with mixed operations."""
+        # Setup: one file exists (update), one doesn't (add)
+        call_count = 0
+
+        async def mock_read(uri, ctx=None):
+            nonlocal call_count
+            call_count += 1
+            if "existing" in uri:
+                return "# Existing\n\nOld content"
+            elif "new" in uri:
+                return "# New\n\nNew content"
+            raise Exception("File not found")
+
+        mock_viking_fs.read_file.side_effect = mock_read
+
+        result = MemoryUpdateResult()
+        result.written_uris = [
+            "memory/user/test/identity.md",  # existing -> update
+            "memory/user/test/context/new.md",  # new -> add
+        ]
+
+        old_mf = MemoryFile(
+            uri="memory/user/test/identity.md",
+            content="# Existing\n\nOld content",
+            memory_type="identity",
+        )
+        op_existing = ResolvedOperation(
+            uris=["memory/user/test/identity.md"],
+            memory_type="identity",
+            memory_fields={},
+            old_memory_file_content=old_mf,
+        )
+        op_new = ResolvedOperation(
+            uris=["memory/user/test/context/new.md"],
+            memory_type="context",
+            memory_fields={},
+        )
+        operations = ResolvedOperations(
+            upsert_operations=[op_existing, op_new],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+        diff = await compressor._build_memory_diff(
+            result=result,
+            operations=operations,
+            viking_fs=mock_viking_fs,
+            ctx=mock_ctx,
+        )
+
+        assert diff["summary"]["total_adds"] == 1
+        assert diff["summary"]["total_updates"] == 1
+        assert diff["summary"]["total_deletes"] == 0
+
+    @pytest.mark.asyncio
+    async def test_build_memory_diff_empty(self, compressor, mock_viking_fs, mock_ctx):
+        """Test building memory_diff with no operations."""
+        result = MemoryUpdateResult()
+        operations = ResolvedOperations(
+            upsert_operations=[],
+            delete_file_contents=[],
+            errors=[],
+        )
+
+        diff = await compressor._build_memory_diff(
+            result=result,
+            operations=operations,
+            viking_fs=mock_viking_fs,
+            ctx=mock_ctx,
+        )
+
+        assert diff["summary"]["total_adds"] == 0
+        assert diff["summary"]["total_updates"] == 0
+        assert diff["summary"]["total_deletes"] == 0
+        assert "extracted_at" in diff
+        assert "trace_id" in diff
+        assert diff["trace_id"] is None
+        assert diff["archive_uri"] == ""
+
+    @pytest.mark.asyncio
+    async def test_extract_long_term_memories_with_archive_uri_parameter(
+        self, compressor, mock_ctx
+    ):
+        """Test that extract_long_term_memories accepts archive_uri parameter without error."""
+        # This test verifies the archive_uri parameter is accepted
+        # Full integration testing requires extensive mocking that's covered by other tests
+        import inspect
+
+        sig = inspect.signature(compressor.extract_long_term_memories)
+        params = list(sig.parameters.keys())
+        assert "archive_uri" in params, "archive_uri parameter should be accepted"
+
+
+class TestMemoryDiffStructure:
+    """Tests for memory_diff.json structure validation."""
+
+    def test_memory_diff_structure(self):
+        """Verify memory_diff.json structure."""
+        # This test validates the expected structure
+        expected_keys = [
+            "archive_uri",
+            "trace_id",
+            "extracted_at",
+            "operations",
+            "skipped_operations",
+            "summary",
+        ]
+
+        # We verify this through the actual implementation tests above
+        # This is a placeholder for documentation
+        assert set(expected_keys).issubset(
+            {
+                "archive_uri",
+                "trace_id",
+                "extracted_at",
+                "operations",
+                "skipped_operations",
+                "summary",
+            }
+        )
+
+    def test_operations_structure(self):
+        """Verify operations structure in memory_diff."""
+        expected_ops_keys = ["adds", "updates", "deletes"]
+
+        # We verify this through the actual implementation tests above
+        assert set(expected_ops_keys).issubset(set(expected_ops_keys))

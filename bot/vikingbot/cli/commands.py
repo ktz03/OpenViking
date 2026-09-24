@@ -1,0 +1,1494 @@
+"""CLI commands for vikingbot."""
+
+import asyncio
+import json
+import os
+import select
+import signal
+import socket
+import sys
+import time
+import warnings
+from pathlib import Path
+from typing import Any, Optional
+
+import typer
+from loguru import logger
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import FormattedText
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.styles import Style as PromptStyle
+from rich.console import Console
+from rich.table import Table
+
+from openviking.utils.time_utils import parse_iso_datetime
+from vikingbot import __logo__, __version__
+from vikingbot.agent.loop import AgentLoop
+from vikingbot.bus.queue import MessageBus
+from vikingbot.channels.manager import ChannelManager
+from vikingbot.config.loader import (
+    ensure_config,
+    get_config_path,
+    get_data_dir,
+    load_config,
+    validate_openviking_auth,
+)
+from vikingbot.config.schema import Config, SessionKey, requires_gateway_token
+from vikingbot.cron.service import CronService
+from vikingbot.cron.types import CronJob
+from vikingbot.heartbeat.service import HeartbeatService
+from vikingbot.integrations.langfuse import LangfuseClient
+from vikingbot.observability.feedback_stats import (
+    compute_feedback_stats,
+    format_feedback_stats_table,
+    select_feedback_stats,
+    validate_feedback_stats_sort_by,
+)
+
+# Create sandbox manager
+from vikingbot.sandbox.manager import SandboxManager
+from vikingbot.session.manager import SessionManager
+from vikingbot.utils.helpers import (
+    get_bridge_path,
+    get_history_path,
+    get_source_workspace_path,
+    set_bot_data_path,
+)
+
+# Ignore Pydantic V1 compatibility warning with Python 3.14+ from volcenginesdkarkruntime
+warnings.filterwarnings(
+    "ignore",
+    message="Core Pydantic V1 functionality isn't compatible with Python 3.14 or greater.",
+    category=UserWarning,
+    module="volcenginesdkarkruntime._compat",
+)
+
+app = typer.Typer(
+    name="vikingbot",
+    help=f"{__logo__} vikingbot - Personal AI Assistant",
+    no_args_is_help=True,
+)
+
+console = Console()
+EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
+_CHAT_PROMPT_MESSAGE = FormattedText([("class:user-label", "You: ")])
+_CHAT_PROMPT_STYLE = PromptStyle.from_dict(
+    {
+        "": "fg:ansidefault",
+        "user-label": "bold fg:ansicyan",
+    }
+)
+
+
+def _warn_deprecated_memory_user(memory_user: list[str] | None) -> None:
+    if not memory_user:
+        return
+    typer.secho(
+        "Warning: --memory-user is deprecated and only kept for explicit owner-user lookup. "
+        "Use --memory-peer for the current OpenViking User/Peer model.",
+        fg=typer.colors.YELLOW,
+        err=True,
+    )
+
+
+def _redirect_openviking_logs_to_stderr() -> None:
+    """Redirect openviking/openviking_cli standard-library loggers to stderr.
+
+    This prevents log output (e.g. deprecation warnings from memory_config)
+    from polluting stdout when vikingbot chat is used in --eval mode or piped.
+    """
+    import logging
+
+    for root_name in ("openviking", "openviking_cli"):
+        root_logger = logging.getLogger(root_name)
+        # If the logger has no handlers yet, add a stderr handler now.
+        # If it already has handlers, swap any stdout StreamHandlers to stderr.
+        if not root_logger.handlers:
+            handler = logging.StreamHandler(sys.stderr)
+            formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+            handler.setFormatter(formatter)
+            root_logger.addHandler(handler)
+            root_logger.propagate = False
+        else:
+            for handler in root_logger.handlers:
+                if isinstance(handler, logging.StreamHandler) and handler.stream is sys.stdout:
+                    handler.setStream(sys.stderr)
+
+    # Also redirect Python warnings to stderr
+    warnings.simplefilter("default")
+    if not any(
+        isinstance(h, logging.StreamHandler) and h.stream is sys.stderr
+        for h in logging.getLogger("py.warnings").handlers
+    ):
+        logging.captureWarnings(True)
+        py_warnings_logger = logging.getLogger("py.warnings")
+        py_warnings_logger.addHandler(logging.StreamHandler(sys.stderr))
+
+
+def get_or_create_machine_id() -> str:
+    """Get a unique machine ID using py-machineid.
+
+    Uses the system's machine ID, falls back to "default" if unavailable.
+    """
+    try:
+        from machineid import machine_id
+
+        return machine_id()
+    except ImportError:
+        # Fallback if py-machineid is not installed
+        pass
+    except Exception:
+        pass
+
+    # Default fallback
+    return "default"
+
+
+def _init_bot_data(config):
+    """Initialize bot data directory and set global paths."""
+    set_bot_data_path(config.bot_data_path)
+
+
+def _abort_if_port_in_use(port: int, label: str) -> None:
+    """Exit with a clear message if anything is already listening on ``port``.
+
+    Without this check, a stale process holding the port keeps serving
+    traffic while a freshly-started gateway silently fails to bind — the
+    operator believes they upgraded but the old (potentially unpatched)
+    binary is still answering requests.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        try:
+            s.connect(("127.0.0.1", port))
+            in_use = True
+        except (ConnectionRefusedError, socket.timeout, OSError):
+            in_use = False
+    if in_use:
+        print(
+            f"Error: {label} port {port} is already in use.\n"
+            f"  A previous process is still bound — refusing to start a duplicate.\n"
+            f"  Identify it:  lsof -nP -iTCP:{port} -sTCP:LISTEN\n"
+            f"  Kill it, then retry.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _get_gateway_token(config) -> str:
+    gateway = getattr(config, "gateway", None)
+    if gateway is None:
+        return ""
+    return getattr(gateway, "token", "") or ""
+
+
+def _gateway_startup_mode(config, host: str) -> str:
+    ov_server = getattr(config, "ov_server", None)
+    server_url = str(getattr(ov_server, "server_url", "") or "").strip()
+    source_getter = getattr(ov_server, "get_config_source", None)
+    source = source_getter() if callable(source_getter) else getattr(ov_server, "_source", "none")
+    source = str(source or "none").strip().lower()
+    if server_url:
+        if source == "explicit":
+            return "openviking_explicit"
+        return "openviking_inherited"
+    return "standalone_public" if requires_gateway_token(host, "") else "standalone_local"
+
+
+# ---------------------------------------------------------------------------
+# CLI input: prompt_toolkit for editing, paste, history, and display
+# ---------------------------------------------------------------------------
+
+_PROMPT_SESSION: PromptSession | None = None
+_SAVED_TERM_ATTRS = None  # original termios settings, restored on exit
+
+
+def _flush_pending_tty_input() -> None:
+    """Drop unread keypresses typed while the model was generating output."""
+    try:
+        fd = sys.stdin.fileno()
+        if not os.isatty(fd):
+            return
+    except Exception:
+        return
+
+    try:
+        import termios
+
+        termios.tcflush(fd, termios.TCIFLUSH)
+        return
+    except Exception:
+        pass
+
+    try:
+        while True:
+            ready, _, _ = select.select([fd], [], [], 0)
+            if not ready:
+                break
+            if not os.read(fd, 4096):
+                break
+    except Exception:
+        return
+
+
+def _restore_terminal() -> None:
+    """Restore terminal to its original state (echo, line buffering, etc.)."""
+    if _SAVED_TERM_ATTRS is None:
+        return
+    try:
+        import termios
+
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _SAVED_TERM_ATTRS)
+    except Exception:
+        pass
+
+
+def _init_prompt_session() -> None:
+    """Create the prompt_toolkit session with persistent file history."""
+    global _PROMPT_SESSION, _SAVED_TERM_ATTRS
+
+    # Save terminal state so we can restore it on exit
+    try:
+        import termios
+
+        _SAVED_TERM_ATTRS = termios.tcgetattr(sys.stdin.fileno())
+    except Exception:
+        pass
+
+    history_file = get_history_path() / "cli_history"
+    history_file.parent.mkdir(parents=True, exist_ok=True)
+
+    _PROMPT_SESSION = PromptSession(
+        history=FileHistory(str(history_file)),
+        enable_open_in_editor=False,
+        multiline=False,  # Enter submits (single line mode)
+    )
+
+
+def _is_exit_command(command: str) -> bool:
+    """Return True when input should end interactive chat."""
+    return command.lower() in EXIT_COMMANDS
+
+
+async def _read_interactive_input_async() -> str:
+    """Read user input using prompt_toolkit (handles paste, history, display).
+
+    prompt_toolkit natively handles:
+    - Multiline paste (bracketed paste mode)
+    - History navigation (up/down arrows)
+    - Clean display (no ghost characters or artifacts)
+    """
+    if _PROMPT_SESSION is None:
+        raise RuntimeError("Call _init_prompt_session() first")
+    try:
+        with patch_stdout():
+            return await _PROMPT_SESSION.prompt_async(
+                _CHAT_PROMPT_MESSAGE,
+                style=_CHAT_PROMPT_STYLE,
+            )
+    except EOFError as exc:
+        raise KeyboardInterrupt from exc
+
+
+def version_callback(value: bool):
+    if value:
+        console.print(f"{__logo__} vikingbot v{__version__}")
+        raise typer.Exit()
+
+
+@app.callback()
+def main(
+    version: bool = typer.Option(None, "--version", "-v", callback=version_callback, is_eager=True),
+):
+    """vikingbot - Personal AI Assistant."""
+    pass
+
+
+def _make_provider(config, langfuse_client: Any = None):
+    """Create LLM provider from configuration.
+
+    An explicit bot.agents.model or non-empty bot.agents.credentials uses the
+    Bot's own VLM configuration. Otherwise the complete root VLM configuration
+    is inherited, including its ordered credentials and failover behavior.
+    """
+    p = config.agents
+    model = p.model if p else None
+    temperature = p.temperature if p else 0.7
+    thinking = p.thinking if p else True
+    api_key = p.api_key if p else None
+    api_base = p.api_base if p else None
+    provider_name = p.provider if p else None
+    extra_headers = p.extra_headers if p else {}
+    timeout = p.timeout if p else None
+    max_tokens = getattr(p, "max_tokens", None) if p else None
+    credentials = list(getattr(p, "credentials", None) or [])
+
+    if not model and not credentials:
+        raise RuntimeError("No LLM model configured. Please set it in ~/.openviking/ov.conf")
+
+    inherits_root_vlm = False
+    inherits_root_vlm_getter = getattr(config, "inherits_root_vlm", None)
+    if callable(inherits_root_vlm_getter):
+        inherits_root_vlm = bool(inherits_root_vlm_getter())
+
+    if inherits_root_vlm:
+        from openviking_cli.utils.config.vlm_config import VLMConfig
+        from vikingbot.providers.vlm_adapter import VLMProviderAdapter
+
+        root_vlm_getter = getattr(config, "get_root_vlm_config", None)
+        root_vlm = root_vlm_getter() if callable(root_vlm_getter) else None
+        if root_vlm is None:
+            raise RuntimeError("Root VLM configuration is unavailable")
+
+        # Re-validate a fresh copy so the Bot keeps its existing generation
+        # settings without sharing a cached VLM instance with another runtime.
+        root_vlm_data = root_vlm.model_dump()
+        root_vlm_data["temperature"] = temperature
+        root_vlm_data["thinking"] = thinking
+        if timeout is not None:
+            root_vlm_data["timeout"] = timeout
+        if max_tokens is not None:
+            root_vlm_data["max_tokens"] = max_tokens
+        if extra_headers:
+            root_vlm_data["extra_headers"] = extra_headers
+        effective_vlm = VLMConfig.model_validate(root_vlm_data)
+        return VLMProviderAdapter(
+            vlm_instance=effective_vlm.get_vlm_instance(),
+            default_model=effective_vlm.model or model,
+            langfuse_client=langfuse_client,
+        )
+
+    if credentials:
+        from openviking_cli.utils.config.vlm_config import VLMConfig
+        from vikingbot.providers.vlm_adapter import VLMProviderAdapter
+
+        if not model:
+            missing_model_ids = [
+                credential.id or f"index-{index}"
+                for index, credential in enumerate(credentials)
+                if not credential.model
+            ]
+            if missing_model_ids:
+                raise RuntimeError(
+                    "bot.agents.model is omitted, so every bot.agents.credentials "
+                    "entry must define model; missing for: " + ", ".join(missing_model_ids)
+                )
+
+        bot_vlm_data: dict[str, Any] = {
+            # VLMConfig currently requires a parent model even when every
+            # credential has its own. Use the primary credential internally
+            # without persisting an outer bot.agents.model.
+            "model": model or credentials[0].model,
+            "temperature": temperature,
+            "thinking": thinking,
+            "credentials": credentials,
+            "failback_timeout_seconds": p.failback_timeout_seconds,
+            "failback_request_count": p.failback_request_count,
+        }
+        if provider_name:
+            bot_vlm_data["provider"] = provider_name
+        if timeout is not None:
+            bot_vlm_data["timeout"] = timeout
+        if max_tokens is not None:
+            bot_vlm_data["max_tokens"] = max_tokens
+        if api_key:
+            bot_vlm_data["api_key"] = api_key
+        if api_base:
+            bot_vlm_data["api_base"] = api_base
+        if extra_headers:
+            bot_vlm_data["extra_headers"] = extra_headers
+
+        effective_vlm = VLMConfig.model_validate(bot_vlm_data)
+        return VLMProviderAdapter(
+            vlm_instance=effective_vlm.get_vlm_instance(),
+            default_model=effective_vlm.model or credentials[0].model or "",
+            langfuse_client=langfuse_client,
+        )
+
+    # When provider is explicitly set, use VLMFactory to get the correct
+    # backend (e.g. VolcEngineVLM for volcengine, OpenAIVLM for openai).
+    # The VLM backend handles model name resolution internally, so no
+    # manual LiteLLM prefix is needed.
+    if provider_name:
+        from openviking.models.vlm.base import VLMFactory
+        from vikingbot.providers.vlm_adapter import VLMProviderAdapter
+
+        vlm_config: dict[str, Any] = {
+            "provider": provider_name,
+            "model": model,
+            "temperature": temperature,
+            "thinking": thinking,
+        }
+        if timeout is not None:
+            vlm_config["timeout"] = timeout
+        if max_tokens is not None:
+            vlm_config["max_tokens"] = max_tokens
+        if api_key:
+            vlm_config["api_key"] = api_key
+        if api_base:
+            vlm_config["api_base"] = api_base
+        if extra_headers:
+            vlm_config["extra_headers"] = extra_headers
+
+        vlm_instance = VLMFactory.create(vlm_config)
+        return VLMProviderAdapter(
+            vlm_instance=vlm_instance,
+            default_model=model,
+            langfuse_client=langfuse_client,
+        )
+
+    raise RuntimeError(
+        "No VLM provider configured for VikingBot. Set bot.agents.provider, "
+        "configure bot.agents.credentials, or inherit the root vlm configuration. "
+        "Set provider to 'litellm' to use LiteLLM."
+    )
+
+
+# ============================================================================
+# Gateway / Server
+# ============================================================================
+
+
+@app.command()
+def gateway(
+    port: Optional[int] = typer.Option(None, "--port", "-p", help="Gateway port"),
+    host: Optional[str] = typer.Option(None, "--host", help="Gateway host"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+    config_path: str = typer.Option(None, "--config", "-c", help="ov.conf path"),
+):
+    """Start the vikingbot gateway with OpenAPI chat enabled by default."""
+
+    if verbose:
+        import logging
+
+        logging.basicConfig(level=logging.DEBUG)
+
+    bus = MessageBus()
+    path = Path(config_path).expanduser() if config_path is not None else None
+    config = ensure_config(path)
+    from vikingbot.utils.startup import report_startup
+
+    startup_timeout = getattr(getattr(config, "sandbox", None), "backends", None)
+    report_startup(
+        "starting",
+        timeout=(startup_timeout.opensandbox.startup_timeout + 60) if startup_timeout else 600,
+    )
+    effective_host = host if host is not None else config.gateway.host
+    effective_port = port if port is not None else config.gateway.port
+    config.gateway.host = effective_host
+    config.gateway.port = effective_port
+    gateway_token = _get_gateway_token(config)
+    if requires_gateway_token(effective_host, gateway_token):
+        print(
+            "SECURITY: bot.gateway.token is required when gateway.host is non-localhost.\n"
+            "Set bot.gateway.token in ov.conf, or bind gateway.host to 127.0.0.1/localhost.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    validate_openviking_auth(config)
+    console.print(f"[green]✓[/green] Gateway mode: {_gateway_startup_mode(config, effective_host)}")
+    _abort_if_port_in_use(effective_port, "vikingbot gateway")
+    _init_bot_data(config)
+    session_manager = SessionManager(config.bot_data_path)
+
+    # Create FastAPI app for OpenAPI
+    from fastapi import FastAPI
+
+    fastapi_app = FastAPI(
+        title="Vikingbot OpenAPI",
+        description="HTTP API for Vikingbot chat",
+        version="1.0.0",
+    )
+
+    cron = prepare_cron(config, bus)
+    agent_loop = prepare_agent_loop(config, bus, session_manager, cron)
+    from vikingbot.compile.service import BotCompileService
+
+    compile_service = BotCompileService(agent_loop=agent_loop)
+    channels = prepare_channel(
+        config,
+        bus,
+        fastapi_app=fastapi_app,
+        enable_openapi=True,
+        openapi_port=effective_port,
+        compile_service=compile_service,
+    )
+    heartbeat = prepare_heartbeat(config, agent_loop, session_manager)
+
+    async def run():
+        import uvicorn
+
+        from vikingbot.sandbox.runtime import OpenSandboxRuntime
+
+        # Start uvicorn server for OpenAPI
+        config_uvicorn = uvicorn.Config(
+            fastapi_app,
+            host=effective_host,
+            port=effective_port,
+            log_level="info",
+        )
+        server = uvicorn.Server(config_uvicorn)
+
+        runtime = OpenSandboxRuntime(config)
+        manager = getattr(agent_loop, "sandbox_manager", None)
+        loop = asyncio.get_running_loop()
+        current = asyncio.current_task()
+        previous_sigterm = signal.signal(
+            signal.SIGTERM, lambda *_: loop.call_soon_threadsafe(current.cancel)
+        )
+        tasks = []
+
+        async def report_ready(server_task):
+            while not getattr(server, "started", False):
+                if server_task.done():
+                    return
+                await asyncio.sleep(0.05)
+            report_startup("ready")
+
+        try:
+            await runtime.start(manager)
+            await compile_service.start()
+            server_task = asyncio.create_task(server.serve())
+            tasks = [
+                server_task,
+                asyncio.create_task(report_ready(server_task)),
+                asyncio.create_task(heartbeat.start()),
+                asyncio.create_task(channels.start_all()),
+                asyncio.create_task(agent_loop.run()),
+            ]
+            if cron is not None:
+                tasks.append(asyncio.create_task(cron.start()))
+            combined = asyncio.gather(*tasks)
+            await asyncio.wait({combined, server_task}, return_when=asyncio.FIRST_COMPLETED)
+            if combined.done():
+                await combined
+            else:
+                await server_task
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if tasks:
+                await asyncio.gather(combined, return_exceptions=True)
+            try:
+                if hasattr(compile_service, "close"):
+                    await compile_service.close()
+                if hasattr(heartbeat, "stop"):
+                    heartbeat.stop()
+                if cron is not None and hasattr(cron, "stop"):
+                    cron.stop()
+                await agent_loop.close_mcp()
+            finally:
+                try:
+                    if manager is not None:
+                        await manager.cleanup_all()
+                finally:
+                    await runtime.stop()
+                    signal.signal(signal.SIGTERM, previous_sigterm)
+
+    try:
+        asyncio.run(run())
+    except (Exception, asyncio.CancelledError) as exc:
+        report_startup("failed", error=str(exc) or "Gateway startup cancelled")
+        console.print(f"[red]Gateway failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+
+def prepare_agent_loop(config, bus, session_manager, cron, quiet: bool = False, eval: bool = False):
+    sandbox_parent_path = config.sandbox_workspace_path
+    source_workspace_path = get_source_workspace_path()
+    sandbox_manager = SandboxManager(config, sandbox_parent_path, source_workspace_path)
+    if config.sandbox.backend == "direct":
+        logger.warning("[SANDBOX] disabled (using DIRECT mode - commands run directly on host)")
+    else:
+        logger.info(
+            f"Sandbox: enabled (backend={config.sandbox.backend}, mode={config.sandbox.mode})"
+        )
+
+    # Initialize Langfuse if enabled
+    langfuse_client = None
+    # logger.info(f"[LANGFUSE] Config check: has langfuse attr={hasattr(config, 'langfuse')}")
+
+    if hasattr(config, "langfuse") and config.langfuse.enabled:
+        langfuse_client = LangfuseClient(
+            enabled=config.langfuse.enabled,
+            secret_key=config.langfuse.secret_key,
+            public_key=config.langfuse.public_key,
+            base_url=config.langfuse.base_url,
+        )
+        LangfuseClient.set_instance(langfuse_client)
+        if langfuse_client.enabled:
+            logger.info(f"Langfuse: enabled (base_url={config.langfuse.base_url})")
+        else:
+            logger.warning("Langfuse: configured but failed to initialize")
+
+    provider = _make_provider(config, langfuse_client)
+    # Create agent with cron service
+    agent = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=config.sandbox_workspace_path,
+        model=config.agents.model,
+        temperature=config.agents.temperature,
+        max_iterations=config.agents.max_tool_iterations,
+        memory_window=config.agents.memory_window,
+        brave_api_key=config.tools.web.search.api_key or None,
+        exa_api_key=None,
+        gen_image_model=config.agents.gen_image_model,
+        exec_config=config.tools.exec,
+        cron_service=cron,
+        session_manager=session_manager,
+        sandbox_manager=sandbox_manager,
+        config=config,
+        eval=eval,
+        mcp_servers=config.tools.mcp_servers,
+    )
+    # Set the agent reference in cron if it uses the holder pattern
+    if hasattr(cron, "_agent_holder"):
+        cron._agent_holder["agent"] = agent
+    return agent
+
+
+def prepare_cron(config: Config, bus, quiet: bool = False) -> CronService | None:
+    if not config.tools.cron.enabled:
+        if not quiet:
+            logger.info("Cron: disabled")
+        return None
+
+    # Create cron service first (callback set after agent creation)
+    cron_store_path = get_data_dir() / "cron" / "jobs.json"
+    cron = CronService(cron_store_path)
+
+    # Use a mutable holder for the agent reference
+    agent_holder = {"agent": None}
+
+    # Set cron callback (needs agent)
+    async def on_cron_job(job: CronJob) -> str | None:
+        """Execute a cron job through the agent."""
+        session_key = SessionKey(**json.loads(job.payload.session_key_str))
+        message = job.payload.message
+        channel_metadata = dict(job.payload.channel_metadata or {})
+
+        if agent_holder["agent"] is None:
+            raise RuntimeError("Agent not initialized yet")
+
+        # Clear instructions: let agent know this is a cron task to deliver
+        cron_instruction = f"""[CRON TASK]
+This is a scheduled task triggered by cron job: '{job.name}'
+Your task is to deliver the following reminder message to the user.
+
+IMPORTANT:
+- This is NOT a user message - it's a scheduled reminder you need to send
+- You should acknowledge/confirm the reminder and send it in a friendly way
+- DO NOT treat this as a question from the user
+- Simply deliver the reminder message as requested
+
+Reminder message to deliver:
+\"\"\"{message}\"\"\"
+"""
+
+        response = await agent_holder["agent"].process_direct(
+            cron_instruction,
+            session_key=session_key,
+            metadata=channel_metadata,
+        )
+        if job.payload.deliver:
+            from vikingbot.bus.events import OutboundMessage
+
+            await bus.publish_outbound(
+                OutboundMessage(
+                    session_key=session_key,
+                    content=response or "",
+                    metadata=channel_metadata,
+                )
+            )
+        return response
+
+    cron.on_job = on_cron_job
+    cron._agent_holder = agent_holder
+
+    cron_status = cron.status()
+    if cron_status["jobs"] > 0 and not quiet:
+        logger.info(f"Cron: {cron_status['jobs']} scheduled jobs")
+
+    return cron
+
+
+def prepare_channel(
+    config,
+    bus,
+    fastapi_app=None,
+    enable_openapi: bool = False,
+    openapi_port: int = 18790,
+    compile_service=None,
+):
+    """Prepare channels for the bot.
+
+    Args:
+        config: Bot configuration
+        bus: Message bus for communication
+        fastapi_app: External FastAPI app to register OpenAPI routes on
+        enable_openapi: Whether to enable OpenAPI channel for gateway mode
+        openapi_port: Port for OpenAPI channel (default: 18790)
+    """
+    channels = ChannelManager(bus)
+    channels.load_channels_from_config(config)
+
+    # Enable OpenAPI channel for gateway mode if requested
+    if enable_openapi and fastapi_app is not None:
+        from vikingbot.channels.openapi import OpenAPIChannel, OpenAPIChannelConfig
+
+        openapi_config = OpenAPIChannelConfig(
+            enabled=True,
+        )
+        openapi_channel = OpenAPIChannel(
+            openapi_config,
+            bus,
+            app=fastapi_app,  # Pass the external FastAPI app
+            global_config=config,
+            compile_service=compile_service,
+        )
+        from vikingbot.studio.service import StudioService
+
+        openapi_channel._studio_service = StudioService(config, channels)
+        channels.add_channel(openapi_channel)
+        logger.info(f"OpenAPI channel enabled on port {openapi_port}")
+
+    if channels.enabled_channels:
+        console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
+    else:
+        console.print("[yellow]Warning: No channels enabled[/yellow]")
+    return channels
+
+
+def prepare_heartbeat(config, agent_loop, session_manager) -> HeartbeatService:
+    # Create heartbeat service
+    async def on_heartbeat(
+        prompt: str,
+        session_key: SessionKey | None = None,
+        metadata: dict | None = None,
+    ) -> str:
+        return await agent_loop.process_direct(
+            prompt,
+            session_key=session_key,
+            metadata=metadata,
+        )
+
+    heartbeat = HeartbeatService(
+        workspace=config.sandbox_workspace_path,
+        on_heartbeat=on_heartbeat,
+        interval_s=config.heartbeat.interval_seconds,
+        enabled=config.heartbeat.enabled,
+        sandbox_mode=config.sandbox.mode,
+        session_manager=session_manager,
+    )
+
+    console.print(
+        f"[green]✓[/green] Heartbeat: every {config.heartbeat.interval_seconds}s"
+        if config.heartbeat.enabled
+        else "[yellow]✗[/yellow] Heartbeat: disabled"
+    )
+    return heartbeat
+
+
+# ============================================================================
+# Agent Commands
+# ============================================================================
+
+
+# Helper for thinking spinner context
+
+
+def prepare_agent_channel(
+    config,
+    bus,
+    message: str | None,
+    session_id: str,
+    markdown: bool,
+    logs: bool,
+    eval: bool = False,
+    sender: str | None = None,
+    memory_peer: list[str] | None = None,
+    memory_user: list[str] | None = None,
+):
+    """Prepare channel for agent command."""
+    from vikingbot.channels.chat import ChatChannel, ChatChannelConfig
+    from vikingbot.channels.single_turn import SingleTurnChannel, SingleTurnChannelConfig
+
+    channels = ChannelManager(bus)
+    if message is not None:
+        # Single message mode - use SingleTurnChannel for clean output
+        channel_config = SingleTurnChannelConfig(
+            memory_peer=memory_peer,
+            memory_user=memory_user,
+        )
+        channel = SingleTurnChannel(
+            channel_config,
+            bus,
+            workspace_path=config.workspace_path,
+            message=message,
+            session_id=session_id,
+            markdown=markdown,
+            eval=eval,
+            sender=sender,
+        )
+        channels.add_channel(channel)
+    else:
+        # Interactive mode - use ChatChannel with thinking display
+        channel_config = ChatChannelConfig(
+            memory_peer=memory_peer,
+            memory_user=memory_user,
+        )
+        channel = ChatChannel(
+            channel_config,
+            bus,
+            workspace_path=config.workspace_path,
+            session_id=session_id,
+            markdown=markdown,
+            logs=logs,
+            sender=sender,
+        )
+        channels.add_channel(channel)
+
+    return channels
+
+
+@app.command()
+def chat(
+    message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
+    session_id: str = typer.Option(None, "--session", "-s", help="Session ID"),
+    markdown: bool = typer.Option(
+        True, "--markdown/--no-markdown", help="Render assistant output as Markdown"
+    ),
+    logs: bool = typer.Option(
+        False, "--logs/--no-logs", help="Show vikingbot runtime logs during chat"
+    ),
+    eval: bool = typer.Option(
+        False, "--eval", "-e", help="Run evaluation mode, output JSON results"
+    ),
+    config_path: str = typer.Option(
+        None, "--config", "-c", help="Path to ov.conf, default .openviking/ov.conf"
+    ),
+    sender: str = typer.Option(
+        None, "--sender", help="Sender ID, same usage as feishu channel sender"
+    ),
+    memory_peer: list[str] = typer.Option(
+        None, "--memory-peer", help="Peer ID for memory retrieval (can be repeated)"
+    ),
+    memory_user: list[str] = typer.Option(
+        None,
+        "--memory-user",
+        help="Deprecated legacy OpenViking user ID for root-key memory fanout",
+    ),
+):
+    """Interact with the agent directly."""
+    path = Path(config_path).expanduser() if config_path is not None else None
+
+    bus = MessageBus()
+    config = ensure_config(path)
+
+    # Redirect openviking/openviking_cli standard-library logs to stderr so they
+    # don't pollute stdout JSON output (important for --eval mode and piping).
+    _redirect_openviking_logs_to_stderr()
+
+    validate_openviking_auth(config)
+    _warn_deprecated_memory_user(memory_user)
+    _init_bot_data(config)
+
+    logger.remove()
+    configured_log_file = os.environ.get("VIKINGBOT_LOG_FILE")
+    log_file = (
+        Path(configured_log_file).expanduser()
+        if configured_log_file
+        else get_data_dir() / "log" / f"vikingbot.debug.{os.getpid()}.log"
+    )
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    logger.add(
+        log_file,
+        level="DEBUG",
+        rotation="10 MB",
+        retention="7 days",
+        encoding="utf-8",
+        backtrace=True,
+        diagnose=True,
+    )
+
+    if logs:
+        logger.add(sys.stderr, level="DEBUG")
+    else:
+        logger.add(sys.stderr, level="ERROR")
+
+    session_manager = SessionManager(config.bot_data_path)
+
+    is_single_turn = message is not None
+    # Use unified default session ID
+    if session_id is None:
+        session_id = get_or_create_machine_id()
+    cron = None if eval else prepare_cron(config, bus, quiet=is_single_turn)
+    channels = prepare_agent_channel(
+        config,
+        bus,
+        message,
+        session_id,
+        markdown,
+        logs,
+        eval,
+        sender,
+        memory_peer,
+        memory_user,
+    )
+    agent_loop = prepare_agent_loop(
+        config, bus, session_manager, cron, quiet=is_single_turn, eval=eval
+    )
+
+    async def run():
+        try:
+            if is_single_turn:
+                # Single-turn mode: run channels and agent, exit after response
+                task_cron = asyncio.create_task(cron.start()) if cron is not None else None
+                task_channels = asyncio.create_task(channels.start_all())
+                task_agent = asyncio.create_task(agent_loop.run())
+
+                # Wait for channels to complete (it will complete after getting response)
+                done, pending = await asyncio.wait(
+                    [task_channels], return_when=asyncio.FIRST_COMPLETED
+                )
+
+                # Cancel all other tasks
+                for task in pending:
+                    task.cancel()
+                if task_cron is not None:
+                    task_cron.cancel()
+                task_agent.cancel()
+
+                # Wait for cancellation
+                background_tasks = [task_agent]
+                if task_cron is not None:
+                    background_tasks.append(task_cron)
+                await asyncio.gather(*background_tasks, return_exceptions=True)
+            else:
+                # Interactive mode: run forever
+                tasks = []
+                if cron is not None:
+                    tasks.append(cron.start())
+                tasks.append(channels.start_all())
+                tasks.append(agent_loop.run())
+
+                await asyncio.gather(*tasks)
+        finally:
+            await agent_loop.close_mcp()
+
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        console.print("\nGoodbye!")
+
+
+# ============================================================================
+# Channel Commands
+# ============================================================================
+
+
+channels_app = typer.Typer(help="Manage channels")
+app.add_typer(channels_app, name="channels")
+
+
+@channels_app.command("status")
+def channels_status():
+    """Show channel status."""
+    from vikingbot.config.schema import ChannelType
+
+    config = load_config()
+    channels_config = config.channels_config
+    all_channels = channels_config.get_all_channels()
+
+    table = Table(title="Channel Status")
+    table.add_column("Type", style="cyan")
+    table.add_column("ID", style="magenta")
+    table.add_column("Enabled", style="green")
+    table.add_column("Configuration", style="yellow")
+
+    for channel in all_channels:
+        channel_type = str(channel.type)
+        channel_id = channel.channel_id()
+
+        config_info = ""
+        if channel.type == ChannelType.WHATSAPP:
+            config_info = channel.bridge_url
+        elif channel.type == ChannelType.FEISHU:
+            config_info = f"app_id: {channel.app_id[:10]}..." if channel.app_id else ""
+        elif channel.type == ChannelType.DISCORD:
+            config_info = channel.gateway_url
+        elif channel.type == ChannelType.MOCHAT:
+            config_info = channel.base_url or ""
+        elif channel.type == ChannelType.TELEGRAM:
+            config_info = f"token: {channel.token[:10]}..." if channel.token else ""
+        elif channel.type == ChannelType.SLACK:
+            config_info = "socket" if channel.app_token and channel.bot_token else ""
+
+        table.add_row(
+            channel_type, channel_id, "✓" if channel.enabled else "✗", config_info or "[dim]—[/dim]"
+        )
+
+    if not all_channels:
+        table.add_row("[dim]No channels configured[/dim]", "", "", "")
+
+    console.print(table)
+
+
+def _get_bridge_dir() -> Path:
+    """Get the bridge directory, setting it up if needed."""
+    import shutil
+    import subprocess
+
+    # User's bridge location
+    user_bridge = get_bridge_path()
+
+    # Check if already built
+    if (user_bridge / "dist" / "index.js").exists():
+        return user_bridge
+
+    # Check for npm
+    if not shutil.which("npm"):
+        console.print("[red]npm not found. Please install Node.js >= 18.[/red]")
+        raise typer.Exit(1)
+
+    # Find source bridge: first check package data, then source dir
+    pkg_bridge = Path(__file__).parent.parent / "bridge"  # vikingbot/bridge (installed)
+    src_bridge = Path(__file__).parent.parent.parent / "bridge"  # repo root/bridge (dev)
+
+    source = None
+    if (pkg_bridge / "package.json").exists():
+        source = pkg_bridge
+    elif (src_bridge / "package.json").exists():
+        source = src_bridge
+
+    if not source:
+        console.print("[red]Bridge source not found.[/red]")
+        console.print("Try reinstalling: uv pip install --force-reinstall openviking[bot]")
+        raise typer.Exit(1)
+
+    console.print(f"{__logo__} Setting up bridge...")
+
+    # Copy to user directory
+    user_bridge.parent.mkdir(parents=True, exist_ok=True)
+    if user_bridge.exists():
+        shutil.rmtree(user_bridge)
+    shutil.copytree(source, user_bridge, ignore=shutil.ignore_patterns("node_modules", "dist"))
+
+    # Install and build
+    try:
+        console.print("  Installing dependencies...")
+        subprocess.run(["npm", "install"], cwd=user_bridge, check=True, capture_output=True)
+
+        console.print("  Building...")
+        subprocess.run(["npm", "run", "build"], cwd=user_bridge, check=True, capture_output=True)
+
+        console.print("[green]✓[/green] Bridge ready\n")
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]Build failed: {e}[/red]")
+        if e.stderr:
+            console.print(f"[dim]{e.stderr.decode()[:500]}[/dim]")
+        raise typer.Exit(1)
+
+    return user_bridge
+
+
+@channels_app.command("login")
+def channels_login():
+    """Link device via QR code."""
+    import subprocess
+
+    from vikingbot.config.schema import ChannelType
+
+    config = load_config()
+    bridge_dir = _get_bridge_dir()
+
+    console.print(f"{__logo__} Starting bridge...")
+    console.print("Scan the QR code to connect.\n")
+
+    env = {**os.environ}
+
+    # Find WhatsApp channel config
+    channels_config = config.channels_config
+    all_channels = channels_config.get_all_channels()
+    whatsapp_channel = next((c for c in all_channels if c.type == ChannelType.WHATSAPP), None)
+
+    if whatsapp_channel and whatsapp_channel.bridge_token:
+        env["BRIDGE_TOKEN"] = whatsapp_channel.bridge_token
+
+    try:
+        subprocess.run(["npm", "start"], cwd=bridge_dir, check=True, env=env)
+    except subprocess.CalledProcessError as e:
+        console.print(f"[red]Bridge failed: {e}[/red]")
+    except FileNotFoundError:
+        console.print("[red]npm not found. Please install Node.js.[/red]")
+
+
+# ============================================================================
+# Cron Commands
+# ============================================================================
+
+cron_app = typer.Typer(help="Manage scheduled tasks")
+app.add_typer(cron_app, name="cron")
+
+
+@cron_app.command("list")
+def cron_list(
+    all: bool = typer.Option(False, "--all", "-a", help="Include disabled jobs"),
+):
+    """List scheduled jobs."""
+    from vikingbot.config.loader import get_data_dir
+    from vikingbot.cron.service import CronService
+
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    jobs = service.list_jobs(include_disabled=all)
+
+    if not jobs:
+        console.print("No scheduled jobs.")
+        return
+
+    table = Table(title="Scheduled Jobs")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name")
+    table.add_column("Schedule")
+    table.add_column("Status")
+    table.add_column("Next Run")
+
+    for job in jobs:
+        # Format schedule
+        if job.schedule.kind == "every":
+            sched = f"every {(job.schedule.every_ms or 0) // 1000}s"
+        elif job.schedule.kind == "cron":
+            sched = job.schedule.expr or ""
+        else:
+            sched = "one-time"
+
+        # Format next run
+        next_run = ""
+        if job.state.next_run_at_ms:
+            next_time = time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(job.state.next_run_at_ms / 1000)
+            )
+            next_run = next_time
+
+        status = "[green]enabled[/green]" if job.enabled else "[dim]disabled[/dim]"
+
+        table.add_row(job.id, job.name, sched, status, next_run)
+
+    console.print(table)
+
+
+@cron_app.command("add")
+def cron_add(
+    name: str = typer.Option(..., "--name", "-n", help="Job name"),
+    message: str = typer.Option(..., "--message", "-m", help="Message for agent"),
+    every: int = typer.Option(None, "--every", "-e", help="Run every N seconds"),
+    cron_expr: str = typer.Option(None, "--cron", "-c", help="Cron expression (e.g. '0 9 * * *')"),
+    at: str = typer.Option(None, "--at", help="Run once at time (ISO format)"),
+    deliver: bool = typer.Option(False, "--deliver", "-d", help="Deliver response to channel"),
+    timezone: str = typer.Option(
+        None,
+        "--timezone",
+        "--tz",
+        help="IANA timezone for --cron (e.g. Asia/Shanghai)",
+    ),
+):
+    """Add a scheduled job."""
+    from vikingbot.config.loader import get_data_dir
+    from vikingbot.cron.service import CronService
+    from vikingbot.cron.types import CronSchedule
+
+    # Determine schedule type
+    if timezone and not cron_expr:
+        console.print("[red]Error: --timezone requires --cron[/red]")
+        raise typer.Exit(1)
+    if every:
+        schedule = CronSchedule(kind="every", every_ms=every * 1000)
+    elif cron_expr:
+        schedule = CronSchedule(kind="cron", expr=cron_expr, tz=timezone)
+    elif at:
+        try:
+            dt = parse_iso_datetime(at)
+        except ValueError as e:
+            console.print(f"[red]Error: invalid --at datetime: {e}[/red]")
+            raise typer.Exit(1) from e
+        schedule = CronSchedule(kind="at", at_ms=int(dt.timestamp() * 1000))
+    else:
+        console.print("[red]Error: Must specify --every, --cron, or --at[/red]")
+        raise typer.Exit(1)
+
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    session_key = SessionKey(type="cli", channel_id="default", chat_id="default")
+
+    try:
+        job = service.add_job(
+            name=name,
+            schedule=schedule,
+            message=message,
+            deliver=deliver,
+            session_key=session_key,
+        )
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1) from e
+
+    console.print(f"[green]✓[/green] Added job '{job.name}' ({job.id})")
+
+
+@cron_app.command("remove")
+def cron_remove(
+    job_id: str = typer.Argument(..., help="Job ID to remove"),
+):
+    """Remove a scheduled job."""
+    from vikingbot.config.loader import get_data_dir
+    from vikingbot.cron.service import CronService
+
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    if service.remove_job(job_id):
+        console.print(f"[green]✓[/green] Removed job {job_id}")
+    else:
+        console.print(f"[red]Job {job_id} not found[/red]")
+
+
+@cron_app.command("enable")
+def cron_enable(
+    job_id: str = typer.Argument(..., help="Job ID"),
+    disable: bool = typer.Option(False, "--disable", help="Disable instead of enable"),
+):
+    """Enable or disable a job."""
+    from vikingbot.config.loader import get_data_dir
+    from vikingbot.cron.service import CronService
+
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    try:
+        job = service.enable_job(job_id, enabled=not disable)
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1) from e
+    if job:
+        status = "disabled" if disable else "enabled"
+        console.print(f"[green]✓[/green] Job '{job.name}' {status}")
+    else:
+        console.print(f"[red]Job {job_id} not found[/red]")
+
+
+@cron_app.command("run")
+def cron_run(
+    job_id: str = typer.Argument(..., help="Job ID to run"),
+    force: bool = typer.Option(False, "--force", "-f", help="Run even if disabled"),
+):
+    """Manually run a job."""
+    from vikingbot.config.loader import get_data_dir
+    from vikingbot.cron.service import CronService
+
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    async def run():
+        return await service.run_job(job_id, force=force)
+
+    try:
+        executed = asyncio.run(run())
+    except RuntimeError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1) from e
+
+    if not executed:
+        console.print(f"[red]Failed to run job {job_id}[/red]")
+        raise typer.Exit(1)
+    console.print("[green]✓[/green] Job executed")
+
+
+# ============================================================================
+# Status Commands
+# ============================================================================
+
+
+@app.command()
+def status():
+    """Show vikingbot status."""
+
+    from openviking_cli.utils.config.vlm_config import _normalize_provider_name
+
+    config_path = get_config_path()
+    config = load_config()
+    workspace = config.sandbox_workspace_path
+
+    console.print(f"{__logo__} vikingbot Status\n")
+
+    console.print(
+        f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}"
+    )
+    console.print(
+        f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}"
+    )
+
+    if config_path.exists():
+        inherited = config.inherits_root_vlm()
+        model_config = config.get_root_vlm_config() if inherited else config.agents
+        console.print(f"Model config: {'vlm (inherited)' if inherited else 'bot.agents'}")
+        if model_config is None:
+            console.print("Model configuration unavailable")
+            return
+
+        parent_provider = _normalize_provider_name(model_config.provider)
+        console.print("Credentials (configured order; not a live health check):")
+        for index, credential in enumerate(model_config.credentials or [model_config], 1):
+            provider = credential.provider or parent_provider or "not set"
+            model = credential.model or model_config.model or "not set"
+            # Root credentials are already normalized by VLMConfig. Bot-owned
+            # credentials match the normalized parent provider for key inheritance;
+            # VLMConfig leaves explicitly set credential provider names unchanged.
+            has_key = bool(credential.api_key)
+            if not inherited and provider == parent_provider:
+                has_key = has_key or bool(model_config.api_key)
+            has_headers = bool(
+                credential.extra_headers
+                or model_config.extra_headers
+                or config.agents.extra_headers
+            )
+            console.print(f"  {index}. Provider: {provider} | Model: {model}", markup=False)
+            console.print(
+                f"     API key: {'configured' if has_key else 'not set in config'}; "
+                f"Extra headers: {'configured' if has_headers else 'not set in config'}",
+                markup=False,
+            )
+
+
+@app.command("feedback-stats")
+def feedback_stats(
+    config_path: str = typer.Option(
+        None, "--config", "-c", help="Path to ov.conf, default ~/.openviking/ov.conf"
+    ),
+    channel: str = typer.Option(None, "--channel", help="Only include one channel key"),
+    session_key: str = typer.Option(None, "--session", help="Only include one session key"),
+    updated_since: str = typer.Option(
+        None, "--updated-since", help="Only include sessions updated at or after this ISO timestamp"
+    ),
+    updated_until: str = typer.Option(
+        None,
+        "--updated-until",
+        help="Only include sessions updated at or before this ISO timestamp",
+    ),
+    sort_by: str = typer.Option(
+        "responses_total", "--sort-by", help="Sort channel rows by a metric field"
+    ),
+    top_n: int = typer.Option(None, "--top-n", min=1, help="Limit the number of channel rows"),
+    include_sessions: bool = typer.Option(
+        False, "--sessions", help="Include per-session breakdown in JSON and table output"
+    ),
+    session_limit: int = typer.Option(
+        None,
+        "--session-limit",
+        min=1,
+        help="Limit the number of session rows when --sessions is used",
+    ),
+    output: str = typer.Option("json", "--output", help="Output format: json or table"),
+):
+    """Aggregate minimal feedback observability metrics from persisted sessions."""
+    try:
+        validate_feedback_stats_sort_by(sort_by)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--sort-by") from exc
+
+    path = Path(config_path).expanduser() if config_path is not None else None
+    config = ensure_config(path)
+    _init_bot_data(config)
+    stats = compute_feedback_stats(
+        config.bot_data_path,
+        channel=channel,
+        session_key=session_key,
+        updated_since=updated_since,
+        updated_until=updated_until,
+        include_sessions=include_sessions,
+    )
+    stats = select_feedback_stats(
+        stats,
+        sort_by=sort_by,
+        top_n=top_n,
+        session_limit=session_limit if include_sessions else None,
+    )
+
+    if output == "json":
+        console.print_json(json.dumps(stats, ensure_ascii=False))
+        return
+    if output == "table":
+        _print_feedback_stats_table(stats)
+        return
+
+    raise typer.BadParameter("output must be one of: json, table")
+
+
+def _print_feedback_stats_table(stats: dict) -> None:
+    table_data = format_feedback_stats_table(stats)
+
+    summary_table = Table(title="Feedback Summary")
+    summary_table.add_column("Metric", style="cyan")
+    summary_table.add_column("Value", justify="right")
+
+    for key, value in table_data["summary_rows"]:
+        summary_table.add_row(key, value)
+
+    console.print(summary_table)
+
+    if not table_data["channel_rows"]:
+        return
+
+    channels_table = Table(title="Feedback By Channel")
+    channels_table.add_column("Channel", style="magenta")
+    channels_table.add_column("Responses", justify="right")
+    channels_table.add_column("Feedback", justify="right")
+    channels_table.add_column("Coverage", justify="right")
+    channels_table.add_column("Thumbs Up", justify="right")
+    channels_table.add_column("Thumbs Down", justify="right")
+    channels_table.add_column("Resolution", justify="right")
+
+    for row in table_data["channel_rows"]:
+        channels_table.add_row(*row)
+
+    console.print(channels_table)
+
+    if not table_data["session_rows"]:
+        return
+
+    sessions_table = Table(title="Feedback By Session")
+    sessions_table.add_column("Session", style="green")
+    sessions_table.add_column("Channel", style="magenta")
+    sessions_table.add_column("Updated At")
+    sessions_table.add_column("Responses", justify="right")
+    sessions_table.add_column("Feedback", justify="right")
+    sessions_table.add_column("Negative", justify="right")
+    sessions_table.add_column("Reasked", justify="right")
+    sessions_table.add_column("Resolution", justify="right")
+
+    for row in table_data["session_rows"]:
+        sessions_table.add_row(*row)
+
+    console.print(sessions_table)
+
+
+# ============================================================================
+# Test Commands
+# ============================================================================
+
+try:
+    from vikingbot.cli.test_commands import test_app
+
+    app.add_typer(test_app, name="test")
+except ImportError:
+    # If test commands not available, don't add them
+    pass
+
+
+if __name__ == "__main__":
+    app()

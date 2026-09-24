@@ -1,0 +1,230 @@
+# MCP Integration Guide
+
+OpenViking server has a built-in [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) endpoint, allowing any MCP-compatible client to access its memory and resource capabilities over HTTP — no additional processes needed.
+
+> **Quick setup?** See [MCP Clients](../agent-integrations/06-mcp-clients.md) for client configuration snippets and platform-specific notes. This page covers the full tool reference and advanced configuration.
+
+## Prerequisites
+
+1. OpenViking installed (`pip install openviking` or from source)
+2. A valid configuration file (see [Configuration Guide](01-configuration.md))
+3. `openviking-server` running (see [Deployment Guide](03-deployment.md))
+
+The MCP endpoint is at `http://<server>:1933/mcp`, sharing the same process and port as the REST API.
+
+## Verified Platforms
+
+The following platforms have been successfully integrated with OpenViking MCP:
+
+| Platform | Integration Method |
+|----------|-------------------|
+| **Claude Code** | `type: http` |
+| **Trae** | Standard MCP config |
+| **Cursor** | Standard MCP config |
+| **ChatGPT & Codex** | Standard MCP config |
+| **OpenCode** | Native OpenCode `mcp` config |
+| **Manus** | Standard MCP config |
+| **Claude.ai / Claude Desktop** | Native OAuth 2.1 (see [11-oauth](11-oauth.md)) |
+
+## Authentication
+
+The MCP endpoint shares the same API-Key authentication system as the OpenViking REST API. Pass either header:
+
+- `X-Api-Key: <your-key>`
+- `Authorization: Bearer <your-key>`
+
+No authentication is required in local dev mode (server bound to localhost).
+
+## Client Configuration
+
+### Generic MCP Clients
+
+Most MCP-compatible platforms (Trae, Manus, Cursor, etc.) use the standard `mcpServers` format:
+
+```json
+{
+  "mcpServers": {
+    "openviking": {
+      "url": "https://your-server.com/mcp",
+      "headers": {
+        "Authorization": "Bearer your-api-key-here"
+      }
+    }
+  }
+}
+```
+
+### Claude Code
+
+Claude Code requires `"type": "http"`. Add via CLI:
+
+```bash
+claude mcp add --transport http openviking \
+  https://your-server.com/mcp \
+  --header "Authorization: Bearer your-api-key-here"
+```
+
+Or in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "openviking": {
+      "type": "http",
+      "url": "https://your-server.com/mcp",
+      "headers": {
+        "Authorization": "Bearer your-api-key-here"
+      }
+    }
+  }
+}
+```
+
+Add `--scope user` to make the config global (shared across all projects).
+
+### OpenCode
+
+Configure `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "mcp": {
+    "openviking": {
+      "type": "remote",
+      "url": "https://your-server.com/mcp",
+      "enabled": true,
+      "oauth": false,
+      "headers": {
+        "Authorization": "Bearer your-api-key-here"
+      }
+    }
+  }
+}
+```
+
+### Claude.ai / Claude Desktop (OAuth)
+
+These clients only accept OAuth 2.1 — API Keys cannot be passed directly.
+OpenViking ships a native OAuth 2.1 implementation (DCR + PKCE + opaque
+tokens, backed by SQLite, with a Studio consent screen for authorization) so
+no external proxy is needed.
+
+If you already have HTTPS configured, just connect to `https://your-server.com/mcp` — the client will walk you through the authorization flow automatically.
+
+**See the [OAuth 2.1 Guide](11-oauth.md)** and **[Public Access Guide](12-public-access.md)** for:
+
+- End-to-end flow (device-flow style: page displays a 6-character code,
+  user confirms in the OpenViking console)
+- HTTP (local) and HTTPS (production) deployment, including Caddy and nginx
+  reverse-proxy templates plus a docker-compose example
+- Connecting Claude.ai / Claude Desktop step by step
+- `OPENVIKING_PUBLIC_BASE_URL` and the `oauth` config block
+- Token model (`ovat_` / `ovrt_` / `ovac_` prefixes) and revocation
+
+> The community [MCP-Key2OAuth](https://github.com/t0saki/MCP-Key2OAuth)
+> Cloudflare Worker proxy is still around and remains a valid third-party
+> option, but the native flow is recommended now: no extra deployment unit,
+> no third-party trust boundary on the API key.
+
+
+## Available MCP Tools
+
+Once connected, OpenViking exposes 16 tools:
+
+| Tool | Description | Key Parameters |
+|------|-------------|----------------|
+| `find` | Fast semantic retrieval without session context. `context_type="skill"` on its own switches to package-level skill retrieval: one hit per skill package, its URI pointing at that package's `SKILL.md` and its summary taken from the skill itself, even when an auxiliary file inside the package is what matched. Without `target_uri` it searches both your own skills and the account-shared `viking://agent/skills`. Mixing `skill` with another context type keeps the generic retrieval path | `query`, `target_uri` (optional), `limit`, `min_score`, `level` (optional), `context_type` (optional), `read_content` (optional — inline each hit's content) |
+| `search` | Deep semantic retrieval; `mode="context"` assembles injection-ready context and replaces the former `recall` tool. `list` mode also returns one hit per skill package, its URI pointing at `SKILL.md` and its summary taken from the package itself, but `limit` applies before that merge, so a package matching in several files takes several slots and fewer than `limit` results come back | `query`, `mode` (`list` or `context`), `target_uri` (list mode only), `session_id` (optional), `limit`, `min_score`, `level` (list mode), `context_type` (optional), plus context-mode `quotas`, `purpose`, `max_tokens`, `detail` or `detail_by_category`, `dedup_turns`, `exclude_uris`, `peer_scope`, scalar `other_peer_penalty` or `other_peer_penalties` by category, and `rewrite` (`off` or `auto`) |
+| `read` | Read one or more `viking://` URIs. PNG, JPEG, GIF, and WebP return native MCP image content; WAV, MP3, FLAC, OGG, and M4A return native audio content. Video is not supported because MCP has no standard video content block | `uris` (single string or array) |
+| `list` | List entries under a `viking://` directory | `uri`, `recursive`, `offset`, `limit`, `sort_by`, `sort_order` (optional) |
+| `tree` | Show the recursive directory tree under a `viking://` URI, indented by depth — use when you need a full picture of the file tree (prefer `list` for a single level, `glob` for filename patterns) | `uri` (optional), `level_limit` (default 3), `node_limit` (default 1000), `offset`, `limit`, `include_abstract` (optional — also show each directory's summary; for a skill directory that is its name and description) |
+| `remember` | Store messages into long-term memory (triggers extraction) | `messages` (list of `{role, content}`) |
+| `write` | Write text to a `viking://` file (create/overwrite/append). Parent directories are created automatically; use `read` first to see current content before overwriting, and prefer `edit` for changing part of an existing file. Skill packages are not maintained this way: the caller's own `skills/` subtree is refused, and a write under `viking://agent/skills` produces a plain file that skips skill installation — use `add_skill` | `uri`, `content`, `mode` (optional: `replace` default — overwrites or creates if missing; `append` — appends or creates if missing; `create` — fails if it exists), `wait` (optional, block until re-indexed), `timeout` (optional) |
+| `edit` | Replace an exact string with new text in an existing `viking://` file — for targeted changes instead of a full rewrite. The file is left unchanged if `old_string` is not found, or matches multiple times while `replace_all` is false. Editing a file inside a skill package does not re-run skill installation — use `add_skill` | `uri`, `old_string`, `new_string`, `replace_all` (optional), `wait` (optional, block until re-indexed), `timeout` (optional) |
+| `add_resource` | Add a local file or URL as a resource (local files trigger a progressive upload flow) | `path`, `temp_file_id` (optional), `description` (optional), `watch_interval` (optional, minutes — auto-refresh cadence for remote URLs), `processing_mode` (optional: `semantic_and_vectors` default, or `vectors_only` to skip VLM semantic understanding and only vectorize current files), `to` (optional, target `viking://resources/...` URI; if omitted when `watch_interval > 0`, the watch auto-binds to the resource's created URI), `args` (optional parser-specific options, including `{"parse_mode":"no_split"}` to parse each source document into one Markdown body, `{"feishu_access_token":"u-..."}` for one-time Feishu user-token imports, or access/refresh tokens plus an optional `feishu_app_id` / `feishu_app_secret` pair for Feishu user-token watches) |
+| `add_skill` | Create, install, or replace an agent skill. New skills pass the full SKILL.md text; Git and GitHub tree URLs install every skill in the source unless `skills` names some; a local SKILL.md, directory, or zip returns a signed upload URL like `add_resource` | `data` (SKILL.md text) or `path` (Git URL or local path), `skills` (optional), `target_uri` (optional; `viking://agent/skills` shares with the account), `list_only` (optional) |
+| `list_watches` | List watch tasks (auto-refresh subscriptions) visible to the current agent. Each entry shows target URI, refresh interval (minutes), active/paused status, and next scheduled execution time | none |
+| `cancel_watch` | Cancel (delete) a watch task by its target URI. To change the cadence or pause temporarily, cancel and re-add with a new `watch_interval` | `to_uri` (must match the watch task's `to` value, e.g. `viking://resources/...`) |
+| `grep` | Regex content search across `viking://` files | `uri`, `pattern` (string or array), `case_insensitive`, `node_limit` |
+| `glob` | Find files matching a glob pattern | `pattern`, `uri` (optional scope), `node_limit` |
+| `forget` | Delete any `viking://` URI (use `search` to find it first; pass `recursive=true` to delete a directory). Deleting a skill directory this way leaves the skill's privacy configuration behind; remove a skill with `ov skills remove` or `DELETE /api/v1/skills/{name}` | `uri`, `recursive` (optional) |
+| `health` | Check OpenViking service health | none |
+
+To address your own workspace from an MCP tool, use the home alias `viking://~`. It
+expands to `viking://user/<current-user>` on every control plane (REST API, `ov` CLI,
+SDKs, and MCP alike), so `viking://~/notes/todo.md` resolves to
+`viking://user/<current-user>/notes/todo.md`. Responses always echo the expanded
+canonical URI, and those canonical URIs are accepted as tool input as well.
+
+The uid-less spelling `viking://user/<segment>/...` (`memories`, `resources`, `skills`,
+`peers`, `privacy`, `sessions`) is no longer accepted; such calls fail with an error that
+points at the `viking://~/...` replacement. `viking://user` on its own is the container of
+user spaces, not a shortcut to yours. See
+[Viking URI](../concepts/04-viking-uri.md) for details.
+
+> **Note**: MCP exposes the minimum closure for watch management (`list_watches` + `cancel_watch`). Pause / resume / trigger and the unified `update` verb are intentionally not exposed here — use the REST `/api/v1/watches/*` endpoints or the `ov task watch` CLI for those operations.
+
+> Feishu/Lark imports without `args.feishu_access_token` keep the existing app/tenant-token behavior and can be watched. One-time user-token imports pass only `args.feishu_access_token`; user-token watches must also pass `args.feishu_refresh_token`. They may pass `args.feishu_app_id` and `args.feishu_app_secret` together for that watch, or fall back to the server app credentials. The app must match the issuer of the user token.
+
+> `processing_mode=vectors_only` skips the VLM semantic-understanding stage. It does not generate or refresh `.abstract.md` / `.overview.md`; it only vectorizes current non-hidden resource files, preserving any older semantic artifacts that already exist.
+
+### Adding local-file resources (single-step upload)
+
+The `add_resource` tool accepts both **remote URLs** and **local file paths**, handled differently:
+
+- **Remote URL** (`http(s)://`, `git@`, `ssh://`, `git://`): single round-trip — the server fetches and ingests directly.
+- **Local file path**: the tool returns an **upload instruction** (plain prose). The agent POSTs the file as `multipart/form-data` (field name `file`) to the `temp_upload` URL given in the response. The URL embeds a one-shot token (10-minute TTL by default) that authorizes the upload, so no API key is needed. The server then ingests the file **automatically in the same request** and returns the final result — the agent does **not** call `add_resource` again.
+
+This lets any MCP client — including sandboxed environments without a local filesystem (Claude web, Manus, etc.) — push files into OpenViking without pre-installing the `ov` CLI. The token upload reuses the authenticated `temp_upload` route (API key first, otherwise the one-shot `?token=`) and its `TempUploadStore` persistence, so the same `local` / `shared` upload modes apply. Note: the one-shot token is held in-process, so in a multi-worker deployment the `add_resource` call and the follow-up upload POST must reach the same worker (or run single-worker) for the token to resolve.
+
+#### When you must set `OPENVIKING_PUBLIC_BASE_URL`
+
+The upload URL the tool returns is resolved server-side in this order:
+
+1. Environment variable `OPENVIKING_PUBLIC_BASE_URL`
+2. `server.public_base_url` in `ov.conf`
+3. Request headers `X-Forwarded-Host` / `X-Forwarded-Proto` (forwarded by the reverse-proxy chain)
+4. Request `Host` header (direct connection)
+5. Listen-address fallback: `http://{host}:{port}`
+
+If the server runs behind a reverse proxy (nginx / cloud LB / k8s ingress / MCP proxy), **set `OPENVIKING_PUBLIC_BASE_URL` explicitly**. Layers 3–5 are inferred and break in these cases:
+
+- The reverse proxy / MCP proxy does not forward `X-Forwarded-*` headers
+- The server listens on `0.0.0.0` (fallback URL contains `0.0.0.0`, unreachable from agents)
+- Multi-hop proxy with host rewriting
+
+When the variable is unset and inference is used, the tool response automatically appends a hint asking the user to configure it. Docker Compose example:
+
+```yaml
+services:
+  openviking:
+    # Prefer ghcr.io. If it is hard to reach, use openviking-cn-beijing.cr.volces.com/volcengine/openviking:latest
+    image: ghcr.io/volcengine/openviking:latest
+    environment:
+      OPENVIKING_PUBLIC_BASE_URL: "https://ov.your-domain.com"
+```
+
+## Troubleshooting
+
+### Connection refused
+
+**Likely cause:** `openviking-server` is not running, or is running on a different port.
+
+**Fix:** Verify the server is running:
+
+```bash
+curl http://localhost:1933/health
+# Expected: {"status": "ok"}
+```
+
+### Authentication errors
+
+**Likely cause:** API key mismatch between client config and server config.
+
+**Fix:** Ensure the API key in your MCP client configuration matches the one in your OpenViking server configuration. See [Authentication Guide](04-authentication.md).
+
+## References
+
+- [MCP Specification](https://modelcontextprotocol.io/)
+- [OpenViking Configuration](01-configuration.md)
+- [OpenViking Deployment](03-deployment.md)

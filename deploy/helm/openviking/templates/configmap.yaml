@@ -1,0 +1,13 @@
+{{- $config := deepCopy .Values.config }}
+{{- if empty $config.storage.workspace }}
+{{- $_ := set $config.storage "workspace" (printf "%s/openviking_workspace" (trimSuffix "/" .Values.persistence.mountPath)) }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "openviking.fullname" . }}-config
+  labels:
+    {{- include "openviking.labels" . | nindent 4 }}
+data:
+  ov.conf: |
+    {{- $config | toPrettyJson | nindent 4 }}

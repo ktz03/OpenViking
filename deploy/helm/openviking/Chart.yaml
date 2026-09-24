@@ -1,0 +1,17 @@
+apiVersion: v2
+name: openviking
+description: OpenViking - The Context Database for AI Agents
+type: application
+version: 0.1.1
+keywords:
+  - openviking
+  - ai
+  - agents
+  - context-database
+  - rag
+home: https://github.com/volcengine/OpenViking
+sources:
+  - https://github.com/volcengine/OpenViking
+maintainers:
+  - name: OpenViking Contributors
+    url: https://github.com/volcengine/OpenViking

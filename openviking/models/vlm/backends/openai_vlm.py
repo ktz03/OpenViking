@@ -1,0 +1,514 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""OpenAI VLM backend implementation"""
+
+import base64
+import json
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlparse
+
+import httpx
+
+from openviking.models.network import (
+    create_optional_async_httpx_client,
+    create_optional_sync_httpx_client,
+)
+from openviking.telemetry import tracer
+from openviking.utils.async_client_cache import LoopScopedAsyncClientCache
+from openviking.utils.message_format import format_messages, sanitize_openai_messages
+from openviking.utils.multimodal import redact_image_data_urls
+from openviking_cli.utils import get_logger
+
+try:
+    import openai
+except ImportError:
+    openai = None
+
+from openviking.utils.model_retry import retry_async, retry_sync
+
+from ..base import ToolCall, VLMBase, VLMResponse
+from ..registry import DEFAULT_AZURE_API_VERSION
+
+logger = get_logger(__name__)
+
+
+_DASHSCOPE_HOSTS = {
+    "dashscope.aliyuncs.com",
+    "dashscope-intl.aliyuncs.com",
+}
+
+
+# These names select existing OpenAI request defaults, not general reasoning capability.
+_OPENAI_REASONING_MODEL_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
+
+def _build_openai_client_kwargs(
+    provider: str,
+    api_key: str,
+    api_base: str,
+    api_version: str | None,
+    extra_headers: Dict[str, str] | None,
+    timeout: float = 600.0,
+) -> Dict[str, Any]:
+    """Build kwargs dict shared by sync and async OpenAI/Azure client constructors."""
+    if provider == "azure":
+        if not api_base:
+            raise ValueError("api_base (Azure endpoint) is required for Azure provider")
+        kwargs: Dict[str, Any] = {
+            "api_key": api_key,
+            "azure_endpoint": api_base,
+            "api_version": api_version or DEFAULT_AZURE_API_VERSION,
+            "timeout": timeout,
+        }
+    else:
+        kwargs = {"api_key": api_key, "base_url": api_base}
+    kwargs["timeout"] = timeout
+    # OpenViking owns provider retry/backoff via retry_sync/retry_async.
+    kwargs["max_retries"] = 0
+    if extra_headers:
+        kwargs["default_headers"] = extra_headers
+    return kwargs
+
+
+class OpenAIVLM(VLMBase):
+    """OpenAI / Azure OpenAI VLM backend"""
+
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        self._sync_client = None
+        self._async_client_cache = LoopScopedAsyncClientCache()
+        self.api_version = config.get("api_version")
+        self.reasoning_effort = config.get("reasoning_effort")
+        self.keepalive_expiry = config.get("keepalive_expiry")
+
+    def _http_client_kwargs(self) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {"timeout": self.timeout}
+        if self.keepalive_expiry is not None:
+            defaults = openai.DEFAULT_CONNECTION_LIMITS
+            kwargs["limits"] = httpx.Limits(
+                max_connections=defaults.max_connections,
+                max_keepalive_connections=defaults.max_keepalive_connections,
+                keepalive_expiry=self.keepalive_expiry,
+            )
+        return kwargs
+
+    def get_client(self):
+        """Get sync client"""
+        if self._sync_client is None:
+            if openai is None:
+                raise ImportError("Please install openai: pip install openai")
+            kwargs = _build_openai_client_kwargs(
+                self.provider,
+                self.api_key,
+                self.api_base,
+                self.api_version,
+                self.extra_headers,
+                self.timeout,
+            )
+            http_kwargs = self._http_client_kwargs()
+            http_client = create_optional_sync_httpx_client(
+                self.api_base,
+                client_cls=openai.DefaultHttpxClient,
+                **http_kwargs,
+            )
+            if http_client is None and self.keepalive_expiry is not None:
+                http_client = openai.DefaultHttpxClient(**http_kwargs)
+            if http_client is not None:
+                kwargs["http_client"] = http_client
+            if self.provider == "azure":
+                self._sync_client = openai.AzureOpenAI(**kwargs)
+            else:
+                self._sync_client = openai.OpenAI(**kwargs)
+        return self._sync_client
+
+    def _build_async_client(self):
+        """Create an async client for the current backend."""
+        if openai is None:
+            raise ImportError("Please install openai: pip install openai")
+        kwargs = _build_openai_client_kwargs(
+            self.provider,
+            self.api_key,
+            self.api_base,
+            self.api_version,
+            self.extra_headers,
+            self.timeout,
+        )
+        http_kwargs = self._http_client_kwargs()
+        http_client = create_optional_async_httpx_client(
+            self.api_base,
+            client_cls=openai.DefaultAsyncHttpxClient,
+            **http_kwargs,
+        )
+        if http_client is None and self.keepalive_expiry is not None:
+            http_client = openai.DefaultAsyncHttpxClient(**http_kwargs)
+        if http_client is not None:
+            kwargs["http_client"] = http_client
+        if self.provider == "azure":
+            return openai.AsyncAzureOpenAI(**kwargs)
+        return openai.AsyncOpenAI(**kwargs)
+
+    def get_async_client(self):
+        """Get an async client scoped to the current event loop."""
+        return self._async_client_cache.get(self._build_async_client)
+
+    def close(self) -> None:
+        """Close clients and HTTP transports owned by this backend."""
+        if self._sync_client is not None:
+            self._sync_client.close()
+        self._async_client_cache.close_all_with_close()
+
+    def _supports_enable_thinking(self) -> bool:
+        """Return True for OpenAI-compatible DashScope endpoints that accept enable_thinking."""
+        if self.provider != "openai":
+            return False
+
+        if isinstance(self.model, str) and self.model.lower().startswith("dashscope/"):
+            return True
+
+        if not self.api_base:
+            return False
+
+        try:
+            host = urlparse(self.api_base).hostname or ""
+        except ValueError:
+            return False
+
+        return host.lower() in _DASHSCOPE_HOSTS
+
+    def _apply_completion_params(
+        self, kwargs: Dict[str, Any], thinking: bool, max_tokens: Optional[int] = None
+    ) -> None:
+        """Apply model defaults, explicit settings, and provider-specific body fields."""
+        if kwargs["model"].lower().startswith(_OPENAI_REASONING_MODEL_PREFIXES):
+            max_tokens_param = "max_completion_tokens"
+            kwargs["reasoning_effort"] = "low"
+        else:
+            max_tokens_param = "max_tokens"
+            kwargs["temperature"] = self.temperature
+
+        effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+        if effective_max_tokens is not None:
+            kwargs[max_tokens_param] = effective_max_tokens
+        if self.reasoning_effort is not None:
+            kwargs["reasoning_effort"] = self.reasoning_effort
+
+        extra_body = dict(self.extra_request_body)
+        if self._supports_enable_thinking():
+            extra_body["enable_thinking"] = bool(thinking)
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+
+    def _update_token_usage_from_response(
+        self,
+        response,
+        duration_seconds: float = 0.0,
+    ):
+        if hasattr(response, "usage") and response.usage:
+            tracer.info(f"response.usage={response.usage}")
+            prompt_tokens = response.usage.prompt_tokens
+            completion_tokens = response.usage.completion_tokens
+            prompt_tokens_details = getattr(response.usage, "prompt_tokens_details", None)
+            completion_tokens_details = getattr(response.usage, "completion_tokens_details", None)
+            prompt_cached_tokens = getattr(prompt_tokens_details, "cached_tokens", 0) or 0
+            completion_reasoning_tokens = (
+                getattr(completion_tokens_details, "reasoning_tokens", 0) or 0
+            )
+            self.update_token_usage(
+                model_name=self.model or "gpt-4o-mini",
+                provider=self.provider,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                duration_seconds=duration_seconds,
+                prompt_cached_tokens=prompt_cached_tokens,
+                completion_reasoning_tokens=completion_reasoning_tokens,
+            )
+        return
+
+    def _parse_tool_calls(self, message) -> List[ToolCall]:
+        """Parse tool calls from OpenAI response message."""
+        tool_calls = []
+        if hasattr(message, "tool_calls") and message.tool_calls:
+            for tc in message.tool_calls:
+                args = tc.function.arguments
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {"raw": args}
+                tool_calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
+        return tool_calls
+
+    def _build_vlm_response(self, response, has_tools: bool) -> Union[str, VLMResponse]:
+        """Build response from OpenAI response. Returns str or VLMResponse based on has_tools."""
+        if isinstance(response, str):
+            return VLMResponse(content=response) if has_tools else response
+
+        choice = response.choices[0]
+        message = choice.message
+        tracer.info(f"result={message.content}")
+        if has_tools:
+            usage = {}
+            if hasattr(response, "usage") and response.usage:
+                usage = {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens,
+                    "prompt_tokens_details": getattr(response.usage, "prompt_tokens_details", None),
+                }
+
+            return VLMResponse(
+                content=message.content,
+                tool_calls=self._parse_tool_calls(message),
+                finish_reason=choice.finish_reason or "stop",
+                usage=usage,
+            )
+        return message.content or ""
+
+    def _build_text_kwargs(
+        self,
+        prompt: str = "",
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        thinking: Optional[bool] = None,
+        max_tokens: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        effective_thinking = self.thinking if thinking is None else thinking
+        kwargs_messages = sanitize_openai_messages(
+            messages or [{"role": "user", "content": prompt}]
+        )
+        model = self.model or "gpt-4o-mini"
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": kwargs_messages,
+        }
+        self._apply_completion_params(kwargs, effective_thinking, max_tokens=max_tokens)
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice or "auto"
+        return kwargs
+
+    def _build_vision_kwargs(
+        self,
+        prompt: str = "",
+        images: Optional[List[Union[str, Path, bytes]]] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        thinking: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        effective_thinking = self.thinking if thinking is None else thinking
+        if messages:
+            kwargs_messages = sanitize_openai_messages(messages)
+        else:
+            content = []
+            if images:
+                content.extend(self._prepare_image(img) for img in images)
+            if prompt:
+                content.append({"type": "text", "text": prompt})
+            kwargs_messages = sanitize_openai_messages([{"role": "user", "content": content}])
+
+        model = self.model or "gpt-4o-mini"
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": kwargs_messages,
+        }
+        self._apply_completion_params(kwargs, effective_thinking)
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice or "auto"
+        return kwargs
+
+    def _extract_completion_content(self, response, elapsed: float) -> str:
+        self._update_token_usage_from_response(response, duration_seconds=elapsed)
+        content = self._extract_content_from_response(response)
+        return self._clean_response(content)
+
+    async def _extract_completion_content_async(self, response, elapsed: float) -> str:
+        self._update_token_usage_from_response(response, duration_seconds=elapsed)
+        content = self._extract_content_from_response(response)
+        return self._clean_response(content)
+
+    def get_completion(
+        self,
+        prompt: str = "",
+        thinking: Optional[bool] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Union[str, VLMResponse]:
+        """Get text completion"""
+        effective_thinking = self.thinking if thinking is None else thinking
+        client = self.get_client()
+        kwargs = self._build_text_kwargs(prompt, tools, tool_choice, messages, effective_thinking)
+
+        def _call() -> Union[str, VLMResponse]:
+            t0 = time.perf_counter()
+            response = client.chat.completions.create(**kwargs)
+            elapsed = time.perf_counter() - t0
+            if tools is not None:
+                self._update_token_usage_from_response(response, duration_seconds=elapsed)
+                return self._build_vlm_response(response, has_tools=True)
+            return self._extract_completion_content(response, elapsed)
+
+        return retry_sync(
+            _call,
+            max_retries=self.max_retries,
+            logger=logger,
+            operation_name="OpenAI VLM completion",
+        )
+
+    async def get_completion_async(
+        self,
+        prompt: str = "",
+        thinking: Optional[bool] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
+    ) -> Union[str, VLMResponse]:
+        """Get text completion asynchronously"""
+        effective_thinking = self.thinking if thinking is None else thinking
+        client = self.get_async_client()
+        kwargs = self._build_text_kwargs(
+            prompt, tools, tool_choice, messages, effective_thinking, max_tokens=max_tokens
+        )
+
+        async def _call() -> Union[str, VLMResponse]:
+            t0 = time.perf_counter()
+            response = await client.chat.completions.create(**kwargs)
+            elapsed = time.perf_counter() - t0
+            if tools is not None:
+                self._update_token_usage_from_response(response, duration_seconds=elapsed)
+                return self._build_vlm_response(response, has_tools=True)
+            return await self._extract_completion_content_async(response, elapsed)
+
+        # 用 tracer.info 打印请求（人类可读格式）
+        tracer.info(
+            "llm_input_messages="
+            + format_messages(redact_image_data_urls(kwargs.get("messages", [])))
+        )
+
+        return await retry_async(
+            _call,
+            max_retries=self.max_retries,
+            logger=logger,
+            operation_name="OpenAI VLM async completion",
+        )
+
+    def _detect_image_format(self, data: bytes) -> str:
+        """Detect image format from magic bytes.
+
+        Supported formats: PNG, JPEG, GIF, WebP
+        """
+        if len(data) < 8:
+            logger.warning(f"[OpenAIVLM] Image data too small: {len(data)} bytes")
+            return "image/png"
+
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return "image/png"
+        if data[:2] == b"\xff\xd8":
+            return "image/jpeg"
+        if data[:6] in (b"GIF87a", b"GIF89a"):
+            return "image/gif"
+        if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":
+            return "image/webp"
+
+        logger.warning(f"[OpenAIVLM] Unknown image format, magic bytes: {data[:8].hex()}")
+        return "image/png"
+
+    def _prepare_image(self, image: Union[str, Path, bytes]) -> Dict[str, Any]:
+        """Prepare image data for vision completion."""
+        if isinstance(image, bytes):
+            b64 = base64.b64encode(image).decode("utf-8")
+            mime_type = self._detect_image_format(image)
+            return {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{b64}"},
+            }
+        if isinstance(image, Path) or (
+            isinstance(image, str) and not image.startswith(("http://", "https://"))
+        ):
+            path = Path(image)
+            suffix = path.suffix.lower()
+            mime_type = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".gif": "image/gif",
+                ".webp": "image/webp",
+            }.get(suffix, "image/png")
+            with open(path, "rb") as f:
+                data = f.read()
+            b64 = base64.b64encode(data).decode("utf-8")
+            return {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{b64}"},
+            }
+        return {"type": "image_url", "image_url": {"url": image}}
+
+    def get_vision_completion(
+        self,
+        prompt: str = "",
+        images: Optional[List[Union[str, Path, bytes]]] = None,
+        thinking: Optional[bool] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Union[str, VLMResponse]:
+        """Get vision completion"""
+        effective_thinking = self.thinking if thinking is None else thinking
+        client = self.get_client()
+        kwargs = self._build_vision_kwargs(
+            prompt, images, tools, tool_choice, messages, effective_thinking
+        )
+
+        def _call() -> Union[str, VLMResponse]:
+            t0 = time.perf_counter()
+            response = client.chat.completions.create(**kwargs)
+            elapsed = time.perf_counter() - t0
+            if tools is not None:
+                self._update_token_usage_from_response(response, duration_seconds=elapsed)
+                return self._build_vlm_response(response, has_tools=True)
+            return self._extract_completion_content(response, elapsed)
+
+        return retry_sync(
+            _call,
+            max_retries=self.max_retries,
+            logger=logger,
+            operation_name="OpenAI VLM vision completion",
+        )
+
+    async def get_vision_completion_async(
+        self,
+        prompt: str = "",
+        images: Optional[List[Union[str, Path, bytes]]] = None,
+        thinking: Optional[bool] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Union[str, VLMResponse]:
+        """Get vision completion asynchronously"""
+        effective_thinking = self.thinking if thinking is None else thinking
+        client = self.get_async_client()
+        kwargs = self._build_vision_kwargs(
+            prompt, images, tools, tool_choice, messages, effective_thinking
+        )
+
+        async def _call() -> Union[str, VLMResponse]:
+            t0 = time.perf_counter()
+            response = await client.chat.completions.create(**kwargs)
+            elapsed = time.perf_counter() - t0
+            if tools is not None:
+                self._update_token_usage_from_response(response, duration_seconds=elapsed)
+                return self._build_vlm_response(response, has_tools=True)
+            return await self._extract_completion_content_async(response, elapsed)
+
+        return await retry_async(
+            _call,
+            max_retries=self.max_retries,
+            logger=logger,
+            operation_name="OpenAI VLM async vision completion",
+        )

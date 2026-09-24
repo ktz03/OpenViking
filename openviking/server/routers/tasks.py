@@ -1,0 +1,172 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""Task tracking endpoints for OpenViking HTTP Server.
+
+Provides observability for background operations (e.g. session commit
+with ``wait=false``).  Callers receive a ``task_id`` and can poll these
+endpoints to check completion, results, or errors.
+"""
+
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Query
+
+from openviking.server.auth import get_request_context
+from openviking.server.identity import RequestContext, Role
+from openviking.server.models import Response
+from openviking.service.task_store import SYSTEM_TASK_ACCOUNT_ID, SYSTEM_TASK_USER_ID
+from openviking.service.task_tracker import get_task_tracker
+from openviking_cli.exceptions import (
+    FailedPreconditionError,
+    OpenVikingError,
+    PermissionDeniedError,
+)
+
+router = APIRouter(prefix="/api/v1", tags=["tasks"])
+
+
+@router.get("/tasks/{task_id}")
+async def get_task(
+    task_id: str,
+    include_events: bool = Query(False, description="Include recorded execution events"),
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Get the status of a single background task."""
+    tracker = get_task_tracker()
+    if _ctx.role == Role.ROOT:
+        task = await tracker.get(task_id)
+        if task is None:
+            task = await tracker.get(task_id, account_id=_ctx.account_id, user_id=_ctx.user.user_id)
+        if task is None:
+            task = await tracker.get(
+                task_id,
+                account_id=SYSTEM_TASK_ACCOUNT_ID,
+                user_id=SYSTEM_TASK_USER_ID,
+            )
+    else:
+        task = await tracker.get(
+            task_id,
+            account_id=_ctx.account_id,
+            user_id=_ctx.user.user_id,
+        )
+    if not task:
+        raise OpenVikingError(
+            "Task not found or expired",
+            code="NOT_FOUND",
+            details={"resource": task_id, "type": "task"},
+        )
+    return Response(status="ok", result=task.to_dict(include_events=include_events))
+
+
+@router.post("/tasks/{task_id}/cancel")
+async def cancel_task(
+    task_id: str,
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Request cooperative cancellation of a background task."""
+    if _ctx.role == Role.ROOT:
+        raise PermissionDeniedError("ROOT may not cancel tasks")
+    tracker = get_task_tracker()
+    try:
+        task = await tracker.cancel(
+            task_id,
+            account_id=_ctx.account_id,
+            user_id=_ctx.user.user_id,
+        )
+    except ValueError as exc:
+        raise FailedPreconditionError(str(exc)) from exc
+    if task is None:
+        raise OpenVikingError(
+            "Task not found or expired",
+            code="NOT_FOUND",
+            details={"resource": task_id, "type": "task"},
+        )
+    return Response(status="ok", result=task.to_dict())
+
+
+@router.get("/tasks")
+async def list_tasks(
+    task_type: Optional[str] = Query(None, description="Filter by task type (e.g. session_commit)"),
+    status: Optional[str] = Query(
+        None,
+        description="Filter by status (pending/running/cancelling/completed/failed/cancelled)",
+    ),
+    resource_id: Optional[str] = Query(None, description="Filter by resource ID (e.g. session_id)"),
+    include_internal: bool = Query(False, description="Include internal Connector child tasks"),
+    limit: int = Query(50, ge=1, le=200, description="Max results"),
+    pagination: Optional[str] = Query(None, pattern="^cursor$"),
+    cursor: Optional[str] = Query(None, max_length=2048),
+    q: Optional[str] = Query(None, max_length=200),
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """List background tasks with optional filters."""
+    tracker = get_task_tracker()
+    if pagination == "cursor":
+        from openviking.service.task_pagination import decode_cursor, encode_cursor, page_scope
+
+        # ROOT retains the legacy system + cached visibility and its own
+        # persisted tasks, including submissions restored after restart.
+        account = SYSTEM_TASK_ACCOUNT_ID if _ctx.role == Role.ROOT else _ctx.account_id
+        user = SYSTEM_TASK_USER_ID if _ctx.role == Role.ROOT else _ctx.user.user_id
+        filters = {
+            "task_type": task_type,
+            "status": status,
+            "resource_id": resource_id,
+            "include_internal": include_internal,
+            "q": q,
+        }
+        scope = page_scope(
+            account=_ctx.account_id, user=_ctx.user.user_id, role=str(_ctx.role), **filters
+        )
+        tasks = await tracker.list_page(
+            account_id=account,
+            user_id=user,
+            limit=limit + 1,
+            before=decode_cursor(cursor, scope),
+            include_cached=_ctx.role == Role.ROOT,
+            additional_owner=(_ctx.account_id, _ctx.user.user_id)
+            if _ctx.role == Role.ROOT
+            else None,
+            **filters,
+        )
+        more = len(tasks) > limit
+        items = [t.to_dict() for t in tasks[:limit]]
+        return Response(
+            status="ok",
+            result={
+                "items": items,
+                "has_more": more,
+                "next_cursor": encode_cursor(items[-1], scope) if more else None,
+            },
+        )
+    if _ctx.role == Role.ROOT:
+        system_tasks = await tracker.list_tasks(
+            task_type=task_type,
+            status=status,
+            resource_id=resource_id,
+            limit=limit,
+            account_id=SYSTEM_TASK_ACCOUNT_ID,
+            user_id=SYSTEM_TASK_USER_ID,
+            include_internal=include_internal,
+        )
+        cached_tasks = await tracker.list_tasks(
+            task_type=task_type,
+            status=status,
+            resource_id=resource_id,
+            limit=limit,
+            include_internal=include_internal,
+        )
+        tasks_by_id = {task.task_id: task for task in cached_tasks}
+        tasks_by_id.update({task.task_id: task for task in system_tasks})
+        tasks = sorted(tasks_by_id.values(), key=lambda task: task.created_at, reverse=True)[:limit]
+    else:
+        tasks = await tracker.list_tasks(
+            task_type=task_type,
+            status=status,
+            resource_id=resource_id,
+            limit=limit,
+            account_id=_ctx.account_id,
+            user_id=_ctx.user.user_id,
+            include_internal=include_internal,
+        )
+    return Response(status="ok", result=[t.to_dict() for t in tasks])

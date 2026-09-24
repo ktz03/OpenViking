@@ -1,0 +1,143 @@
+[package]
+name = "ragfs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91.1"
+authors = ["OpenViking Contributors"]
+description = "Rust implementation of AGFS - Aggregated File System for AI Agents"
+license = "Apache-2.0"
+repository = "https://github.com/OpenViking/openviking"
+keywords = ["filesystem", "agents", "rest-api", "plugin-system"]
+categories = ["filesystem", "network-programming"]
+
+[lib]
+name = "ragfs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ragfs-shell"
+path = "src/shell/main.rs"
+
+[[test]]
+name = "cache_wrapper"
+path = "tests/cache_wrapper.rs"
+required-features = ["cache", "test-utils"]
+
+[[test]]
+name = "cache_runtime"
+path = "tests/cache_runtime.rs"
+required-features = ["cache", "test-utils"]
+
+[[test]]
+name = "redis_runtime"
+path = "tests/redis_runtime.rs"
+required-features = ["cache"]
+
+[[test]]
+name = "dynamic_provider"
+path = "tests/dynamic_provider.rs"
+required-features = ["cache"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.38", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+
+# Git (gitoxide)
+gix-hash = "0.14"
+gix-object = "0.42"
+gix-features = { version = "0.38", features = ["zlib"] }
+gix-actor = "0.31"
+gix-date = "0.8"
+
+# Git backend dependencies
+dashmap = "5.0"
+flate2 = "1.0"
+
+# Path handling and filesystem
+path-clean = "1.0"
+filelocks = "0.1.0"
+
+# Data structures
+radix_trie = "0.2"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# UUIDs
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Bytes handling
+bytes = "1.5"
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+fred = { version = "10.1.0", default-features = false, features = ["i-keys", "i-lists", "i-scripts", "i-server", "i-sets", "sentinel-auth", "sha-1", "vendored-openssl"], optional = true }
+libloading = { version = "0.8", optional = true }
+native-tls = { version = "0.2", optional = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "mysql"], optional = true }
+
+# AWS S3
+aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+aws-sdk-s3 = { version = "1", optional = true }
+aws-types = { version = "1", optional = true }
+
+# Cache
+lru = "0.12"
+
+# Regular expressions for grep
+regex = "1.10"
+mime_guess = "2.0"
+globset = "0.4"
+url = "2.5"
+
+# Encryption (envelope encryption: AES-256-GCM + HKDF-SHA256)
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+sha1 = "0.10"
+rand = "0.8"
+
+# Stream combinators for concurrent I/O
+futures = "0.3"
+
+# Grep acceleration (localfs fallback, rg-like behavior)
+ignore = "0.4.25"
+grep = "0.4.1"
+grep-matcher = "0.1.8"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.16"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+# Development dependencies
+[dev-dependencies]
+tempfile = "3.12"
+criterion = "0.5"
+tokio = { version = "1.38", features = ["full"] }
+toml = "0.8"
+# Used by the S3/TOS git integration tests (crates/ragfs/tests/git_s3_integration.rs)
+gix-hash = "0.14"
+gix-object = "0.42"
+bytes = "1.5"
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+
+[features]
+default = []
+cache = ["dep:fred", "dep:libloading", "dep:native-tls"]
+test-utils = []
+s3 = ["aws-sdk-s3", "aws-config", "aws-types"]
+full = ["s3", "cache"]

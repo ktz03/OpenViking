@@ -1,0 +1,64 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+
+"""Shared token estimation tests."""
+
+from openviking.message import Message, TextPart
+from openviking.session import Session
+from openviking.utils.token_estimation import (
+    estimate_text_tokens,
+    truncate_text_to_token_budget,
+)
+
+
+def test_message_estimated_tokens_is_cjk_aware():
+    """Chinese text should not be estimated with the ASCII chars/4 fallback."""
+    msg = Message(id="msg-cjk", role="user", parts=[TextPart("\u4f60\u597d\u4e16\u754c")])
+
+    assert msg.estimated_tokens == 6
+    assert estimate_text_tokens("abcd") == 1
+    assert estimate_text_tokens("\U0001f600") == 2
+
+
+def test_truncate_text_to_token_budget_preserves_head_and_tail():
+    text = "summary-start " + ("填充内容" * 100) + " relevant-tail"
+
+    truncated = truncate_text_to_token_budget(text, 32)
+
+    assert estimate_text_tokens(truncated) <= 32
+    assert truncated.startswith("summary-start")
+    assert truncated.endswith("relevant-tail")
+
+
+async def test_archive_overview_tokens_do_not_trust_stale_low_metadata():
+    class FakeFS:
+        async def read_file(self, uri, ctx=None):
+            del uri, ctx
+            return '{"overview_tokens": 1}'
+
+    fake_session = type("FakeSession", (), {"_viking_fs": FakeFS(), "ctx": None})()
+
+    tokens = await Session._read_archive_overview_tokens(
+        fake_session,
+        "viking://session/test/history/archive_001",
+        "\u4f60\u597d\u4e16\u754c",
+    )
+
+    assert tokens == 6
+
+
+async def test_archive_overview_tokens_keep_higher_metadata_estimate():
+    class FakeFS:
+        async def read_file(self, uri, ctx=None):
+            del uri, ctx
+            return '{"overview_tokens": 5}'
+
+    fake_session = type("FakeSession", (), {"_viking_fs": FakeFS(), "ctx": None})()
+
+    tokens = await Session._read_archive_overview_tokens(
+        fake_session,
+        "viking://session/test/history/archive_001",
+        "abcd",
+    )
+
+    assert tokens == 5

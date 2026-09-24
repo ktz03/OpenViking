@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""
+OpenViking Basic Usage Example
+
+This script demonstrates the core features of OpenViking:
+1. HTTP client initialization
+2. Adding resources (URLs, files, directories)
+3. Browsing the virtual filesystem
+4. Semantic search and retrieval
+5. Tiered context loading (L0/L1/L2)
+6. Session management for memory
+
+Requirements:
+- pip install openviking --upgrade
+- A running OpenViking server at http://localhost:1933
+"""
+
+import os
+import sys
+import time
+
+# Add parent directory to path for local development
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+
+def main():
+    print("=" * 60)
+    print("OpenViking Basic Usage Example")
+    print("=" * 60)
+    print()
+
+    # ============================================================
+    # 1. Initialization
+    # ============================================================
+    print("1. Initializing OpenViking...")
+    print("-" * 40)
+
+    try:
+        from openviking_sdk import SyncHTTPClient
+    except ImportError as e:
+        print(f"   Error: Failed to import openviking_sdk: {e}")
+        print("   Please install: pip install openviking-sdk --upgrade")
+        sys.exit(1)
+
+    client = SyncHTTPClient(url="http://localhost:1933")
+
+    try:
+        client.initialize()
+        print("   Client initialized successfully")
+
+        # Check health status
+        if client.is_healthy():
+            print("   Status: healthy")
+        else:
+            print("   Warning: Some components may not be healthy")
+
+    except Exception as e:
+        print(f"   Error during initialization: {e}")
+        print("   Make sure the OpenViking server is running")
+        sys.exit(1)
+
+    print()
+
+    # ============================================================
+    # 2. Adding Resources
+    # ============================================================
+    print("2. Adding a resource (URL)...")
+    print("-" * 40)
+
+    try:
+        # Add a URL resource
+        result = client.add_resource(
+            path="https://raw.githubusercontent.com/volcengine/OpenViking/refs/heads/main/README.md",
+        )
+
+        task_id = result["task_id"]
+        print(f"   Import task: {task_id}")
+
+    except Exception as e:
+        print(f"   Error adding resource: {e}")
+        task_id = None
+
+    print()
+
+    # ============================================================
+    # 3. Tracking the Import Task
+    # ============================================================
+    print("3. Checking import progress...")
+    print("-" * 40)
+
+    root_uri = ""
+    if task_id:
+        try:
+            while True:
+                task = client.get_task(task_id)
+                if task is None:
+                    raise RuntimeError(f"Task {task_id} is no longer available")
+                if task["status"] == "completed":
+                    break
+                if task["status"] in {"failed", "cancelled"}:
+                    raise RuntimeError(
+                        f"Import task {task_id}: {task['status']} ({task.get('error')})"
+                    )
+                time.sleep(2)
+            root_uri = task["result"]["root_uri"]
+            print(f"   Processing complete: {root_uri}")
+        except Exception as e:
+            print(f"   Import task {task_id}: {e}")
+
+    print()
+
+    # ============================================================
+    # 4. Browsing the Virtual Filesystem
+    # ============================================================
+    print("4. Browsing the virtual filesystem...")
+    print("-" * 40)
+
+    if root_uri:
+        try:
+            # List directory contents
+            print("   Directory listing:")
+            files = client.ls(uri=root_uri, simple=True)
+            for f in files[:5]:  # Show first 5 files
+                print(f"   - {f}")
+
+            # Show tree structure
+            print("\n   Tree view:")
+            tree = client.tree(uri=root_uri, level_limit=2)
+            print_tree(tree, indent="   ")
+
+        except Exception as e:
+            print(f"   Error browsing filesystem: {e}")
+
+    print()
+
+    # ============================================================
+    # 5. Tiered Context Loading
+    # ============================================================
+    print("5. Tiered Context Loading (L0/L1/L2):")
+    print("-" * 40)
+
+    if root_uri:
+        try:
+            # L0: Abstract (quick summary ~100 tokens)
+            print("   L0 (Abstract):")
+            abstract = client.abstract(uri=root_uri)
+            if abstract:
+                # Show first 200 characters
+                preview = abstract[:200] + "..." if len(abstract) > 200 else abstract
+                print(f"   {preview}")
+            else:
+                print("   (Not available yet)")
+
+            print()
+
+            # L1: Overview (key points ~2k tokens)
+            print("   L1 (Overview):")
+            overview = client.overview(uri=root_uri)
+            if overview:
+                preview = overview[:300] + "..." if len(overview) > 300 else overview
+                print(f"   {preview}")
+            else:
+                print("   (Not available yet)")
+
+            print()
+
+            # L2: Read one concrete file under the resource root
+            print("   L2 (Full content - first 500 chars):")
+            glob_result = client.glob(pattern="**/*.md", uri=root_uri)
+            matches = glob_result.get("matches", []) if isinstance(glob_result, dict) else []
+            if matches:
+                content = client.read(uri=matches[0])
+                preview = content[:500] + "..." if len(content) > 500 else content
+                print(f"   File: {matches[0]}")
+                print(f"   {preview}")
+            else:
+                print("   (No readable markdown file found under this resource)")
+
+        except Exception as e:
+            print(f"   Error loading context: {e}")
+
+    print()
+
+    # ============================================================
+    # 6. Semantic Search
+    # ============================================================
+    print("6. Semantic Search:")
+    print("-" * 40)
+
+    if root_uri:
+        try:
+            query = "what is openviking"
+            print(f"   Query: '{query}'")
+            print("   Results:")
+
+            results = client.find(
+                query=query,
+                target_uri=root_uri,
+                limit=5,
+            )
+
+            resources = results.get("resources", [])
+            if resources:
+                for resource in resources:
+                    print(f"   - {resource['uri']}")
+                    print(f"     Score: {resource.get('score', 0.0):.4f}")
+            else:
+                print("   No results found")
+
+        except Exception as e:
+            print(f"   Error during search: {e}")
+
+    print()
+
+    # ============================================================
+    # 7. Content Search (grep)
+    # ============================================================
+    print("7. Content search (grep):")
+    print("-" * 40)
+
+    if root_uri:
+        try:
+            pattern = "Agent"
+            print(f"   Pattern: '{pattern}'")
+
+            result = client.grep(uri=root_uri, pattern=pattern, case_insensitive=True)
+
+            matches = result.get("matches", [])
+            print(f"   Found {len(matches)} matches")
+
+            # Show first 3 matches
+            for match in matches[:3]:
+                print(f"   - {match.get('uri', 'N/A')}: {match.get('count', 0)} occurrences")
+
+        except Exception as e:
+            print(f"   Error during grep: {e}")
+
+    print()
+
+    # ============================================================
+    # 8. Session Management (Optional Demo)
+    # ============================================================
+    print("8. Session Management (Demo):")
+    print("-" * 40)
+
+    try:
+        # Create a new session
+        session_info = client.create_session()
+        session_id = session_info.get("session_id", "")
+        print(f"   Created session: {session_id}")
+
+        # Add a conversation turn
+        client.add_message(
+            session_id=session_id,
+            role="user",
+            content="I prefer Python for data science projects",
+        )
+        client.add_message(
+            session_id=session_id,
+            role="assistant",
+            content="Understood! I'll use Python for your data science work.",
+        )
+
+        print("   Added conversation turn")
+
+        # Note: In a real application, you would commit the session at the end
+        # to extract long-term memories. Here we just demonstrate the API.
+        # client.commit_session(session_id)
+
+        print("   (Session would be committed at conversation end)")
+
+    except Exception as e:
+        print(f"   Note: Session demo skipped - {e}")
+
+    print()
+
+    # ============================================================
+    # 9. Cleanup
+    # ============================================================
+    print("9. Closing OpenViking...")
+    print("-" * 40)
+
+    try:
+        client.close()
+        print("   Done!")
+    except Exception as e:
+        print(f"   Note: Close skipped - {e}")
+    print()
+    print("=" * 60)
+    print("Example completed successfully!")
+    print("=" * 60)
+
+
+def print_tree(tree, indent: str = ""):
+    """Helper function to print tree structure."""
+    if not tree:
+        return
+
+    if isinstance(tree, list):
+        for child in tree[:5]:
+            print_tree(child, indent)
+        return
+
+    if not isinstance(tree, dict):
+        print(f"{indent}{tree}")
+        return
+
+    name = tree.get("name", "?")
+    children = tree.get("children", [])
+    is_dir = tree.get("isDir", tree.get("is_dir", bool(children)))
+
+    print(f"{indent}{name}/" if is_dir else f"{indent}{name}")
+
+    for child in children[:5]:  # Limit to first 5 children
+        if child.get("isDir", child.get("is_dir")):
+            print_tree(child, indent + "  ")
+        else:
+            print(f"{indent}  {child.get('name', '?')}")
+
+
+if __name__ == "__main__":
+    main()

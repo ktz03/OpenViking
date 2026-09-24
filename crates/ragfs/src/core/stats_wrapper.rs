@@ -1,0 +1,238 @@
+//! Statistics wrapper for FileSystem
+//!
+//! This module provides a wrapper around any FileSystem implementation
+//! that automatically collects operation statistics.
+
+use async_trait::async_trait;
+use std::sync::Arc;
+
+use super::{
+    FileInfo, FileSystem, FsOperation, GlobPage, GrepOptions, GrepResult, OperationTimer, Result,
+    StatsCollector, TreeEntry, WriteFlag,
+};
+
+/// A wrapper around FileSystem that automatically collects operation statistics
+pub struct StatsWrappedFS {
+    inner: Arc<dyn FileSystem>,
+    stats: Arc<StatsCollector>,
+}
+
+impl StatsWrappedFS {
+    /// Get the wrapped filesystem for specialized delegation.
+    pub(crate) fn inner_fs(&self) -> &Arc<dyn FileSystem> {
+        &self.inner
+    }
+
+    /// Create a new statistics-wrapped filesystem
+    pub fn new(inner: Box<dyn FileSystem>) -> Self {
+        Self {
+            inner: Arc::from(inner),
+            stats: Arc::new(StatsCollector::new()),
+        }
+    }
+
+    /// Create a new statistics-wrapped filesystem from an `Arc` inner.
+    ///
+    /// Used by the stack builder to wrap an already shared lower layer
+    /// (e.g. `Arc<EncryptionWrappedFS>` or `Arc<MountableFS>`) as the top stats layer.
+    pub fn with_arc(inner: Arc<dyn FileSystem>) -> Self {
+        Self {
+            inner,
+            stats: Arc::new(StatsCollector::new()),
+        }
+    }
+
+    /// Create a new statistics-wrapped filesystem with an existing collector
+    pub fn with_collector(inner: Box<dyn FileSystem>, stats: Arc<StatsCollector>) -> Self {
+        Self {
+            inner: Arc::from(inner),
+            stats,
+        }
+    }
+
+    /// Get a reference to the statistics collector
+    pub fn stats_collector(&self) -> Arc<StatsCollector> {
+        Arc::clone(&self.stats)
+    }
+
+    /// Get the inner filesystem (for testing)
+    #[cfg(test)]
+    pub fn into_inner(self) -> Arc<dyn FileSystem> {
+        self.inner
+    }
+}
+
+#[async_trait]
+impl FileSystem for StatsWrappedFS {
+    async fn create(&self, path: &str) -> Result<()> {
+        let timer = OperationTimer::start(FsOperation::Create, Arc::clone(&self.stats));
+        let result = self.inner.create(path).await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn mkdir(&self, path: &str, mode: u32) -> Result<()> {
+        let timer = OperationTimer::start(FsOperation::Mkdir, Arc::clone(&self.stats));
+        let result = self.inner.mkdir(path, mode).await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn remove(&self, path: &str) -> Result<()> {
+        let timer = OperationTimer::start(FsOperation::Remove, Arc::clone(&self.stats));
+        let result = self.inner.remove(path).await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn remove_all(&self, path: &str) -> Result<()> {
+        let timer = OperationTimer::start(FsOperation::RemoveAll, Arc::clone(&self.stats));
+        let result = self.inner.remove_all(path).await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn read(&self, path: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
+        let timer = OperationTimer::start(FsOperation::Read, Arc::clone(&self.stats));
+        let result = self.inner.read(path, offset, size).await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn write(&self, path: &str, data: &[u8], offset: u64, flags: WriteFlag) -> Result<u64> {
+        let timer = OperationTimer::start(FsOperation::Write, Arc::clone(&self.stats));
+        let result = self.inner.write(path, data, offset, flags).await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn read_dir(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+        sort_by: Option<crate::core::ListSortBy>,
+        sort_order: Option<crate::core::SortOrder>,
+    ) -> Result<Vec<FileInfo>> {
+        let timer = OperationTimer::start(FsOperation::ReadDir, Arc::clone(&self.stats));
+        let result = self
+            .inner
+            .read_dir(path, offset, limit, sort_by, sort_order)
+            .await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn stat(&self, path: &str) -> Result<FileInfo> {
+        let timer = OperationTimer::start(FsOperation::Stat, Arc::clone(&self.stats));
+        let result = self.inner.stat(path).await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+        let timer = OperationTimer::start(FsOperation::Rename, Arc::clone(&self.stats));
+        let result = self.inner.rename(old_path, new_path).await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn replace(&self, src_path: &str, dst_path: &str) -> Result<()> {
+        let timer = OperationTimer::start(FsOperation::Rename, Arc::clone(&self.stats));
+        let result = self.inner.replace(src_path, dst_path).await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn chmod(&self, path: &str, mode: u32) -> Result<()> {
+        let timer = OperationTimer::start(FsOperation::Chmod, Arc::clone(&self.stats));
+        let result = self.inner.chmod(path, mode).await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn truncate(&self, path: &str, size: u64) -> Result<()> {
+        let timer = OperationTimer::start(FsOperation::Truncate, Arc::clone(&self.stats));
+        let result = self.inner.truncate(path, size).await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn ensure_parent_dirs(&self, path: &str, mode: u32) -> Result<()> {
+        let timer = OperationTimer::start(FsOperation::EnsureParentDirs, Arc::clone(&self.stats));
+        let result = self.inner.ensure_parent_dirs(path, mode).await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn exists(&self, path: &str) -> bool {
+        let timer = OperationTimer::start(FsOperation::Exists, Arc::clone(&self.stats));
+        let result = self.inner.exists(path).await;
+        timer.finish(true).await;
+        result
+    }
+
+    async fn grep(
+        &self,
+        path: &str,
+        pattern: &str,
+        options: GrepOptions<'_>,
+    ) -> Result<GrepResult> {
+        let timer = OperationTimer::start(FsOperation::Grep, Arc::clone(&self.stats));
+        let result = self.inner.grep(path, pattern, options).await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn tree_directory(
+        &self,
+        path: &str,
+        show_hidden: bool,
+        node_limit: Option<usize>,
+        level_limit: Option<usize>,
+        offset: Option<usize>,
+        sort_by: Option<crate::core::ListSortBy>,
+        sort_order: Option<crate::core::SortOrder>,
+    ) -> Result<Vec<TreeEntry>> {
+        let timer = OperationTimer::start(FsOperation::TreeDir, Arc::clone(&self.stats));
+        let result = self
+            .inner
+            .tree_directory(
+                path,
+                show_hidden,
+                node_limit,
+                level_limit,
+                offset,
+                sort_by,
+                sort_order,
+            )
+            .await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn glob_directory(
+        &self,
+        path: &str,
+        pattern: &str,
+        show_hidden: bool,
+        page_size: Option<usize>,
+        level_limit: Option<usize>,
+        continuation_token: Option<String>,
+    ) -> Result<GlobPage> {
+        let timer = OperationTimer::start(FsOperation::GlobDir, Arc::clone(&self.stats));
+        let result = self
+            .inner
+            .glob_directory(
+                path,
+                pattern,
+                show_hidden,
+                page_size,
+                level_limit,
+                continuation_token,
+            )
+            .await;
+        timer.finish(result.is_ok()).await;
+        result
+    }
+}

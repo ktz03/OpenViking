@@ -1,0 +1,191 @@
+"""Direct backend implementation - executes commands directly on host without sandboxing."""
+
+import asyncio
+import os
+from pathlib import Path
+from typing import Any
+
+from loguru import logger
+
+from vikingbot.config.schema import SandboxConfig, SessionKey
+from vikingbot.sandbox.backends import register_backend
+from vikingbot.sandbox.base import SandboxBackend
+
+
+@register_backend("direct")
+class DirectBackend(SandboxBackend):
+    """Direct backend that executes commands directly on the host."""
+
+    def __init__(self, config: "SandboxConfig", session_key: SessionKey, workspace: Path):
+        super().__init__()
+        self.config = config
+        self.session_key = session_key
+        self._workspace = workspace
+        self._running = False
+        self.restrict_workspaces = config.restrict_workspaces
+
+    async def start(self) -> None:
+        """Start the backend (no-op for direct backend)."""
+        self._workspace.mkdir(parents=True, exist_ok=True)
+        self._running = True
+        # logger.info("Direct backend started")
+
+    async def execute(self, command: str, timeout: int = 60, **kwargs: Any) -> str:
+        """Execute a command directly on the host."""
+        if not self._running:
+            raise RuntimeError("Direct backend not started")
+
+        logger.info("[Direct] Executing: {}", repr(command))
+
+        cwd = kwargs.get("working_dir", str(self._workspace))
+
+        # Compile sessions opt into read tracing: prepend the readtrace dir to
+        # PYTHONPATH so every python3 in the exec auto-loads the audit hook that
+        # records opened source files into the Compile readlist. Any failure
+        # degrades to "inherit env" so exec is never affected.
+        env = None
+        if str(self.session_key).startswith("compile__"):
+            try:
+                from vikingbot.compile.readtrace import READLIST_REL_PATH, TRACE_DIR
+
+                env = dict(os.environ)
+                env["PYTHONPATH"] = str(TRACE_DIR) + os.pathsep + env.get("PYTHONPATH", "")
+                env["READLIST_FILE"] = str(self._workspace / READLIST_REL_PATH)
+                env["READLIST_WORKSPACE"] = str(self._workspace)
+            except Exception:
+                env = None
+
+        try:
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
+                env=env,
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                process.kill()
+                return f"Error: Command timed out after {timeout} seconds"
+
+            output_parts = []
+
+            if stdout:
+                output_parts.append(stdout.decode("utf-8", errors="replace"))
+
+            if stderr:
+                stderr_text = stderr.decode("utf-8", errors="replace")
+                if stderr_text.strip():
+                    output_parts.append(f"STDERR:\n{stderr_text}")
+
+            if process.returncode != 0:
+                output_parts.append(f"\nExit code: {process.returncode}")
+
+            result = "\n".join(output_parts) if output_parts else "(no output)"
+
+            log_result = result[:2000] + ("... (truncated)" if len(result) > 2000 else "")
+            logger.info(f"[Direct] Output:\n{log_result}")
+
+            max_len = 10000
+            if len(result) > max_len:
+                result = result[:max_len] + f"\n... (truncated, {len(result) - max_len} more chars)"
+
+            return result
+
+        except Exception as e:
+            logger.error(f"[Direct] Error: {e}")
+            import traceback
+
+            logger.error(f"[Direct] Traceback:\n{traceback.format_exc()}")
+            raise
+
+    async def stop(self) -> None:
+        """Stop the backend (no-op for direct backend)."""
+        self._running = False
+        logger.info("Direct backend stopped")
+
+    def is_running(self) -> bool:
+        """Check if backend is running."""
+        return self._running
+
+    @property
+    def workspace(self) -> Path:
+        """Get the workspace directory."""
+        return self._workspace
+
+    @property
+    def sandbox_cwd(self) -> str:
+        """Get the current working directory (uses actual host cwd)."""
+        return str(self._workspace)
+
+    def local_file_path(self, path: str) -> Path | None:
+        sandbox_path = Path(path)
+        if not sandbox_path.is_absolute():
+            sandbox_path = self._workspace / path
+        self._check_path_restriction(sandbox_path)
+        if not sandbox_path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        if not sandbox_path.is_file():
+            raise IOError(f"Not a file: {path}")
+        return sandbox_path
+
+    async def read_file_bytes(self, path: str, *, max_bytes: int | None = None) -> bytes:
+        self._validate_max_bytes(max_bytes)
+        sandbox_path = self.local_file_path(path)
+        if sandbox_path is None:
+            raise IOError("Sandbox file is not accessible from the host")
+        return await asyncio.to_thread(self._read_local_bytes, sandbox_path, path, max_bytes)
+
+    async def read_file(self, path: str) -> str:
+        data = await self.read_file_bytes(path)
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data.decode("utf-8", errors="replace")
+
+    async def write_file(self, path: str, content: str) -> None:
+        sandbox_path = Path(path)
+        if not sandbox_path.is_absolute():
+            sandbox_path = self._workspace / path
+
+        self._check_path_restriction(sandbox_path)
+        sandbox_path.parent.mkdir(parents=True, exist_ok=True)
+        sandbox_path.write_text(content, encoding="utf-8")
+
+    async def list_dir(self, path: str) -> list[tuple[str, bool]]:
+        sandbox_path = Path(path)
+        if not sandbox_path.is_absolute():
+            sandbox_path = self._workspace / path
+
+        self._check_path_restriction(sandbox_path)
+        if not sandbox_path.exists():
+            raise FileNotFoundError(f"Directory not found: {path}")
+        if not sandbox_path.is_dir():
+            raise IOError(f"Not a directory: {path}")
+
+        items = []
+        for item in sorted(sandbox_path.iterdir()):
+            items.append((item.name, item.is_dir()))
+        return items
+
+    def _check_path_restriction(self, path: Path) -> None:
+        """Check if path is within workspace (if restricted).
+
+        Args:
+            path: Path to check
+
+        Raises:
+            PermissionError: If path outside workspace and restriction is enabled
+        """
+
+        workspace = self.workspace.resolve()
+        resolved = path.resolve()
+
+        allowed_roots = [workspace]
+        if self.restrict_workspaces and self.session_key in self.restrict_workspaces:
+            allowed_roots.append(Path(self.restrict_workspaces[self.session_key]).resolve())
+
+        if not any(resolved == root or root in resolved.parents for root in allowed_roots):
+            raise PermissionError(f"Path outside allowed workspaces: {path}")

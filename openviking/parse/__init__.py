@@ -1,0 +1,48 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""Document parsers for various formats."""
+
+from openviking.core.building_tree import BuildingTree
+from openviking.parse.base import NodeType, ParseResult, ResourceNode, create_parse_result
+from openviking.parse.directory_scan import (
+    CLASS_PROCESSABLE,
+    CLASS_UNSUPPORTED,
+    ClassifiedFile,
+    DirectoryScanResult,
+    scan_directory,
+)
+from openviking.parse.mode import ParseMode, ParseModeInput
+from openviking.parse.parsers.base_parser import BaseParser
+from openviking.parse.parsers.html import HTMLParser
+from openviking.parse.parsers.markdown import MarkdownParser
+from openviking.parse.parsers.pdf import PDFParser
+from openviking.parse.parsers.text import TextParser
+from openviking.parse.tree_builder import TreeBuilder
+from openviking.parse.vlm import VLMProcessor
+
+__all__ = [
+    # Base classes and helpers
+    "BaseParser",
+    "ResourceNode",
+    "NodeType",
+    "ParseResult",
+    "create_parse_result",
+    # Document parsers (core)
+    "TextParser",
+    "MarkdownParser",
+    "PDFParser",
+    "HTMLParser",
+    # Tree builder
+    "TreeBuilder",
+    "BuildingTree",
+    # VLM
+    "VLMProcessor",
+    # Directory scan (phase-one validation)
+    "CLASS_PROCESSABLE",
+    "CLASS_UNSUPPORTED",
+    "ClassifiedFile",
+    "DirectoryScanResult",
+    "scan_directory",
+    "ParseMode",
+    "ParseModeInput",
+]

@@ -1,0 +1,2324 @@
+//! LocalFS plugin - Local file system mount
+//!
+//! This plugin mounts a local directory into RAGFS virtual file system,
+//! providing direct access to local files and directories.
+
+use async_trait::async_trait;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use std::io::{self, BufRead, BufReader, ErrorKind};
+use std::process::{Command, Stdio};
+
+use grep_regex::RegexMatcher;
+use grep_searcher::{
+    BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch,
+};
+use ignore::WalkBuilder;
+use serde::Deserialize;
+
+use crate::core::errors::{Error, Result};
+use crate::core::filesystem::{validate_virtual_path, FileSystem};
+use crate::core::glob::{decode_offset_token, encode_offset_token, PreparedGlob};
+use crate::core::grep::GrepLineCollector;
+use crate::core::plugin::ServicePlugin;
+use crate::core::types::{
+    ConfigParameter, FileInfo, GlobEntry, GlobPage, GrepContextLine, GrepOptions, GrepResult,
+    PluginConfig, WriteFlag,
+};
+
+struct LocalGrepSink<'a> {
+    file: String,
+    collector: GrepLineCollector<'a>,
+}
+
+impl<'a> LocalGrepSink<'a> {
+    fn new(
+        file: String,
+        before_context: usize,
+        after_context: usize,
+        limit: usize,
+        result: &'a mut GrepResult,
+    ) -> Self {
+        Self {
+            collector: GrepLineCollector::new(
+                file.clone(),
+                before_context,
+                after_context,
+                limit,
+                result,
+            ),
+            file,
+        }
+    }
+
+    fn decode_line(line_number: Option<u64>, bytes: &[u8]) -> io::Result<GrepContextLine> {
+        let line_number = line_number.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "line numbers not enabled")
+        })?;
+        let content = std::str::from_utf8(bytes)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+            .trim_end_matches(&['\r', '\n'][..])
+            .to_string();
+        Ok(GrepContextLine {
+            line: line_number,
+            content,
+        })
+    }
+
+    fn consume_line(&mut self, file: &str, line: GrepContextLine, is_match: bool) -> bool {
+        self.collector.consume_line(file, line, is_match)
+    }
+}
+
+impl Sink for LocalGrepSink<'_> {
+    type Error = io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, matched: &SinkMatch<'_>) -> io::Result<bool> {
+        let line = Self::decode_line(matched.line_number(), matched.bytes())?;
+        Ok(self.collector.consume_line(&self.file, line, true))
+    }
+
+    fn context(&mut self, _searcher: &Searcher, context: &SinkContext<'_>) -> io::Result<bool> {
+        if context.kind() == &SinkContextKind::Other {
+            return Ok(true);
+        }
+        let line = Self::decode_line(context.line_number(), context.bytes())?;
+        Ok(self.collector.consume_line(&self.file, line, false))
+    }
+
+    fn context_break(&mut self, _searcher: &Searcher) -> io::Result<bool> {
+        self.collector.break_context();
+        Ok(!self.collector.limit_reached())
+    }
+}
+
+/// LocalFS - Local file system implementation
+pub struct LocalFileSystem {
+    /// Base path of the mounted directory
+    base_path: PathBuf,
+    /// Whether external `rg` is available in current process PATH.
+    has_rg: bool,
+}
+
+impl LocalFileSystem {
+    /// Create a new LocalFileSystem
+    ///
+    /// # Arguments
+    /// * `base_path` - The local directory path to mount
+    ///
+    /// # Errors
+    /// Returns an error if the base path doesn't exist or is not a directory
+    pub fn new(base_path: &str) -> Result<Self> {
+        let path = PathBuf::from(base_path);
+
+        // Check if path exists
+        if !path.exists() {
+            return Err(Error::plugin(format!(
+                "base path does not exist: {}",
+                base_path
+            )));
+        }
+
+        // Check if it's a directory
+        if !path.is_dir() {
+            return Err(Error::plugin(format!(
+                "base path is not a directory: {}",
+                base_path
+            )));
+        }
+
+        // Canonicalize to stabilize prefix stripping and make rg JSON path mapping more reliable.
+        let canonical = fs::canonicalize(&path)
+            .map_err(|e| Error::plugin(format!("failed to canonicalize base path: {}", e)))?;
+
+        let has_rg = Command::new("rg")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        Ok(Self {
+            base_path: canonical,
+            has_rg,
+        })
+    }
+
+    /// Resolve a virtual path to actual local path
+    fn resolve_path(&self, path: &str) -> Result<PathBuf> {
+        validate_virtual_path(path)?;
+
+        // Remove leading slash to make it relative
+        let relative = path.strip_prefix('/').unwrap_or(path);
+        if Path::new(relative).is_absolute() {
+            return Err(Error::invalid_path(path));
+        }
+
+        // Join with base path
+        if relative.is_empty() {
+            Ok(self.base_path.clone())
+        } else {
+            Ok(self.base_path.join(relative))
+        }
+    }
+
+    #[cfg(windows)]
+    fn windows_file_identity(file: &fs::File) -> Result<(u32, u64)> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        };
+
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns a live OS handle and `info` points to valid,
+        // writable storage for the duration of this call.
+        let succeeded =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info as *mut _) };
+        if succeeded == 0 {
+            return Err(Error::plugin(format!(
+                "failed to inspect open CAS file: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        let file_index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+        Ok((info.dwVolumeSerialNumber, file_index))
+    }
+
+    /// Return whether an open file still identifies the file currently stored at `path`.
+    fn open_file_matches_path(file: &fs::File, path: &Path) -> Result<bool> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let open_metadata = file
+                .metadata()
+                .map_err(|e| Error::plugin(format!("failed to stat open CAS file: {}", e)))?;
+            let path_metadata = match fs::metadata(path) {
+                Ok(metadata) => metadata,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => {
+                    return Err(Error::plugin(format!(
+                        "failed to stat CAS path '{}': {}",
+                        path.display(),
+                        e
+                    )));
+                }
+            };
+            Ok(open_metadata.dev() == path_metadata.dev()
+                && open_metadata.ino() == path_metadata.ino())
+        }
+        #[cfg(windows)]
+        {
+            let path_file = match fs::File::open(path) {
+                Ok(path_file) => path_file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => {
+                    return Err(Error::plugin(format!(
+                        "failed to open CAS path '{}': {}",
+                        path.display(),
+                        e
+                    )));
+                }
+            };
+            Ok(Self::windows_file_identity(file)? == Self::windows_file_identity(&path_file)?)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (file, path);
+            Err(Error::invalid_operation(
+                "CAS file identity checks are unsupported on this platform",
+            ))
+        }
+    }
+
+    /// Replace local file content only when the locked file content matches `expected`.
+    fn compare_and_write_locked(
+        local_path: PathBuf,
+        expected: Vec<u8>,
+        new_data: Vec<u8>,
+    ) -> Result<bool> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&local_path)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Error::NotFound(local_path.to_string_lossy().to_string())
+                } else {
+                    Error::plugin(format!("failed to open file for compare_and_write: {}", e))
+                }
+            });
+        let file = match file {
+            Ok(file) => file,
+            Err(Error::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let mut lock = filelocks::LockOptions::new()
+            .backend(filelocks::LockBackend::Fcntl)
+            .lock(
+                file,
+                filelocks::LockKind::Exclusive,
+                filelocks::LockMode::NonBlocking,
+            )
+            .map_err(|e| Self::map_lock_error("compare_and_write", &e.to_string()))?;
+        let file = lock.file_mut();
+        if !Self::open_file_matches_path(&file, &local_path)? {
+            return Ok(false);
+        }
+
+        let mut current = Vec::new();
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| Error::plugin(format!("failed to seek for compare_and_write: {}", e)))?;
+        file.read_to_end(&mut current)
+            .map_err(|e| Error::plugin(format!("failed to read for compare_and_write: {}", e)))?;
+        if current != expected {
+            return Ok(false);
+        }
+
+        file.set_len(0).map_err(|e| {
+            Error::plugin(format!("failed to truncate for compare_and_write: {}", e))
+        })?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| Error::plugin(format!("failed to rewind for compare_and_write: {}", e)))?;
+        file.write_all(&new_data)
+            .map_err(|e| Error::plugin(format!("failed to write for compare_and_write: {}", e)))?;
+        file.sync_data()
+            .map_err(|e| Error::plugin(format!("failed to sync for compare_and_write: {}", e)))?;
+        Ok(true)
+    }
+
+    /// Remove a local file only when the locked file content matches `expected`.
+    fn compare_and_remove_locked(local_path: PathBuf, expected: Vec<u8>) -> Result<bool> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&local_path)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Error::NotFound(local_path.to_string_lossy().to_string())
+                } else {
+                    Error::plugin(format!("failed to open file for compare_and_remove: {}", e))
+                }
+            });
+        let file = match file {
+            Ok(file) => file,
+            Err(Error::NotFound(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let mut lock = filelocks::LockOptions::new()
+            .backend(filelocks::LockBackend::Fcntl)
+            .lock(
+                file,
+                filelocks::LockKind::Exclusive,
+                filelocks::LockMode::NonBlocking,
+            )
+            .map_err(|e| Self::map_lock_error("compare_and_remove", &e.to_string()))?;
+        let file = lock.file_mut();
+        if !Self::open_file_matches_path(&file, &local_path)? {
+            return Ok(false);
+        }
+
+        let mut current = Vec::new();
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| Error::plugin(format!("failed to seek for compare_and_remove: {}", e)))?;
+        file.read_to_end(&mut current)
+            .map_err(|e| Error::plugin(format!("failed to read for compare_and_remove: {}", e)))?;
+        if current != expected {
+            return Ok(false);
+        }
+
+        fs::remove_file(&local_path).map_err(|e| {
+            Error::plugin(format!("failed to remove for compare_and_remove: {}", e))
+        })?;
+        Ok(true)
+    }
+
+    /// Map a non-blocking file-lock acquisition error into a retryable filesystem error.
+    fn map_lock_error(operation: &str, error: &str) -> Error {
+        if error.to_ascii_lowercase().contains("would block") {
+            return Error::would_block(format!("failed to lock for {operation}: {error}"));
+        }
+        Error::plugin(format!("failed to lock for {operation}: {error}"))
+    }
+
+    /// Map local file failures into stable filesystem error categories.
+    fn map_error(path: &str, error: std::io::Error) -> Error {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Error::NotFound(path.to_string());
+        }
+        Error::plugin(format!("failed to read file: {}", error))
+    }
+
+    /// Run blocking local filesystem work on a dedicated thread.
+    async fn run_blocking_fs<T, F>(job: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(job)
+            .await
+            .map_err(|e| Error::Internal(format!("spawn_blocking failed: {}", e)))?
+    }
+
+    /// Convert an exclude path (plugin-relative "virtual mount" form, often starts with "/")
+    /// into a query-root-relative path.
+    ///
+    /// Contract:
+    /// - Returns `Some(".")` when the exclude path covers the entire query root (exclude all).
+    /// - Returns `Some(rel)` when the exclude path is under the query root (so it can be
+    ///   compared with `file_virtual`, which is always query-root-relative).
+    /// - Returns `None` when the exclude path is outside the query root (no effect).
+    fn exclude_to_query_root_relative_path(
+        base_path: &Path,
+        query_root_local: &Path,
+        exclude_path: &str,
+    ) -> Option<String> {
+        let p = exclude_path.trim_end_matches('/');
+        if p.is_empty() {
+            return Some(".".to_string());
+        }
+
+        let exclude_local = Self::resolve_virtual_path(base_path, p);
+
+        // If the exclude prefix includes the query root itself, exclude everything under the query root.
+        if query_root_local == exclude_local
+            || query_root_local.strip_prefix(&exclude_local).is_ok()
+        {
+            return Some(".".to_string());
+        }
+
+        // If exclude is under query root, convert it to query-root-relative.
+        let rel = exclude_local.strip_prefix(query_root_local).ok()?;
+        let s = rel.to_string_lossy();
+        if s.is_empty() {
+            Some(".".to_string())
+        } else {
+            Some(s.to_string())
+        }
+    }
+
+    /// Check whether a query-root-relative `file_virtual` is excluded by `exclude_rel`.
+    fn is_excluded_virtual(file_virtual: &str, exclude_rel: &str) -> bool {
+        if exclude_rel == "." {
+            return true;
+        }
+        if file_virtual == exclude_rel || exclude_rel.is_empty() {
+            return file_virtual == exclude_rel;
+        }
+
+        file_virtual
+            .strip_prefix(exclude_rel)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    }
+
+    /// Compute depth of a query-root-relative path.
+    fn virtual_depth(file_virtual: &str) -> usize {
+        if file_virtual.is_empty() || file_virtual == "." {
+            0
+        } else {
+            file_virtual.split('/').filter(|p| !p.is_empty()).count()
+        }
+    }
+
+    /// Execute grep via external `rg` (ripgrep) and return `GrepResult`.
+    ///
+    /// Returns `Ok(None)` when `rg` is unavailable or cannot be executed (e.g. not in PATH),
+    /// so the caller can fall back to the in-process implementation.
+    fn grep_via_rg(
+        base_path: &Path,
+        target_path: &Path,
+        pattern: &str,
+        options: GrepOptions<'_>,
+    ) -> Result<Option<GrepResult>> {
+        if options.node_limit == Some(0) {
+            return Ok(Some(GrepResult::new()));
+        }
+
+        let mut cmd = Command::new("rg");
+        cmd.arg("--json");
+        cmd.arg("--no-messages"); // Avoid interleaving permission/IO warnings with JSON output
+        cmd.arg("--no-ignore-parent"); // Match fallback `.parents(false)` semantics.
+
+        if options.case_insensitive {
+            cmd.arg("-i");
+        }
+        if options.before_context > 0 {
+            cmd.arg("--before-context")
+                .arg(options.before_context.to_string());
+        }
+        if options.after_context > 0 {
+            cmd.arg("--after-context")
+                .arg(options.after_context.to_string());
+        }
+
+        // Non-recursive directory search: only scan the current directory (no descent).
+        if !options.recursive && target_path.is_dir() {
+            cmd.arg("--max-depth").arg("1");
+        }
+
+        // NOTE: rg's --max-count is a per-file limit; we enforce a global limit by terminating early while parsing.
+        if let Some(limit) = options.node_limit {
+            cmd.arg("--max-count").arg(limit.to_string());
+        }
+
+        // Run rg from base_path so we can interpret relative paths in JSON output reliably.
+        let current_dir = if target_path.is_dir() {
+            target_path
+        } else {
+            target_path.parent().unwrap_or(target_path)
+        };
+        cmd.current_dir(current_dir);
+
+        // Keep user-controlled patterns and file names out of option parsing.
+        cmd.arg("--").arg(pattern);
+        // Search relative to the query root so returned paths can be interpreted as query-root relative.
+        if target_path.is_dir() {
+            cmd.arg(".");
+        } else {
+            cmd.arg(
+                target_path
+                    .file_name()
+                    .ok_or_else(|| Error::InvalidPath(target_path.display().to_string()))?,
+            );
+        }
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(Error::InvalidOperation(format!("spawn rg failed: {}", e)));
+            }
+        };
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Internal("rg stdout missing".to_string()))?;
+        let mut stderr_pipe = child.stderr.take();
+        let reader = BufReader::new(stdout);
+
+        let mut out = GrepResult::new();
+        let mut killed_for_limit = false;
+        let exclude_rel = options
+            .exclude_path
+            .and_then(|p| Self::exclude_to_query_root_relative_path(base_path, target_path, p));
+        let limit = options.node_limit.unwrap_or(usize::MAX);
+        let mut sink = LocalGrepSink::new(
+            String::new(),
+            options.before_context,
+            options.after_context,
+            limit,
+            &mut out,
+        );
+
+        #[derive(Debug, Deserialize)]
+        struct RgEvent {
+            #[serde(rename = "type")]
+            kind: String,
+            #[serde(default)]
+            data: Option<RgMatchData>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct RgMatchData {
+            path: RgTextField,
+            #[serde(default)]
+            line_number: u64,
+            #[serde(default)]
+            lines: RgTextField,
+        }
+
+        #[derive(Debug, Deserialize, Default)]
+        struct RgTextField {
+            #[serde(default)]
+            text: String,
+        }
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            if line.is_empty() {
+                continue;
+            }
+
+            let ev: RgEvent = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if ev.kind == "end" && sink.collector.match_count() >= limit {
+                let _ = child.kill();
+                killed_for_limit = true;
+                break;
+            }
+
+            let is_match = ev.kind == "match";
+            if !is_match && ev.kind != "context" {
+                continue;
+            }
+
+            let data = match ev.data {
+                Some(d) => d,
+                None => continue,
+            };
+
+            let file_text = data.path.text;
+            if file_text.is_empty() {
+                continue;
+            }
+
+            // `rg --json` may output relative paths depending on invocation. Convert to absolute using base_path.
+            let file_local = {
+                let p = Path::new(&file_text);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    current_dir.join(p)
+                }
+            };
+
+            let file_virtual = match Self::local_to_query_relative_path(target_path, &file_local) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            if let Some(excl_rel) = exclude_rel.as_deref() {
+                if Self::is_excluded_virtual(&file_virtual, excl_rel) {
+                    continue;
+                }
+            }
+
+            if let Some(limit) = options.level_limit {
+                if Self::virtual_depth(&file_virtual) > limit {
+                    continue;
+                }
+            }
+
+            let line_no = data.line_number;
+
+            // `lines.text` usually contains the full line, possibly including trailing newline.
+            let content = data
+                .lines
+                .text
+                .trim_end_matches(&['\r', '\n'][..])
+                .to_string();
+
+            let keep_going = sink.consume_line(
+                &file_virtual,
+                GrepContextLine {
+                    line: line_no,
+                    content,
+                },
+                is_match,
+            );
+            if !keep_going {
+                let _ = child.kill();
+                killed_for_limit = true;
+                break;
+            }
+        }
+
+        drop(sink);
+        let status = child
+            .wait()
+            .map_err(|e| Error::InvalidOperation(format!("wait rg failed: {}", e)))?;
+
+        // rg exit code: 0=matches, 1=no matches, 2=error
+        // If we killed it due to node_limit, ignore the exit code.
+        if !killed_for_limit && status.code() == Some(2) {
+            let mut stderr = String::new();
+            if let Some(mut err) = stderr_pipe.take() {
+                use std::io::Read;
+                let _ = err.read_to_string(&mut stderr);
+            }
+            return Err(Error::InvalidOperation(format!("rg failed: {}", stderr)));
+        }
+
+        Ok(Some(out))
+    }
+
+    /// In-process grep fallback using Rust crates, aiming to match rg-like defaults:
+    /// - respect .gitignore/.ignore
+    /// - skip hidden files/dirs by default
+    /// - skip binary files by default
+    fn grep_via_libs(
+        base_path: &Path,
+        virtual_path: &str,
+        pattern: &str,
+        options: GrepOptions<'_>,
+    ) -> Result<GrepResult> {
+        let local_root = Self::resolve_virtual_path(base_path, virtual_path);
+        if !local_root.exists() {
+            return Err(Error::NotFound(virtual_path.to_string()));
+        }
+
+        if options.node_limit == Some(0) {
+            return Ok(GrepResult::new());
+        }
+
+        // Build regex for fallback (uses Rust `regex` semantics).
+        let regex_pattern = if options.case_insensitive {
+            format!("(?i){}", pattern)
+        } else {
+            pattern.to_string()
+        };
+
+        let matcher = RegexMatcher::new_line_matcher(&regex_pattern)
+            .map_err(|e| Error::InvalidOperation(format!("Invalid regex pattern: {}", e)))?;
+
+        let mut searcher = SearcherBuilder::new()
+            .line_number(true)
+            .binary_detection(BinaryDetection::quit(b'\x00'))
+            .before_context(options.before_context)
+            .after_context(options.after_context)
+            .build();
+
+        let mut out = GrepResult::new();
+        let limit = options.node_limit.unwrap_or(usize::MAX);
+        let exclude_rel = options
+            .exclude_path
+            .and_then(|p| Self::exclude_to_query_root_relative_path(base_path, &local_root, p));
+
+        // Single file: search directly.
+        if local_root.is_file() {
+            let file_virtual = Self::local_to_query_relative_path(&local_root, &local_root)
+                .ok_or_else(|| Error::InvalidPath(virtual_path.to_string()))?;
+            if exclude_rel
+                .as_deref()
+                .is_some_and(|exclude| Self::is_excluded_virtual(&file_virtual, exclude))
+                || options
+                    .level_limit
+                    .is_some_and(|max_depth| Self::virtual_depth(&file_virtual) > max_depth)
+            {
+                return Ok(out);
+            }
+            Self::grep_file_via_searcher(
+                &mut searcher,
+                &matcher,
+                &local_root,
+                file_virtual,
+                options,
+                limit,
+                &mut out,
+            );
+            return Ok(out);
+        }
+
+        // Directory traversal: use ignore::WalkBuilder and explicitly set rg-like defaults.
+        //
+        // NOTE: We intentionally do NOT inherit ignore rules from parent directories.
+        // In OpenViking, a localfs mount may live under a git repo whose root `.gitignore`
+        // ignores the storage directory (e.g. `data/`). Inheriting parent ignore rules would
+        // cause grep to return empty results unexpectedly.
+        let mut builder = WalkBuilder::new(&local_root);
+        builder
+            // In ignore crate, hidden(true) means "ignore hidden" (enabled by default).
+            // We set it explicitly to match rg default behavior.
+            .hidden(true)
+            .parents(false)
+            .ignore(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true);
+        // Apply git-related ignore rules even if the target directory isn't inside a git repo.
+        builder.require_git(false);
+        if !options.recursive && local_root.is_dir() {
+            builder.max_depth(Some(1));
+        }
+
+        for dent in builder.build() {
+            if out.count >= limit {
+                break;
+            }
+
+            let dent = match dent {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+
+            let ft_is_file = dent.file_type().map(|t| t.is_file()).unwrap_or(false);
+            if !ft_is_file {
+                continue;
+            }
+
+            let file_path = dent.path();
+            let file_virtual = match Self::local_to_query_relative_path(&local_root, file_path) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            if let Some(excl_rel) = exclude_rel.as_deref() {
+                if Self::is_excluded_virtual(&file_virtual, excl_rel) {
+                    continue;
+                }
+            }
+
+            if let Some(max_depth) = options.level_limit {
+                if Self::virtual_depth(&file_virtual) > max_depth {
+                    continue;
+                }
+            }
+
+            Self::grep_file_via_searcher(
+                &mut searcher,
+                &matcher,
+                file_path,
+                file_virtual,
+                options,
+                limit,
+                &mut out,
+            );
+        }
+
+        Ok(out)
+    }
+
+    fn grep_file_via_searcher(
+        searcher: &mut Searcher,
+        matcher: &RegexMatcher,
+        file_path: &Path,
+        file_virtual: String,
+        options: GrepOptions<'_>,
+        limit: usize,
+        result: &mut GrepResult,
+    ) {
+        let sink = LocalGrepSink::new(
+            file_virtual,
+            options.before_context,
+            options.after_context,
+            limit,
+            result,
+        );
+        // Similar to rg's --no-messages: file-level errors are not fatal here.
+        let _ = searcher.search_path(matcher, file_path, sink);
+    }
+    fn local_to_query_relative_path(query_root: &Path, local: &Path) -> Option<String> {
+        let rel = local.strip_prefix(query_root).ok()?;
+        let parts = rel
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>();
+        if parts.is_empty() {
+            Some(".".to_string())
+        } else {
+            Some(parts.join("/"))
+        }
+    }
+
+    /// Build the plugin-root-relative path required by the `GlobEntry.path` contract.
+    fn local_glob_entry_path(virtual_root: &str, rel_path: &str) -> String {
+        if virtual_root == "/" {
+            format!("/{}", rel_path)
+        } else {
+            format!("{}/{}", virtual_root.trim_end_matches('/'), rel_path)
+        }
+    }
+
+    fn glob_static_max_depth(pattern: &str) -> Option<usize> {
+        let mut depth = 0usize;
+        for segment in pattern.split('/') {
+            if segment.is_empty() || segment == "." {
+                continue;
+            }
+            if segment == "**" {
+                return None;
+            }
+            depth += 1;
+        }
+        Some(depth)
+    }
+
+    fn effective_glob_max_depth(pattern: &str, level_limit: Option<usize>) -> Option<usize> {
+        match (Self::glob_static_max_depth(pattern), level_limit) {
+            (Some(pattern_depth), Some(level_depth)) => Some(pattern_depth.min(level_depth)),
+            (Some(pattern_depth), None) => Some(pattern_depth),
+            (None, Some(level_depth)) => Some(level_depth),
+            (None, None) => None,
+        }
+    }
+
+    /// Implement glob pagination via `ignore::WalkBuilder` without materializing the whole tree.
+    ///
+    /// Args:
+    /// - `base_path`: Absolute local path to the mounted root directory.
+    /// - `virtual_path`: Query path inside the plugin mount.
+    /// - `pattern`: Standard glob pattern matched against query-root-relative paths.
+    /// - `show_hidden`: Whether hidden files should be included.
+    /// - `page_size`: Page size, or `None` to return all matches.
+    /// - `level_limit`: Maximum traversal depth.
+    /// - `continuation_token`: Continuation token returned by the previous page.
+    ///
+    /// Returns:
+    /// - The current `GlobPage`, or an error if the path is missing, not a directory,
+    ///   the token is invalid, or traversal fails.
+    fn glob_via_walk(
+        base_path: &Path,
+        virtual_path: &str,
+        pattern: &str,
+        show_hidden: bool,
+        page_size: Option<usize>,
+        level_limit: Option<usize>,
+        continuation_token: Option<String>,
+    ) -> Result<GlobPage> {
+        let matcher = PreparedGlob::new(pattern)?;
+        if matches!(page_size, Some(0)) {
+            return Err(Error::invalid_operation("page_size must be positive"));
+        }
+
+        let query_root = Self::resolve_virtual_path(base_path, virtual_path);
+        if !query_root.exists() {
+            return Err(Error::NotFound(virtual_path.to_string()));
+        }
+        if !query_root.is_dir() {
+            return Err(Error::NotADirectory(virtual_path.to_string()));
+        }
+
+        let start = decode_offset_token(
+            continuation_token.as_deref(),
+            virtual_path,
+            pattern,
+            show_hidden,
+            level_limit,
+        )?;
+        let limit = page_size.unwrap_or(usize::MAX);
+        let mut builder = WalkBuilder::new(&query_root);
+        builder
+            .hidden(false)
+            .parents(false)
+            .ignore(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .sort_by_file_path(|left, right| left.cmp(right));
+        if let Some(max_depth) = Self::effective_glob_max_depth(pattern, level_limit) {
+            builder.max_depth(Some(max_depth));
+        }
+
+        let mut walker = builder.build();
+        let mut raw_seen = 0usize;
+        let mut entries = Vec::new();
+        let mut next_offset = None;
+
+        while let Some(dent) = walker.next() {
+            if entries.len() >= limit {
+                next_offset = Some(raw_seen);
+                break;
+            }
+
+            let dent =
+                dent.map_err(|e| Error::plugin(format!("failed to walk directory: {}", e)))?;
+            raw_seen += 1;
+
+            if raw_seen <= start {
+                continue;
+            }
+
+            let rel_path = Self::local_to_query_relative_path(&query_root, dent.path())
+                .ok_or_else(|| Error::InvalidPath(dent.path().display().to_string()))?;
+            if rel_path == "." {
+                continue;
+            }
+
+            let name = dent.file_name().to_string_lossy().to_string();
+            let is_dir = dent
+                .file_type()
+                .map(|file_type| file_type.is_dir())
+                .unwrap_or_else(|| dent.path().is_dir());
+
+            if !show_hidden && !is_dir && name.starts_with('.') {
+                continue;
+            }
+            if !matcher.is_match(&rel_path) {
+                continue;
+            }
+
+            entries.push(GlobEntry {
+                path: Self::local_glob_entry_path(virtual_path, &rel_path),
+                rel_path,
+                name,
+                is_dir,
+            });
+        }
+
+        let next_token = next_offset.filter(|_| page_size.is_some()).map(|offset| {
+            encode_offset_token(offset, virtual_path, pattern, show_hidden, level_limit)
+        });
+
+        Ok(GlobPage {
+            entries,
+            next_token,
+        })
+    }
+
+    fn resolve_virtual_path(base_path: &Path, path: &str) -> PathBuf {
+        let relative = path.strip_prefix('/').unwrap_or(path);
+        if relative.is_empty() {
+            base_path.to_path_buf()
+        } else {
+            base_path.join(relative)
+        }
+    }
+}
+
+#[async_trait]
+impl FileSystem for LocalFileSystem {
+    async fn create(&self, path: &str) -> Result<()> {
+        let local_path = self.resolve_path(path)?;
+
+        // Check if file already exists
+        if local_path.exists() {
+            return Err(Error::AlreadyExists(path.to_string()));
+        }
+
+        // Check if parent directory exists
+        if let Some(parent) = local_path.parent() {
+            if !parent.exists() {
+                return Err(Error::NotFound(parent.to_string_lossy().to_string()));
+            }
+        }
+
+        // Create empty file
+        fs::File::create(&local_path)
+            .map_err(|e| Error::plugin(format!("failed to create file: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn mkdir(&self, path: &str, _mode: u32) -> Result<()> {
+        let local_path = self.resolve_path(path)?;
+
+        // Check if directory already exists
+        if local_path.exists() {
+            return Err(Error::AlreadyExists(path.to_string()));
+        }
+
+        // Check if parent directory exists
+        if let Some(parent) = local_path.parent() {
+            if !parent.exists() {
+                return Err(Error::NotFound(parent.to_string_lossy().to_string()));
+            }
+        }
+
+        match fs::create_dir(&local_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+                Err(Error::AlreadyExists(path.to_string()))
+            }
+            Err(e) => Err(Error::plugin(format!("failed to create directory: {}", e))),
+        }
+    }
+
+    async fn remove(&self, path: &str) -> Result<()> {
+        let local_path = self.resolve_path(path)?;
+
+        // Check if exists
+        if !local_path.exists() {
+            return Err(Error::NotFound(path.to_string()));
+        }
+
+        // If directory, check if empty
+        if local_path.is_dir() {
+            let entries = fs::read_dir(&local_path)
+                .map_err(|e| Error::plugin(format!("failed to read directory: {}", e)))?;
+
+            if entries.count() > 0 {
+                return Err(Error::plugin(format!("directory not empty: {}", path)));
+            }
+        }
+
+        // Remove file or empty directory
+        fs::remove_file(&local_path)
+            .or_else(|_| fs::remove_dir(&local_path))
+            .map_err(|e| Error::plugin(format!("failed to remove: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn remove_all(&self, path: &str) -> Result<()> {
+        let local_path = self.resolve_path(path)?;
+
+        // Check if exists
+        if !local_path.exists() {
+            return Err(Error::NotFound(path.to_string()));
+        }
+
+        // Remove recursively
+        fs::remove_dir_all(&local_path)
+            .map_err(|e| Error::plugin(format!("failed to remove: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn read(&self, path: &str, offset: u64, size: u64) -> Result<Vec<u8>> {
+        let local_path = self.resolve_path(path)?;
+
+        // Check if exists and is not a directory
+        let metadata = fs::metadata(&local_path).map_err(|_| Error::NotFound(path.to_string()))?;
+
+        if metadata.is_dir() {
+            return Err(Error::plugin(format!("is a directory: {}", path)));
+        }
+
+        // Read file
+        let data = fs::read(&local_path).map_err(|e| Self::map_error(path, e))?;
+
+        // Apply offset and size
+        let file_size = data.len() as u64;
+        let start = offset.min(file_size) as usize;
+        let end = if size == 0 {
+            data.len()
+        } else {
+            (offset + size).min(file_size) as usize
+        };
+
+        if start >= data.len() {
+            Ok(vec![])
+        } else {
+            Ok(data[start..end].to_vec())
+        }
+    }
+
+    async fn write(&self, path: &str, data: &[u8], offset: u64, flags: WriteFlag) -> Result<u64> {
+        let local_path = self.resolve_path(path)?;
+
+        // Check if it's a directory
+        if local_path.exists() && local_path.is_dir() {
+            return Err(Error::plugin(format!("is a directory: {}", path)));
+        }
+
+        // Check if parent directory exists
+        if let Some(parent) = local_path.parent() {
+            if !parent.exists() {
+                return Err(Error::NotFound(parent.to_string_lossy().to_string()));
+            }
+        }
+
+        let mut options = fs::OpenOptions::new();
+        match flags {
+            WriteFlag::Create => {
+                options.write(true).create(true).truncate(true);
+            }
+            WriteFlag::CreateNew => {
+                options.write(true).create_new(true);
+            }
+            WriteFlag::Append => {
+                options.append(true);
+            }
+            WriteFlag::Truncate => {
+                options.write(true).truncate(true);
+            }
+            WriteFlag::None => {
+                options.write(true);
+            }
+        }
+        let mut file = options.open(&local_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::NotFound(path.to_string())
+            } else {
+                Error::plugin(format!("failed to open file: {}", e))
+            }
+        })?;
+
+        use std::io::{Seek, SeekFrom, Write};
+        if matches!(flags, WriteFlag::None) && offset > 0 {
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|e| Error::plugin(format!("failed to seek: {}", e)))?;
+        }
+        file.write_all(data)
+            .map_err(|e| Error::plugin(format!("failed to write: {}", e)))?;
+        Ok(data.len() as u64)
+    }
+
+    /// Atomically replace a local file when its current content exactly matches `expected`.
+    async fn compare_and_write(
+        &self,
+        path: &str,
+        expected: &[u8],
+        new_data: &[u8],
+    ) -> Result<bool> {
+        let local_path = self.resolve_path(path)?;
+        let expected = expected.to_vec();
+        let new_data = new_data.to_vec();
+        Self::run_blocking_fs(move || {
+            Self::compare_and_write_locked(local_path, expected, new_data)
+        })
+        .await
+    }
+
+    /// Atomically remove a local file when its current content exactly matches `expected`.
+    async fn compare_and_remove(&self, path: &str, expected: &[u8]) -> Result<bool> {
+        let local_path = self.resolve_path(path)?;
+        let expected = expected.to_vec();
+        Self::run_blocking_fs(move || Self::compare_and_remove_locked(local_path, expected)).await
+    }
+
+    async fn read_dir(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+        sort_by: Option<crate::core::ListSortBy>,
+        sort_order: Option<crate::core::SortOrder>,
+    ) -> Result<Vec<FileInfo>> {
+        let local_path = self.resolve_path(path)?;
+        let path = path.to_string();
+
+        let entries = Self::run_blocking_fs(move || {
+            // Check if directory exists
+            if !local_path.exists() {
+                return Err(Error::NotFound(path.clone()));
+            }
+
+            if !local_path.is_dir() {
+                return Err(Error::NotADirectory(path));
+            }
+
+            // Read directory
+            let entries = fs::read_dir(&local_path)
+                .map_err(|e| Error::plugin(format!("failed to read directory: {}", e)))?;
+
+            let mut files = Vec::new();
+            for entry in entries {
+                let entry =
+                    entry.map_err(|e| Error::plugin(format!("failed to read entry: {}", e)))?;
+                let metadata = entry
+                    .metadata()
+                    .map_err(|e| Error::plugin(format!("failed to get metadata: {}", e)))?;
+
+                let name = entry.file_name().to_string_lossy().to_string();
+                let mode = if metadata.is_dir() { 0o755 } else { 0o644 };
+                let mod_time = metadata
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+                files.push(FileInfo::new(
+                    name,
+                    metadata.len(),
+                    mode,
+                    mod_time,
+                    metadata.is_dir(),
+                ));
+            }
+
+            Ok(files)
+        })
+        .await?;
+        Ok(crate::core::filesystem::apply_read_dir_options(
+            entries, offset, limit, sort_by, sort_order,
+        ))
+    }
+
+    async fn stat(&self, path: &str) -> Result<FileInfo> {
+        let local_path = self.resolve_path(path)?;
+        let path = path.to_string();
+
+        Self::run_blocking_fs(move || {
+            // Get file metadata
+            let metadata = fs::metadata(&local_path).map_err(|_| Error::NotFound(path.clone()))?;
+
+            let name = Path::new(&path)
+                .file_name()
+                .unwrap_or(path.as_ref())
+                .to_string_lossy()
+                .to_string();
+            let mode = if metadata.is_dir() { 0o755 } else { 0o644 };
+            let mod_time = metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+
+            Ok(FileInfo::new(
+                name,
+                metadata.len(),
+                mode,
+                mod_time,
+                metadata.is_dir(),
+            ))
+        })
+        .await
+    }
+
+    async fn rename(&self, old_path: &str, new_path: &str) -> Result<()> {
+        let old_local = self.resolve_path(old_path)?;
+        let new_local = self.resolve_path(new_path)?;
+
+        // Check if old path exists
+        if !old_local.exists() {
+            return Err(Error::NotFound(old_path.to_string()));
+        }
+
+        // Check if new path parent directory exists
+        if let Some(parent) = new_local.parent() {
+            if !parent.exists() {
+                return Err(Error::NotFound(parent.to_string_lossy().to_string()));
+            }
+        }
+
+        // Rename/move
+        fs::rename(&old_local, &new_local)
+            .map_err(|e| Error::plugin(format!("failed to rename: {}", e)))?;
+
+        Ok(())
+    }
+
+    async fn replace(&self, src_path: &str, dst_path: &str) -> Result<()> {
+        let src_local = self.resolve_path(src_path)?;
+        let dst_local = self.resolve_path(dst_path)?;
+
+        if !src_local.exists() {
+            return Err(Error::NotFound(src_path.to_string()));
+        }
+
+        if src_local.is_dir() {
+            return Err(Error::invalid_operation(
+                "replace only supports files in localfs",
+            ));
+        }
+
+        if dst_local.is_dir() {
+            return Err(Error::IsADirectory(dst_path.to_string()));
+        }
+
+        if let Some(parent) = dst_local.parent() {
+            if !parent.exists() {
+                return Err(Error::NotFound(parent.to_string_lossy().to_string()));
+            }
+        }
+
+        // Keep replace semantics explicit instead of inheriting rename behavior:
+        // encrypted publish needs an overwrite-on-destination move.
+        #[cfg(windows)]
+        {
+            use std::ffi::OsStr;
+            use std::io;
+            use std::os::windows::ffi::OsStrExt;
+
+            type BOOL = i32;
+            type DWORD = u32;
+            type LPCWSTR = *const u16;
+
+            const MOVEFILE_REPLACE_EXISTING: DWORD = 0x1;
+            const MOVEFILE_WRITE_THROUGH: DWORD = 0x8;
+
+            unsafe extern "system" {
+                fn MoveFileExW(
+                    lpExistingFileName: LPCWSTR,
+                    lpNewFileName: LPCWSTR,
+                    dwFlags: DWORD,
+                ) -> BOOL;
+            }
+
+            let src_wide: Vec<u16> = OsStr::new(src_local.as_os_str())
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let dst_wide: Vec<u16> = OsStr::new(dst_local.as_os_str())
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let replaced = unsafe {
+                MoveFileExW(
+                    src_wide.as_ptr(),
+                    dst_wide.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if replaced == 0 {
+                return Err(Error::plugin(format!(
+                    "failed to replace: {}",
+                    io::Error::last_os_error()
+                )));
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            fs::rename(&src_local, &dst_local)
+                .map_err(|e| Error::plugin(format!("failed to replace: {}", e)))?;
+        }
+
+        Ok(())
+    }
+
+    async fn chmod(&self, path: &str, _mode: u32) -> Result<()> {
+        let local_path = self.resolve_path(path)?;
+
+        // Check if exists
+        if !local_path.exists() {
+            return Err(Error::NotFound(path.to_string()));
+        }
+
+        // Note: chmod is not fully implemented on all platforms
+        // For now, just return success
+        Ok(())
+    }
+
+    async fn ensure_parent_dirs(&self, path: &str, _mode: u32) -> Result<()> {
+        let local_path = self.resolve_path(path)?;
+
+        // Get parent directory
+        if let Some(parent) = local_path.parent() {
+            // Create all parent directories if they don't exist
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                Error::plugin(format!("failed to create parent directories: {}", e))
+            })?;
+        }
+
+        Ok(())
+    }
+
+    async fn grep(
+        &self,
+        path: &str,
+        pattern: &str,
+        options: GrepOptions<'_>,
+    ) -> Result<GrepResult> {
+        // Fast-path: requesting 0 matches should return immediately without touching disk or spawning processes.
+        if options.node_limit == Some(0) {
+            return Ok(GrepResult::new());
+        }
+
+        let local = self.resolve_path(path)?;
+        if !local.exists() {
+            return Err(Error::NotFound(path.to_string()));
+        }
+        let pattern_owned = pattern.to_string();
+        let path_owned = path.to_string();
+        let base_path = self.base_path.clone();
+        let exclude_owned = options.exclude_path.map(str::to_string);
+        let recursive = options.recursive;
+        let case_insensitive = options.case_insensitive;
+        let node_limit = options.node_limit;
+        let level_limit = options.level_limit;
+        let before_context = options.before_context;
+        let after_context = options.after_context;
+
+        if self.has_rg {
+            // External rg path: run in a blocking thread to avoid blocking the async runtime.
+            let rg_pattern = pattern_owned.clone();
+            let rg_base_path = base_path.clone();
+            let rg_exclude = exclude_owned.clone();
+            let rg_res = Self::run_blocking_fs(move || {
+                let options = GrepOptions {
+                    recursive,
+                    case_insensitive,
+                    node_limit,
+                    exclude_path: rg_exclude.as_deref(),
+                    level_limit,
+                    before_context,
+                    after_context,
+                };
+                LocalFileSystem::grep_via_rg(
+                    rg_base_path.as_path(),
+                    local.as_path(),
+                    rg_pattern.as_str(),
+                    options,
+                )
+            })
+            .await?;
+
+            if let Some(out) = rg_res {
+                return Ok(out);
+            }
+        }
+
+        // Fallback: also run in a blocking thread (dir walking + file reads are blocking IO).
+        Self::run_blocking_fs(move || {
+            let options = GrepOptions {
+                recursive,
+                case_insensitive,
+                node_limit,
+                exclude_path: exclude_owned.as_deref(),
+                level_limit,
+                before_context,
+                after_context,
+            };
+            LocalFileSystem::grep_via_libs(
+                base_path.as_path(),
+                &path_owned,
+                &pattern_owned,
+                options,
+            )
+        })
+        .await
+    }
+
+    /// Return one glob page in local stable DFS order without building the full directory tree first.
+    ///
+    /// Args:
+    /// - `path`: Query directory path inside the plugin mount.
+    /// - `pattern`: Glob pattern.
+    /// - `show_hidden`: Whether hidden files should be included.
+    /// - `page_size`: Page size, or `None` to return all matches.
+    /// - `level_limit`: Maximum traversal depth.
+    /// - `continuation_token`: Token returned by the previous page.
+    ///
+    /// Returns:
+    /// - The current `GlobPage`, or an error if arguments are invalid or traversal fails.
+    async fn glob_directory(
+        &self,
+        path: &str,
+        pattern: &str,
+        show_hidden: bool,
+        page_size: Option<usize>,
+        level_limit: Option<usize>,
+        continuation_token: Option<String>,
+    ) -> Result<GlobPage> {
+        // Use the same guard as every other op: `validate_virtual_path` alone lets an
+        // absolute remainder (e.g. `//etc` from a `//`-double-slash mount path) through,
+        // and `glob_via_walk`'s `resolve_virtual_path` would then join it over the base.
+        // `resolve_path` adds the is_absolute check; discard the PathBuf, keep the guard.
+        self.resolve_path(path)?;
+        let base_path = self.base_path.clone();
+        let path_owned = path.to_string();
+        let pattern_owned = pattern.to_string();
+
+        Self::run_blocking_fs(move || {
+            LocalFileSystem::glob_via_walk(
+                base_path.as_path(),
+                &path_owned,
+                &pattern_owned,
+                show_hidden,
+                page_size,
+                level_limit,
+                continuation_token,
+            )
+        })
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{ConfigValue, FileSystem, MountableFS};
+    use std::collections::HashMap;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    /// Create a LocalFS fixture pinned to the fallback grep implementation.
+    fn fallback_localfs() -> (TempDir, LocalFileSystem) {
+        let dir = TempDir::new().unwrap();
+        let mut fs = LocalFileSystem::new(dir.path().to_str().unwrap()).unwrap();
+        fs.has_rg = false;
+        (dir, fs)
+    }
+
+    /// Write a test file, creating parent directories when needed.
+    fn write_file(root: &Path, path: &str, content: &str) {
+        let path = root.join(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn test_open_file_identity_matches_only_the_current_path_entry() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "first.txt", "same content");
+        write_file(dir.path(), "second.txt", "same content");
+
+        let first_path = dir.path().join("first.txt");
+        let first_file = std::fs::File::open(&first_path).unwrap();
+
+        assert!(LocalFileSystem::open_file_matches_path(&first_file, &first_path).unwrap());
+        assert!(!LocalFileSystem::open_file_matches_path(
+            &first_file,
+            &dir.path().join("second.txt")
+        )
+        .unwrap());
+        assert!(!LocalFileSystem::open_file_matches_path(
+            &first_file,
+            &dir.path().join("missing.txt")
+        )
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_localfs_rejects_parent_path_components() {
+        let dir = TempDir::new().unwrap();
+        let mount = dir.path().join("mount");
+        std::fs::create_dir(&mount).unwrap();
+        write_file(dir.path(), "secret.txt", "secret");
+        let fs = LocalFileSystem::new(mount.to_str().unwrap()).unwrap();
+
+        let err = fs.read("/../secret.txt", 0, 0).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidPath(_)));
+    }
+
+    #[tokio::test]
+    async fn test_localfs_mount_preserves_path_errors() {
+        let dir = TempDir::new().unwrap();
+        let mount = dir.path().join("mount");
+        std::fs::create_dir(&mount).unwrap();
+        write_file(dir.path(), "secret.txt", "secret");
+        write_file(&mount, "note.md", "note");
+
+        let fs = MountableFS::new();
+        fs.register_plugin(LocalFSPlugin::new()).await;
+        let params = HashMap::from([(
+            "local_dir".to_string(),
+            ConfigValue::String(mount.to_string_lossy().into_owned()),
+        )]);
+        fs.mount(PluginConfig::single_backend("localfs", "/local", params))
+            .await
+            .unwrap();
+
+        let escape_path = format!("/local/{}", dir.path().join("secret.txt").display());
+        let err = fs.read(&escape_path, 0, 0).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidPath(_)));
+
+        let err = fs.read_internal_dir("/local/note.md").await.unwrap_err();
+        assert!(matches!(err, Error::NotADirectory(_)));
+    }
+
+    #[tokio::test]
+    async fn test_localfs_glob_mount_rejects_absolute_remainder() {
+        let dir = TempDir::new().unwrap();
+        let mount = dir.path().join("mount");
+        std::fs::create_dir(&mount).unwrap();
+        write_file(dir.path(), "secret.txt", "secret");
+
+        let fs = MountableFS::new();
+        fs.register_plugin(LocalFSPlugin::new()).await;
+        let params = HashMap::from([(
+            "local_dir".to_string(),
+            ConfigValue::String(mount.to_string_lossy().into_owned()),
+        )]);
+        fs.mount(PluginConfig::single_backend("localfs", "/local", params))
+            .await
+            .unwrap();
+
+        // `/local/<abs dir>` -> remainder `//<abs dir>` would otherwise join over the mount
+        // base and let glob list a host directory outside the mount.
+        let escape_path = format!("/local/{}", dir.path().display());
+        let err = fs
+            .glob_directory(&escape_path, "**/*", false, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidPath(_)));
+    }
+
+    #[tokio::test]
+    async fn test_localfs_write_honors_flags() {
+        let (_dir, fs) = fallback_localfs();
+        fs.write("/file", b"old", 0, WriteFlag::Create)
+            .await
+            .unwrap();
+        fs.write("/file", b"new", 0, WriteFlag::Append)
+            .await
+            .unwrap();
+        assert_eq!(fs.read("/file", 0, 0).await.unwrap(), b"oldnew");
+
+        for flag in [WriteFlag::Append, WriteFlag::Truncate, WriteFlag::None] {
+            let err = fs.write("/missing", b"data", 0, flag).await.unwrap_err();
+            assert!(matches!(err, Error::NotFound(_)));
+        }
+    }
+
+    #[test]
+    fn test_localfs_maps_would_block_lock_errors() {
+        let err = LocalFileSystem::map_lock_error(
+            "compare_and_remove",
+            "failed to lock for compare_and_remove: lock would block",
+        );
+        assert!(matches!(err, Error::WouldBlock(_)));
+    }
+
+    #[tokio::test]
+    async fn test_localfs_grep_fallback_respects_gitignore_and_hidden() {
+        let (dir, fs) = fallback_localfs();
+        write_file(dir.path(), ".gitignore", "ignored.txt\n");
+        write_file(dir.path(), "a.txt", "hello\n");
+        write_file(dir.path(), "ignored.txt", "hello\n");
+        std::fs::create_dir_all(dir.path().join(".hidden")).unwrap();
+        write_file(dir.path(), ".hidden/secret.txt", "hello\n");
+
+        let result = fs
+            .grep(
+                "/",
+                "hello",
+                GrepOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.count, 1);
+        assert_eq!(result.matches[0].file, "a.txt");
+    }
+
+    #[tokio::test]
+    async fn test_localfs_replace_overwrites_existing_file() {
+        let (_dir, fs) = fallback_localfs();
+
+        fs.write("/src.txt", b"fresh", 0, WriteFlag::Create)
+            .await
+            .unwrap();
+        fs.write("/dst.txt", b"stale", 0, WriteFlag::Create)
+            .await
+            .unwrap();
+
+        fs.replace("/src.txt", "/dst.txt").await.unwrap();
+
+        assert!(fs.stat("/src.txt").await.is_err());
+        let data = fs.read("/dst.txt", 0, 0).await.unwrap();
+        assert_eq!(data, b"fresh");
+    }
+
+    #[tokio::test]
+    async fn test_localfs_grep_case_insensitive() {
+        let (dir, fs) = fallback_localfs();
+        write_file(dir.path(), "a.txt", "HELLO\n");
+
+        let result = fs
+            .grep(
+                "/",
+                "hello",
+                GrepOptions {
+                    recursive: true,
+                    case_insensitive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_localfs_grep_includes_context() {
+        let (dir, fs) = fallback_localfs();
+        write_file(dir.path(), "a.txt", "first\nbefore\nhit\nafter\n");
+
+        let result = fs
+            .grep(
+                "/",
+                "hit",
+                GrepOptions {
+                    recursive: true,
+                    before_context: 2,
+                    after_context: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.count, 1);
+        let matched = &result.matches[0];
+        assert_eq!(matched.line, 3);
+        assert_eq!(matched.before_context.as_ref().unwrap()[0].content, "first");
+        assert_eq!(
+            matched.before_context.as_ref().unwrap()[1].content,
+            "before"
+        );
+        assert_eq!(matched.after_context.as_ref().unwrap()[0].content, "after");
+    }
+
+    #[tokio::test]
+    async fn test_localfs_grep_context_handles_adjacent_matches_and_file_boundaries() {
+        let (dir, fs) = fallback_localfs();
+        write_file(dir.path(), "a.txt", "hit one\nhit two\nlast");
+
+        let result = fs
+            .grep(
+                "/",
+                "hit",
+                GrepOptions {
+                    recursive: true,
+                    before_context: 2,
+                    after_context: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.count, 2);
+        assert_eq!(result.matches[0].before_context.as_ref().unwrap().len(), 0);
+        assert_eq!(
+            result.matches[0]
+                .after_context
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|line| (line.line, line.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "hit two"), (3, "last")]
+        );
+        assert_eq!(
+            result.matches[1]
+                .before_context
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|line| (line.line, line.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "hit one")]
+        );
+        assert_eq!(
+            result.matches[1]
+                .after_context
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|line| (line.line, line.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "last")]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_localfs_grep_node_limit_collects_trailing_context() {
+        let (dir, fs) = fallback_localfs();
+        write_file(dir.path(), "a.txt", "hit\none\ntwo\nhit\nthree\n");
+
+        let result = fs
+            .grep(
+                "/",
+                "hit",
+                GrepOptions {
+                    recursive: true,
+                    node_limit: Some(1),
+                    after_context: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.count, 1);
+        assert_eq!(
+            result.matches[0]
+                .after_context
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|line| (line.line, line.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "one"), (3, "two")]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_localfs_grep_missing_path_returns_not_found() {
+        let (_dir, fs) = fallback_localfs();
+
+        let err = fs
+            .grep(
+                "/does-not-exist",
+                "hello",
+                GrepOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_localfs_grep_does_not_inherit_parent_gitignore() {
+        let dir = TempDir::new().unwrap();
+        let mount_dir = dir.path().join("mount");
+        std::fs::create_dir_all(&mount_dir).unwrap();
+
+        // Parent .gitignore ignores the mounted directory entirely.
+        write_file(dir.path(), ".gitignore", "mount/\n");
+        write_file(&mount_dir, "a.txt", "hello\n");
+
+        let mut fs = LocalFileSystem::new(mount_dir.to_str().unwrap()).unwrap();
+        fs.has_rg = false;
+
+        let result = fs
+            .grep(
+                "/",
+                "hello",
+                GrepOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.count, 1);
+        assert_eq!(result.matches[0].file, "a.txt");
+    }
+
+    #[tokio::test]
+    async fn test_localfs_grep_returns_query_root_relative_paths() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "sub/-a.txt", "hello --version\n");
+        let mut fs = LocalFileSystem::new(dir.path().to_str().unwrap()).unwrap();
+
+        for has_rg in [fs.has_rg, false] {
+            fs.has_rg = has_rg;
+            for pattern in ["--version", "hello"] {
+                let result = fs
+                    .grep(
+                        "/sub",
+                        pattern,
+                        GrepOptions {
+                            recursive: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result.count, 1);
+                assert_eq!(result.matches[0].file, "-a.txt");
+                assert_eq!(result.matches[0].content, "hello --version");
+
+                let single_file = fs
+                    .grep(
+                        "/sub/-a.txt",
+                        pattern,
+                        GrepOptions {
+                            recursive: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(single_file.count, 1);
+                assert_eq!(single_file.matches[0].file, ".");
+                assert_eq!(single_file.matches[0].content, "hello --version");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_localfs_grep_node_limit_zero_does_not_invoke_rg() {
+        let (dir, mut fs) = fallback_localfs();
+        write_file(dir.path(), "a.txt", "hello\n");
+        fs.has_rg = true;
+        let result = fs
+            .grep(
+                "/",
+                "hello",
+                GrepOptions {
+                    recursive: true,
+                    node_limit: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.count, 0);
+        assert!(result.matches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_localfs_grep_exclude_path_applies_before_node_limit() {
+        let (dir, fs) = fallback_localfs();
+        write_file(dir.path(), "excluded/x.txt", "hit\n");
+        write_file(dir.path(), "ok/y.txt", "hit\n");
+
+        let out = fs
+            .grep(
+                "/",
+                "hit",
+                GrepOptions {
+                    recursive: true,
+                    node_limit: Some(1),
+                    exclude_path: Some("/excluded"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out.count, 1);
+        assert_eq!(out.matches.len(), 1);
+        assert_eq!(out.matches[0].file, "ok/y.txt");
+    }
+
+    #[tokio::test]
+    async fn test_localfs_grep_exclude_path_is_query_root_relative_for_nested_query_root() {
+        let (dir, fs) = fallback_localfs();
+        let nested_root = dir.path().join("acct/resources/docs");
+        write_file(&nested_root, "excluded/x.txt", "hit\n");
+        write_file(&nested_root, "ok/y.txt", "hit\n");
+
+        // Simulate MountableFS -> LocalFS: query root and exclude path are plugin-relative and nested.
+        let out = fs
+            .grep(
+                "/acct/resources/docs",
+                "hit",
+                GrepOptions {
+                    recursive: true,
+                    node_limit: Some(1),
+                    exclude_path: Some("/acct/resources/docs/excluded"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(out.count, 1);
+        assert_eq!(out.matches.len(), 1);
+        assert_eq!(out.matches[0].file, "ok/y.txt");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_localfs_grep_rg_path_supports_context() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), ".gitignore", "mount/\n");
+
+        let mount_dir = dir.path().join("mount");
+        write_file(&mount_dir, "a.txt", "before\nhello\nafter\n");
+
+        let fs = LocalFileSystem::new(mount_dir.to_str().unwrap()).unwrap();
+        if !fs.has_rg {
+            return;
+        }
+        let result = fs
+            .grep(
+                "/",
+                "hello",
+                GrepOptions {
+                    recursive: true,
+                    before_context: 1,
+                    after_context: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.count, 1);
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].file, "a.txt");
+        assert_eq!(result.matches[0].content, "hello");
+        assert_eq!(
+            result.matches[0].before_context.as_ref().unwrap()[0].content,
+            "before"
+        );
+        assert_eq!(
+            result.matches[0].after_context.as_ref().unwrap()[0].content,
+            "after"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_localfs_glob_paginates_with_local_cursor_tokens() {
+        let (dir, fs) = fallback_localfs();
+        write_file(dir.path(), "a.md", "");
+        write_file(dir.path(), "b.md", "");
+        write_file(dir.path(), "c.md", "");
+
+        let first = fs
+            .glob_directory("/", "**/*.md", false, Some(2), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.rel_path.clone())
+                .collect::<Vec<_>>(),
+            vec!["a.md", "b.md"]
+        );
+        assert!(first.next_token.is_some());
+        assert_eq!(first.entries[0].path, "/a.md");
+
+        let second = fs
+            .glob_directory("/", "**/*.md", false, Some(2), None, first.next_token)
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|entry| entry.rel_path.clone())
+                .collect::<Vec<_>>(),
+            vec!["c.md"]
+        );
+        assert!(second.next_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_localfs_glob_keeps_directory_matches() {
+        let (dir, fs) = fallback_localfs();
+        std::fs::create_dir_all(dir.path().join("folder")).unwrap();
+
+        let out = fs
+            .glob_directory("/", "**/*", false, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.entries
+                .iter()
+                .map(|entry| entry.rel_path.clone())
+                .collect::<Vec<_>>(),
+            vec!["folder"]
+        );
+        assert!(out.entries[0].is_dir);
+    }
+
+    #[test]
+    fn test_localfs_relative_path_uses_forward_slashes() {
+        let root = Path::new("root");
+        let local = root.join("a").join("b.md");
+
+        assert_eq!(
+            LocalFileSystem::local_to_query_relative_path(root, &local).unwrap(),
+            "a/b.md"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_localfs_glob_respects_level_limit() {
+        let (dir, fs) = fallback_localfs();
+        write_file(dir.path(), "top.md", "");
+        write_file(dir.path(), "sub/nested.md", "");
+        write_file(dir.path(), "sub/deeper/late.md", "");
+
+        let out = fs
+            .glob_directory("/", "**/*.md", false, None, Some(1), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.entries
+                .iter()
+                .map(|entry| entry.rel_path.clone())
+                .collect::<Vec<_>>(),
+            vec!["top.md"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_localfs_glob_rejects_token_from_different_query_scope() {
+        let (dir, fs) = fallback_localfs();
+        write_file(dir.path(), "a.md", "");
+        write_file(dir.path(), "b.md", "");
+        write_file(dir.path(), "c.md", "");
+
+        let first = fs
+            .glob_directory("/", "**/*.md", false, Some(2), None, None)
+            .await
+            .unwrap();
+        let err = fs
+            .glob_directory("/", "**/*.txt", false, Some(2), None, first.next_token)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidOperation(_)));
+    }
+
+    #[tokio::test]
+    async fn test_localfs_glob_skips_hidden_files_but_keeps_hidden_dirs() {
+        let (dir, fs) = fallback_localfs();
+        write_file(dir.path(), ".hidden.md", "");
+        write_file(dir.path(), ".hidden_dir/nested.md", "");
+
+        let out = fs
+            .glob_directory("/", "**/*.md", false, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            out.entries
+                .iter()
+                .map(|entry| entry.rel_path.clone())
+                .collect::<Vec<_>>(),
+            vec![".hidden_dir/nested.md"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_localfs_glob_defers_late_subtree_errors_to_later_pages() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, fs) = fallback_localfs();
+        write_file(dir.path(), "a.md", "");
+        write_file(dir.path(), "b.md", "");
+        write_file(dir.path(), "c.md", "");
+        std::fs::create_dir_all(dir.path().join("z_blocked")).unwrap();
+        write_file(dir.path(), "z_blocked/late.md", "");
+
+        let blocked_dir = dir.path().join("z_blocked");
+        let old_mode = std::fs::metadata(&blocked_dir)
+            .unwrap()
+            .permissions()
+            .mode();
+        let mut perms = std::fs::metadata(&blocked_dir).unwrap().permissions();
+        perms.set_mode(0);
+        std::fs::set_permissions(&blocked_dir, perms).unwrap();
+
+        let first = fs
+            .glob_directory("/", "**/*.md", false, Some(2), None, None)
+            .await;
+        assert!(first.is_ok());
+        let first = first.unwrap();
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.rel_path.clone())
+                .collect::<Vec<_>>(),
+            vec!["a.md", "b.md"]
+        );
+        assert!(first.next_token.is_some());
+
+        let out = fs
+            .glob_directory("/", "**/*.md", false, Some(2), None, first.next_token)
+            .await;
+
+        let mut restore = std::fs::metadata(&blocked_dir).unwrap().permissions();
+        restore.set_mode(old_mode);
+        std::fs::set_permissions(&blocked_dir, restore).unwrap();
+
+        assert!(out.is_err());
+    }
+}
+
+/// LocalFS plugin
+pub struct LocalFSPlugin {
+    config_params: Vec<ConfigParameter>,
+}
+
+impl LocalFSPlugin {
+    /// Create a new LocalFS plugin
+    pub fn new() -> Self {
+        Self {
+            config_params: vec![ConfigParameter {
+                name: "local_dir".to_string(),
+                param_type: "string".to_string(),
+                required: true,
+                default: None,
+                description: "Local directory path to expose (must exist)".to_string(),
+            }],
+        }
+    }
+}
+
+#[async_trait]
+impl ServicePlugin for LocalFSPlugin {
+    fn name(&self) -> &str {
+        "localfs"
+    }
+
+    fn readme(&self) -> &str {
+        r#"LocalFS Plugin - Local File System Mount
+
+This plugin mounts a local directory into RAGFS virtual file system.
+
+FEATURES:
+  - Mount any local directory into RAGFS
+  - Full POSIX file system operations
+  - Direct access to local files and directories
+  - Preserves file permissions and timestamps
+  - Efficient file operations (no copying)
+
+CONFIGURATION:
+
+  Basic configuration:
+  [plugins.localfs]
+  enabled = true
+  path = "/local"
+
+    [plugins.localfs.config]
+    local_dir = "/path/to/local/directory"
+
+  Multiple local mounts:
+  [plugins.localfs_home]
+  enabled = true
+  path = "/home"
+
+    [plugins.localfs_home.config]
+    local_dir = "/Users/username"
+
+USAGE:
+
+  List directory:
+    agfs ls /local
+
+  Read a file:
+    agfs cat /local/file.txt
+
+  Write to a file:
+    agfs write /local/file.txt "Hello, World!"
+
+  Create a directory:
+    agfs mkdir /local/newdir
+
+  Remove a file:
+    agfs rm /local/file.txt
+
+NOTES:
+  - Changes are directly applied to local file system
+  - File permissions are preserved and can be modified
+  - Be careful with rm -r as it permanently deletes files
+
+VERSION: 1.0.0
+"#
+    }
+
+    async fn validate(&self, config: &PluginConfig) -> Result<()> {
+        // Validate local_dir parameter
+        let local_dir = config
+            .params
+            .get("local_dir")
+            .and_then(|v| match v {
+                crate::core::types::ConfigValue::String(s) => Some(s),
+                _ => None,
+            })
+            .ok_or_else(|| Error::plugin("local_dir is required in configuration".to_string()))?;
+
+        // Check if path exists
+        let path = Path::new(local_dir);
+        if !path.exists() {
+            return Err(Error::plugin(format!(
+                "base path does not exist: {}",
+                local_dir
+            )));
+        }
+
+        // Verify it's a directory
+        if !path.is_dir() {
+            return Err(Error::plugin(format!(
+                "base path is not a directory: {}",
+                local_dir
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn initialize(&self, config: PluginConfig) -> Result<Box<dyn FileSystem>> {
+        // Parse configuration
+        let local_dir = config
+            .params
+            .get("local_dir")
+            .and_then(|v| match v {
+                crate::core::types::ConfigValue::String(s) => Some(s),
+                _ => None,
+            })
+            .ok_or_else(|| Error::plugin("local_dir is required".to_string()))?;
+
+        let fs = LocalFileSystem::new(local_dir)?;
+        Ok(Box::new(fs))
+    }
+
+    fn config_params(&self) -> &[ConfigParameter] {
+        &self.config_params
+    }
+}

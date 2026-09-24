@@ -1,0 +1,205 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+
+"""Regression tests for watch-task control file access boundaries."""
+
+import contextvars
+from types import SimpleNamespace
+
+import pytest
+
+from openviking.resource.watch_storage import (
+    WATCH_TASK_STORAGE_BAK_URI,
+    WATCH_TASK_STORAGE_TMP_URI,
+    WATCH_TASK_STORAGE_URI,
+)
+from openviking.server.identity import RequestContext, Role
+from openviking.storage.content_write import ContentWriteCoordinator
+from openviking.storage.viking_fs import VikingFS
+from openviking_cli.exceptions import InvalidArgumentError, PermissionDeniedError
+from openviking_cli.session.user_id import UserIdentifier
+
+
+@pytest.fixture
+def root_ctx() -> RequestContext:
+    return RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+
+
+@pytest.fixture
+def user_ctx() -> RequestContext:
+    return RequestContext(user=UserIdentifier("default", "alice"), role=Role.USER)
+
+
+@pytest.fixture
+def bare_viking_fs() -> VikingFS:
+    fs = object.__new__(VikingFS)
+    fs.acl_manager = None
+    fs._bound_ctx = contextvars.ContextVar("vikingfs_bound_ctx", default=None)
+    return fs
+
+
+class _NoWriteVikingFS:
+    async def _ensure_access(self, uri, ctx, *, action):
+        raise AssertionError(f"write access should not be reached for {uri}")
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        WATCH_TASK_STORAGE_URI,
+        WATCH_TASK_STORAGE_BAK_URI,
+        WATCH_TASK_STORAGE_TMP_URI,
+    ],
+)
+@pytest.mark.asyncio
+async def test_watch_task_control_files_are_root_only(bare_viking_fs, root_ctx, user_ctx, uri):
+    async def acl_enabled(_account_id):
+        return True
+
+    bare_viking_fs.acl_manager = SimpleNamespace(is_enabled=acl_enabled)
+    await bare_viking_fs._ensure_access(uri, root_ctx)
+    with pytest.raises(PermissionDeniedError):
+        await bare_viking_fs._ensure_access(uri, user_ctx)
+
+
+@pytest.mark.asyncio
+async def test_hidden_listing_filters_watch_task_control_files_for_non_root(
+    bare_viking_fs, root_ctx, user_ctx
+):
+    async def ls_entries(path, **_kwargs):
+        return [
+            {
+                "name": ".watch_tasks.json",
+                "isDir": False,
+                "size": 10,
+                "modTime": "2026-01-01T00:00:00+00:00",
+            },
+            {
+                "name": ".watch_tasks.json.bak",
+                "isDir": False,
+                "size": 10,
+                "modTime": "2026-01-01T00:00:00+00:00",
+            },
+            {
+                "name": ".watch_tasks.json.tmp",
+                "isDir": False,
+                "size": 10,
+                "modTime": "2026-01-01T00:00:00+00:00",
+            },
+            {
+                "name": "public.txt",
+                "isDir": False,
+                "size": 5,
+                "modTime": "2026-01-01T00:00:00+00:00",
+            },
+        ]
+
+    bare_viking_fs._uri_to_path = lambda uri, ctx=None: "/fake/resources"
+    bare_viking_fs._ctx_or_default = lambda ctx=None: ctx
+    bare_viking_fs._ls_entries = ls_entries
+    bare_viking_fs._path_to_uri = lambda path, ctx=None: f"viking://resources/{path.split('/')[-1]}"
+
+    root_entries = await bare_viking_fs._ls_original(
+        "viking://resources",
+        show_all_hidden=True,
+        ctx=root_ctx,
+    )
+    root_uris = {entry["uri"] for entry in root_entries}
+    assert root_uris >= {
+        WATCH_TASK_STORAGE_URI,
+        WATCH_TASK_STORAGE_BAK_URI,
+        WATCH_TASK_STORAGE_TMP_URI,
+        "viking://resources/public.txt",
+    }
+
+    user_entries = await bare_viking_fs._ls_original(
+        "viking://resources",
+        show_all_hidden=True,
+        ctx=user_ctx,
+    )
+    user_uris = {entry["uri"] for entry in user_entries}
+    assert "viking://resources/public.txt" in user_uris
+    assert WATCH_TASK_STORAGE_URI not in user_uris
+    assert WATCH_TASK_STORAGE_BAK_URI not in user_uris
+    assert WATCH_TASK_STORAGE_TMP_URI not in user_uris
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        WATCH_TASK_STORAGE_URI,
+        WATCH_TASK_STORAGE_BAK_URI,
+        WATCH_TASK_STORAGE_TMP_URI,
+    ],
+)
+async def test_content_write_rejects_watch_task_control_files(user_ctx, uri):
+    coordinator = ContentWriteCoordinator(_NoWriteVikingFS())
+
+    with pytest.raises(InvalidArgumentError, match="watch task control file"):
+        await coordinator.write(uri=uri, content="x", ctx=user_ctx)
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "viking://resources/project/.path.ovlock",
+        "viking://resources/project/.exact.ovlock.",
+        "viking://resources/project/.exact.ovlock.probe.md",
+        "viking://resources/project/.exact.ovlock.notes.md.0123abcd",
+        "viking://resources/project/.redirect.json",
+        "viking://resources/project/.sync_log.json",
+    ],
+)
+@pytest.mark.parametrize("suffix", ["", "/child.md", "/nested/child.md"])
+@pytest.mark.parametrize("mode", ["create", "replace", "append"])
+async def test_content_write_rejects_storage_internal_files(user_ctx, uri, suffix, mode):
+    coordinator = ContentWriteCoordinator(_NoWriteVikingFS())
+
+    with pytest.raises(InvalidArgumentError, match="storage internal file"):
+        await coordinator.write(uri=uri + suffix, content="x", mode=mode, ctx=user_ctx)
+
+
+async def test_batch_write_rejects_storage_internal_parent_before_writing(user_ctx):
+    from unittest.mock import AsyncMock
+
+    coordinator = ContentWriteCoordinator(_NoWriteVikingFS())
+    coordinator._validate_batch_root = AsyncMock()
+    with pytest.raises(InvalidArgumentError, match="storage internal file"):
+        await coordinator.batch_write(
+            root_uri="viking://resources/project",
+            operations=[
+                {
+                    "uri": "viking://resources/project/.exact.ovlock.probe.md/child.md",
+                    "content": "x",
+                    "mode": "create",
+                }
+            ],
+            ctx=user_ctx,
+        )
+
+
+@pytest.mark.parametrize("name", ["tasks", "_system", ".exact.ovlock", "x.exact.ovlock.foo"])
+def test_storage_name_policy_allows_user_directories(name):
+    from openviking.service.fs_service import FSService
+
+    uri = f"viking://resources/project/{name}/notes.md"
+    FSService._reject_storage_internal_target(uri)
+    ContentWriteCoordinator(_NoWriteVikingFS())._ensure_content_write_policy(uri)
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "viking://resources//.watch_tasks.json",
+        "viking://resources//.watch_tasks.json.bak",
+        "viking://resources///.watch_tasks.json.tmp/",
+    ],
+)
+async def test_redundant_separator_aliases_cannot_bypass_watch_task_acl(
+    bare_viking_fs, user_ctx, uri
+):
+    assert bare_viking_fs._is_accessible(uri, user_ctx) is False
+
+    coordinator = ContentWriteCoordinator(_NoWriteVikingFS())
+    with pytest.raises(InvalidArgumentError, match="watch task control file"):
+        await coordinator.write(uri=uri, content="x", ctx=user_ctx)

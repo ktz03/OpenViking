@@ -1,0 +1,366 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+
+from dataclasses import replace
+
+import pytest
+
+from openviking.server.identity import RequestContext, Role
+from openviking.storage.viking_fs import VikingFS
+from openviking_cli.exceptions import NotFoundError, PermissionDeniedError
+from openviking_cli.session.user_id import UserIdentifier
+
+_MOD_TIME = "2026-01-01T00:00:00Z"
+
+
+class _MemoryAGFS:
+    def __init__(self):
+        self.files = {
+            "/local/acct/agent/skills/demo/SKILL.md": b"shared skill",
+            "/local/acct/agent/tools/search/config.json": b"{}",
+            "/local/acct/agent/workflows/daily.md": b"shared workflow",
+            "/local/acct/user/support_bot/peers/customer-wang-yue/memories/profile.md": b"wang",
+            "/local/acct/user/support_bot/peers/customer-zhang-xiaoxiao/memories/profile.md": (
+                b"zhang"
+            ),
+            "/local/acct/user/support_bot/resources/guide.md": b"guide",
+            "/local/acct/user/support_bot/sessions/duplicate/messages.jsonl": (
+                b'{"role":"user","content":"new"}\n'
+            ),
+            "/local/acct/user/support_bot/sessions/new-session/messages.jsonl": (
+                b'{"role":"user","content":"new only"}\n'
+            ),
+            "/local/acct/session/duplicate/messages.jsonl": (
+                b'{"role":"user","content":"legacy duplicate"}\n'
+            ),
+            "/local/acct/session/legacy-session/messages.jsonl": (
+                b'{"role":"user","content":"legacy"}\n'
+            ),
+            "/local/acct/session/legacy-session/.meta.json": (
+                b'{"created_by_user_id":"support_bot"}'
+            ),
+            "/local/acct/session/other-owned/.meta.json": b'{"created_by_user_id":"other"}',
+            "/local/acct/session/other-owned/messages.jsonl": (
+                b'{"role":"user","content":"other"}\n'
+            ),
+            "/local/acct/session/support_bot/nested-session/messages.jsonl": (
+                b'{"role":"user","content":"nested"}\n'
+            ),
+        }
+        self.dirs = set()
+        for path in self.files:
+            parts = path.strip("/").split("/")[:-1]
+            current = ""
+            for part in parts:
+                current += f"/{part}"
+                self.dirs.add(current)
+        self.writes = []
+        self.removed = []
+
+    def ls(self, path, ctx=None, *, offset=0, limit=None):
+        if path not in self.dirs:
+            raise FileNotFoundError(path)
+        prefix = path.rstrip("/") + "/"
+        names = set()
+        for candidate in [*self.dirs, *self.files]:
+            if not candidate.startswith(prefix):
+                continue
+            rest = candidate[len(prefix) :]
+            if rest and "/" not in rest:
+                names.add(rest)
+        entries = [self._entry(f"{prefix}{name}") for name in sorted(names)]
+        return entries[offset : offset + limit if limit is not None else None]
+
+    def tree_directory(
+        self,
+        path,
+        show_hidden=False,
+        node_limit=None,
+        level_limit=None,
+        ctx=None,
+    ):
+        if path not in self.dirs:
+            raise FileNotFoundError(path)
+        prefix = path.rstrip("/") + "/"
+        entries = []
+        for candidate in sorted([*self.dirs, *self.files]):
+            if not candidate.startswith(prefix):
+                continue
+            rel_path = candidate[len(prefix) :]
+            if not rel_path:
+                continue
+            if level_limit is not None and len(rel_path.split("/")) > level_limit:
+                continue
+            entry = {
+                "path": candidate,
+                "rel_path": rel_path,
+                "info": self._entry(candidate),
+                "extra": {},
+            }
+            entries.append(entry)
+            if node_limit is not None and len(entries) >= node_limit:
+                break
+        return entries
+
+    def stat(self, path, ctx=None):
+        if path in self.dirs:
+            return self._entry(path)
+        if path in self.files:
+            return self._entry(path)
+        raise FileNotFoundError(path)
+
+    def read(self, path, *args, ctx=None):
+        if path not in self.files:
+            raise FileNotFoundError(path)
+        return self.files[path]
+
+    def write(self, path, data, ctx=None):
+        self.files[path] = data if isinstance(data, bytes) else data.encode("utf-8")
+        self.writes.append(path)
+
+    def rm(self, path, recursive=False, ctx=None):
+        self.removed.append(path)
+        self.files.pop(path, None)
+        return {}
+
+    def grep(self, **kwargs):
+        return {
+            "matches": [
+                {
+                    "file": "peers/customer-wang-yue/memories/profile.md",
+                    "line": 1,
+                    "content": "wang",
+                },
+                {
+                    "file": "peers/customer-zhang-xiaoxiao/memories/profile.md",
+                    "line": 1,
+                    "content": "zhang",
+                },
+            ],
+            "files_scanned": 2,
+        }
+
+    def _entry(self, path):
+        is_dir = path in self.dirs
+        return {
+            "name": path.rstrip("/").rsplit("/", 1)[-1],
+            "size": 0 if is_dir else len(self.files[path]),
+            "mode": 0o755,
+            "modTime": _MOD_TIME,
+            "isDir": is_dir,
+        }
+
+
+class _CountingVectorStore:
+    def __init__(self):
+        self.calls = []
+
+    async def count(self, filter=None, ctx=None):
+        self.calls.append((filter, ctx))
+        return 7
+
+
+@pytest.fixture
+def fs():
+    return VikingFS(agfs=_MemoryAGFS())
+
+
+@pytest.fixture
+def actor_ctx():
+    return RequestContext(
+        user=UserIdentifier("acct", "support_bot"),
+        role=Role.USER,
+        actor_peer_id="customer-wang-yue",
+    )
+
+
+def _other_peer_uri(suffix="memories/profile.md"):
+    return f"viking://user/support_bot/peers/customer-zhang-xiaoxiao/{suffix}"
+
+
+def _actor_peer_uri(suffix="memories/profile.md"):
+    return f"viking://user/support_bot/peers/customer-wang-yue/{suffix}"
+
+
+@pytest.mark.asyncio
+async def test_actor_peer_view_filters_ls_peer_collection(fs, actor_ctx):
+    entries = await fs.ls("viking://user/support_bot/peers", ctx=actor_ctx)
+
+    assert [entry["uri"] for entry in entries] == [
+        "viking://user/support_bot/peers/customer-wang-yue"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_directories_are_shared_within_account(fs, actor_ctx):
+    for ctx in (actor_ctx, replace(actor_ctx, actor_peer_id="another-peer")):
+        entries = await fs.ls("viking://agent", ctx=ctx)
+        assert [entry["uri"] for entry in entries] == [
+            "viking://agent/skills",
+            "viking://agent/tools",
+            "viking://agent/workflows",
+        ]
+        assert await fs.read_file("viking://agent/skills/demo/SKILL.md", ctx=ctx) == "shared skill"
+        await fs.write_file("viking://agent/workflows/daily.md", "updated workflow", ctx=ctx)
+        assert (
+            await fs.read_file("viking://agent/workflows/daily.md", ctx=ctx) == "updated workflow"
+        )
+
+    other_account = replace(actor_ctx, user=UserIdentifier("other-acct", "support_bot"))
+    with pytest.raises(NotFoundError):
+        await fs.read_file("viking://agent/skills/demo/SKILL.md", ctx=other_account)
+
+
+@pytest.mark.asyncio
+async def test_legacy_session_scope_merges_new_and_unmigrated_sessions(fs, actor_ctx):
+    session_root = "viking://user/support_bot/sessions"
+    entries = await fs.ls(session_root, ctx=actor_ctx)
+
+    assert [entry["uri"] for entry in entries] == [
+        f"{session_root}/duplicate",
+        f"{session_root}/new-session",
+        f"{session_root}/legacy-session",
+        f"{session_root}/nested-session",
+    ]
+
+    assert (
+        await fs.read_file(f"{session_root}/duplicate/messages.jsonl", ctx=actor_ctx)
+        == '{"role":"user","content":"new"}\n'
+    )
+    assert (
+        await fs.read_file(f"{session_root}/legacy-session/messages.jsonl", ctx=actor_ctx)
+        == '{"role":"user","content":"legacy"}\n'
+    )
+    assert (
+        await fs.read_file(f"{session_root}/nested-session/messages.jsonl", ctx=actor_ctx)
+        == '{"role":"user","content":"nested"}\n'
+    )
+    with pytest.raises(NotFoundError):
+        await fs.read_file(f"{session_root}/other-owned/messages.jsonl", ctx=actor_ctx)
+
+    for session_id in ("new-session", "legacy-session", "nested-session"):
+        children = await fs.ls(f"{session_root}/{session_id}", ctx=actor_ctx)
+        assert [entry["uri"] for entry in children] == [
+            f"{session_root}/{session_id}/messages.jsonl"
+        ]
+    with pytest.raises(NotFoundError):
+        await fs.ls(f"{session_root}/other-owned", ctx=actor_ctx)
+
+
+@pytest.mark.asyncio
+async def test_session_grep_preserves_legacy_merge_and_primary_shadow(fs, actor_ctx):
+    session_root = "viking://user/support_bot/sessions"
+
+    result = await fs.grep(
+        session_root,
+        pattern="new|legacy|nested|other",
+        ctx=actor_ctx,
+    )
+
+    assert result["matches"] == [
+        {
+            "uri": f"{session_root}/duplicate/messages.jsonl",
+            "line": 1,
+            "content": '{"role":"user","content":"new"}',
+        },
+        {
+            "uri": f"{session_root}/new-session/messages.jsonl",
+            "line": 1,
+            "content": '{"role":"user","content":"new only"}',
+        },
+        {
+            "uri": f"{session_root}/legacy-session/messages.jsonl",
+            "line": 1,
+            "content": '{"role":"user","content":"legacy"}',
+        },
+        {
+            "uri": f"{session_root}/nested-session/messages.jsonl",
+            "line": 1,
+            "content": '{"role":"user","content":"nested"}',
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_native_grep_gate_allows_primary_only_session(fs, actor_ctx):
+    assert await fs._session_native_grep_safe(
+        "viking://user/support_bot/sessions/new-session", actor_ctx
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_native_grep_gate_rejects_visible_legacy_layouts(fs, actor_ctx):
+    assert not await fs._session_native_grep_safe(
+        "viking://user/support_bot/sessions/legacy-session", actor_ctx
+    )
+    assert not await fs._session_native_grep_safe(
+        "viking://user/support_bot/sessions/nested-session", actor_ctx
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_native_grep_gate_ignores_other_owner_legacy_data(fs, actor_ctx):
+    assert await fs._session_native_grep_safe(
+        "viking://user/support_bot/sessions/other-owned", actor_ctx
+    )
+
+
+@pytest.mark.asyncio
+async def test_actor_peer_view_filters_tree_from_user_root(fs, actor_ctx):
+    entries = await fs.tree(
+        "viking://user/support_bot",
+        ctx=actor_ctx,
+        level_limit=None,
+    )
+    uris = {entry["uri"] for entry in entries}
+
+    assert _actor_peer_uri() in uris
+    assert _other_peer_uri() not in uris
+    assert "viking://user/support_bot/resources/guide.md" in uris
+
+
+@pytest.mark.asyncio
+async def test_actor_peer_view_blocks_read_stat_and_write_to_other_peer(fs, actor_ctx):
+    with pytest.raises(PermissionDeniedError):
+        await fs.stat(_other_peer_uri(), ctx=actor_ctx)
+    with pytest.raises(PermissionDeniedError):
+        await fs.read_file(_other_peer_uri(), ctx=actor_ctx)
+    with pytest.raises(PermissionDeniedError):
+        await fs.write_file(_other_peer_uri(), "blocked", ctx=actor_ctx)
+
+    await fs.write_file("viking://user/support_bot/resources/new.md", "allowed", ctx=actor_ctx)
+    assert "/local/acct/user/support_bot/resources/new.md" in fs._async_agfs._client.writes
+
+
+@pytest.mark.asyncio
+async def test_actor_peer_view_stat_does_not_count_hidden_peer_roots(actor_ctx):
+    vector_store = _CountingVectorStore()
+    fs = VikingFS(agfs=_MemoryAGFS(), vector_store=vector_store)
+
+    user_root = await fs.stat("viking://user/support_bot", ctx=actor_ctx)
+    peer_collection = await fs.stat("viking://user/support_bot/peers", ctx=actor_ctx)
+    user_resources = await fs.stat("viking://user/support_bot/resources", ctx=actor_ctx)
+
+    assert "count" not in user_root
+    assert "count" not in peer_collection
+    assert user_resources["count"] == 7
+
+
+@pytest.mark.asyncio
+async def test_actor_peer_view_blocks_mutating_other_peer_and_peer_collection(fs, actor_ctx):
+    with pytest.raises(PermissionDeniedError):
+        await fs.rm(_other_peer_uri(), ctx=actor_ctx)
+    with pytest.raises(PermissionDeniedError):
+        await fs.mv(_actor_peer_uri(), _other_peer_uri(), ctx=actor_ctx)
+    with pytest.raises(PermissionDeniedError):
+        await fs.rm("viking://user/support_bot/peers", recursive=True, ctx=actor_ctx)
+    with pytest.raises(PermissionDeniedError):
+        await fs.rm("viking://user/support_bot", recursive=True, ctx=actor_ctx)
+
+
+@pytest.mark.asyncio
+async def test_actor_peer_view_filters_grep_matches(fs, actor_ctx):
+    result = await fs.grep("viking://user/support_bot", pattern="profile", ctx=actor_ctx)
+
+    assert [match["uri"] for match in result["matches"]] == [_actor_peer_uri()]
+    assert result["files_scanned"] == 1

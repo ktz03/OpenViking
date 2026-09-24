@@ -1,0 +1,751 @@
+import pytest
+
+from openviking.session.memory.dataclass import MemoryFile
+from openviking.session.memory.utils.link_renderer import LinkRenderer
+from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+
+
+@pytest.mark.parametrize(
+    ("name", "encoded"),
+    [("a#one.md", "a%23one.md"), ("a%23one.md", "a%2523one.md")],
+)
+def test_hash_filename_links_round_trip_without_aliasing(name, encoded):
+    source = "viking://resources/wiki/index.md"
+    target = f"viking://resources/wiki/{name}"
+    assert (
+        LinkRenderer.render_links("Details", source, [{"match_text": "Details", "to_uri": target}])
+        == f"[Details](./{encoded})"
+    )
+    for prefix in ("./", "viking://resources/wiki/"):
+        content = f"[Details]({prefix}{encoded}#intro)"
+        assert LinkRenderer.can_render_link(content, "Details", source, target)
+        for other in {"a#one.md", "a#two.md", "a%23one.md", "a"} - {name}:
+            assert not LinkRenderer.can_render_link(
+                content, "Details", source, f"viking://resources/wiki/{other}"
+            )
+
+
+class TestRelativePath:
+    def test_same_directory(self):
+        result = LinkRenderer.relative_path(
+            "viking://user/Caroline/memories/profile.md",
+            "viking://user/Caroline/memories/identity.md",
+        )
+        assert result == "./identity.md"
+
+    def test_target_in_subdirectory(self):
+        result = LinkRenderer.relative_path(
+            "viking://user/Caroline/memories/profile.md",
+            "viking://user/Caroline/memories/events/2023/08/17/pride.md",
+        )
+        assert result == "events/2023/08/17/pride.md"
+
+    def test_source_in_subdirectory(self):
+        result = LinkRenderer.relative_path(
+            "viking://user/Caroline/memories/events/2023/08/17/pride.md",
+            "viking://user/Caroline/memories/profile.md",
+        )
+        assert result == "../../../../profile.md"
+
+    def test_cross_subdirectory(self):
+        result = LinkRenderer.relative_path(
+            "viking://user/Caroline/memories/events/2023/08/17/pride.md",
+            "viking://user/Caroline/memories/entities/people/alice.md",
+        )
+        assert result == "../../../../entities/people/alice.md"
+
+    def test_cross_scope_returns_none(self):
+        result = LinkRenderer.relative_path(
+            "viking://user/Caroline/memories/profile.md",
+            "viking://resources/skills/pdf.md",
+        )
+        assert result is None
+
+    def test_different_user_returns_none(self):
+        result = LinkRenderer.relative_path(
+            "viking://user/Caroline/memories/profile.md",
+            "viking://user/Melanie/memories/profile.md",
+        )
+        assert result is None
+
+    def test_different_user_same_scope_prefix(self):
+        # "user" matches, but "Caroline" != "Melanie" so common < 2
+        result = LinkRenderer.relative_path(
+            "viking://user/Caroline/memories/profile.md",
+            "viking://user/Melanie/memories/events/2023/pride.md",
+        )
+        assert result is None
+
+    def test_same_file_returns_empty(self):
+        result = LinkRenderer.relative_path(
+            "viking://user/Caroline/memories/profile.md",
+            "viking://user/Caroline/memories/profile.md",
+        )
+        # Same file: common = all segments, up=0, down=empty -> empty string
+        assert result == ""
+
+
+class TestLinkSatisfaction:
+    source_uri = "viking://resources/wiki/overview.md"
+    target_uri = "viking://resources/wiki/tags.md"
+
+    def test_unprotected_anchor_can_be_linked(self):
+        assert LinkRenderer.can_render_link(
+            "Read the behavior tags.",
+            "behavior tags",
+            self.source_uri,
+            self.target_uri,
+        )
+
+    def test_existing_link_to_target_is_already_satisfied(self):
+        assert LinkRenderer.can_render_link(
+            "参见 [L2 行为标签库](./tags.md)。",
+            "行为标签库",
+            self.source_uri,
+            self.target_uri,
+        )
+
+    def test_existing_link_with_title_is_already_satisfied(self):
+        assert LinkRenderer.can_render_link(
+            'See [Tags](./tags.md "details").',
+            "Tags",
+            self.source_uri,
+            self.target_uri,
+        )
+
+    def test_existing_link_with_angle_destination_and_title_is_satisfied(self):
+        assert LinkRenderer.can_render_link(
+            "See [Tags](<./tags.md> 'details').",
+            "Tags",
+            self.source_uri,
+            self.target_uri,
+        )
+
+    def test_existing_link_with_balanced_parentheses_is_satisfied(self):
+        assert LinkRenderer.can_render_link(
+            "See [Version](../meta/foo(1).md).",
+            "Version",
+            "viking://resources/wiki/guide/overview.md",
+            "viking://resources/wiki/meta/foo(1).md",
+        )
+
+    def test_existing_link_with_escaped_parentheses_is_satisfied(self):
+        assert LinkRenderer.can_render_link(
+            r"See [Version](../meta/foo\(1\).md).",
+            "Version",
+            "viking://resources/wiki/guide/overview.md",
+            "viking://resources/wiki/meta/foo(1).md",
+        )
+
+    def test_literal_space_destination_with_title_remains_supported(self):
+        assert LinkRenderer.can_render_link(
+            'See [Tag Notes](./tag notes.md "details").',
+            "Tag Notes",
+            self.source_uri,
+            "viking://resources/wiki/tag notes.md",
+        )
+
+    def test_equivalent_encoded_target_with_fragment_is_satisfied(self):
+        assert LinkRenderer.can_render_link(
+            "See [ByteDance](../concepts/byte%20dance.md#facts).",
+            "ByteDance",
+            "viking://resources/wiki/sections/overview.md",
+            "viking://resources/wiki/concepts/byte dance.md",
+        )
+
+    def test_existing_link_to_other_target_is_not_satisfied(self):
+        assert not LinkRenderer.can_render_link(
+            "参见 [行为标签库](./other.md)。",
+            "行为标签库",
+            self.source_uri,
+            self.target_uri,
+        )
+
+    def test_title_and_parentheses_do_not_hide_wrong_targets(self):
+        assert not LinkRenderer.can_render_link(
+            'See [Tags](./other.md "details").',
+            "Tags",
+            self.source_uri,
+            self.target_uri,
+        )
+        assert not LinkRenderer.can_render_link(
+            "See [Version](../meta/foo(2).md).",
+            "Version",
+            "viking://resources/wiki/guide/overview.md",
+            "viking://resources/wiki/meta/foo(1).md",
+        )
+
+    def test_link_syntax_in_code_is_not_satisfied(self):
+        assert not LinkRenderer.can_render_link(
+            "`[行为标签库](./tags.md)`",
+            "行为标签库",
+            self.source_uri,
+            self.target_uri,
+        )
+
+
+class TestRenderLinks:
+    def test_single_link(self):
+        content = "Caroline attended a support group meeting."
+        links = [
+            {
+                "from_uri": "viking://user/Caroline/memories/profile.md",
+                "to_uri": "viking://user/Caroline/memories/entities/groups/lgbtq_support_group.md",
+                "weight": 1.0,
+                "match_text": "support",
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Caroline/memories/profile.md",
+            links,
+        )
+        assert (
+            result
+            == "Caroline attended a [support](entities/groups/lgbtq_support_group.md) group meeting."
+        )
+
+    def test_case_insensitive_match(self):
+        content = "Caroline attended a Support group meeting."
+        links = [
+            {
+                "from_uri": "viking://user/Caroline/memories/profile.md",
+                "to_uri": "viking://user/Caroline/memories/entities/groups/lgbtq_support_group.md",
+                "weight": 1.0,
+                "match_text": "support",
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Caroline/memories/profile.md",
+            links,
+        )
+        assert (
+            result
+            == "Caroline attended a [Support](entities/groups/lgbtq_support_group.md) group meeting."
+        )
+
+    def test_word_boundary_no_substring_match(self):
+        content = "She is a car enthusiast."
+        links = [
+            {
+                "from_uri": "viking://user/Caroline/memories/profile.md",
+                "to_uri": "viking://user/Caroline/memories/entities/vehicles/car.md",
+                "weight": 1.0,
+                "match_text": "car",
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Caroline/memories/profile.md",
+            links,
+        )
+        assert result == "She is a [car](entities/vehicles/car.md) enthusiast."
+
+    def test_word_boundary_no_match_inside_word(self):
+        content = "Caroline went to the store."
+        links = [
+            {
+                "from_uri": "viking://user/Caroline/memories/profile.md",
+                "to_uri": "viking://user/Caroline/memories/entities/vehicles/car.md",
+                "weight": 1.0,
+                "match_text": "car",
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Caroline/memories/profile.md",
+            links,
+        )
+        assert result == "Caroline went to the store."
+
+    def test_ascii_boundary_matches_when_surrounded_by_non_ascii_word_chars(self):
+        content = "(car), car."
+        links = [
+            {
+                "from_uri": "viking://user/Caroline/memories/profile.md",
+                "to_uri": "viking://user/Caroline/memories/entities/vehicles/car.md",
+                "weight": 1.0,
+                "match_text": "car",
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Caroline/memories/profile.md",
+            links,
+        )
+        assert result == "([car](entities/vehicles/car.md)), car."
+
+    def test_ascii_boundary_matches_next_to_cjk_text(self):
+        content = "她喜欢car，也喜欢旅行。"
+        links = [
+            {
+                "from_uri": "viking://user/Caroline/memories/profile.md",
+                "to_uri": "viking://user/Caroline/memories/entities/vehicles/car.md",
+                "weight": 1.0,
+                "match_text": "car",
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Caroline/memories/profile.md",
+            links,
+        )
+        assert result == "她喜欢[car](entities/vehicles/car.md)，也喜欢旅行。"
+
+    def test_no_match_text_skipped(self):
+        content = "Some content here."
+        links = [
+            {
+                "from_uri": "viking://user/Caroline/memories/profile.md",
+                "to_uri": "viking://user/Caroline/memories/entities/foo.md",
+                "weight": 1.0,
+                "match_text": None,
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Caroline/memories/profile.md",
+            links,
+        )
+        assert result == "Some content here."
+
+    def test_self_link_skipped(self):
+        content = "This is my profile."
+        links = [
+            {
+                "from_uri": "viking://user/Caroline/memories/profile.md",
+                "to_uri": "viking://user/Caroline/memories/profile.md",
+                "weight": 1.0,
+                "match_text": "profile",
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Caroline/memories/profile.md",
+            links,
+        )
+        assert result == "This is my profile."
+
+    def test_backlink_not_rendered(self):
+        # Backlinks (where to_uri == source_uri) are not rendered
+        content = "The painting features nice colors."
+        links = [
+            {
+                "from_uri": "viking://user/Melanie/memories/entities/art/lake_sunrise.md",
+                "to_uri": "viking://user/Melanie/memories/preferences/creative.md",
+                "weight": 1.0,
+                "match_text": "painting",
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Melanie/memories/preferences/creative.md",
+            links,
+        )
+        # to_uri == source_uri, so this is a self-link, skipped
+        assert result == "The painting features nice colors."
+
+    def test_cross_scope_fallback_to_full_uri(self):
+        content = "The agent has a useful skill."
+        links = [
+            {
+                "from_uri": "viking://user/Caroline/memories/profile.md",
+                "to_uri": "viking://resources/skills/research.md",
+                "weight": 1.0,
+                "match_text": "skill",
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Caroline/memories/profile.md",
+            links,
+        )
+        assert "viking://resources/skills/research.md" in result
+
+    def test_weight_priority(self):
+        content = "She loves painting and painting is fun."
+        links = [
+            {
+                "from_uri": "viking://user/Melanie/memories/profile.md",
+                "to_uri": "viking://user/Melanie/memories/preferences/art.md",
+                "weight": 0.5,
+                "match_text": "painting",
+            },
+            {
+                "from_uri": "viking://user/Melanie/memories/profile.md",
+                "to_uri": "viking://user/Melanie/memories/entities/art/lake_sunrise.md",
+                "weight": 1.0,
+                "match_text": "painting",
+            },
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Melanie/memories/profile.md",
+            links,
+        )
+        # Higher weight wins, only first occurrence replaced
+        assert result == "She loves [painting](entities/art/lake_sunrise.md) and painting is fun."
+
+    def test_no_links_returns_unchanged(self):
+        content = "Plain text without links."
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Caroline/memories/profile.md",
+            [],
+        )
+        assert result == content
+
+    def test_chinese_match_without_word_boundaries(self):
+        content = "她喜欢角色扮演游戏，也喜欢开放世界游戏。"
+        links = [
+            {
+                "from_uri": "viking://user/Caroline/memories/profile.md",
+                "to_uri": "viking://user/Caroline/memories/entities/games/rpg.md",
+                "weight": 1.0,
+                "match_text": "角色扮演游戏",
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Caroline/memories/profile.md",
+            links,
+        )
+        assert result == "她喜欢[角色扮演游戏](entities/games/rpg.md)，也喜欢开放世界游戏。"
+
+    def test_skip_match_inside_existing_link(self):
+        content = "Worked with [Frank Ocean](../../../../entities/personal/frank.md)."
+        links = [
+            {
+                "from_uri": "viking://user/Calvin/memories/profile.md",
+                "to_uri": "viking://user/Calvin/memories/entities/personal/frank.md",
+                "weight": 1.0,
+                "match_text": "Frank",
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Calvin/memories/profile.md",
+            links,
+        )
+        assert result == content
+
+    def test_skip_match_inside_existing_link_with_space_in_target(self):
+        # Reviewer feedback: existing links with literal spaces in their target
+        # (e.g. `[Frank Ocean](entities/frank ocean.md)`) must still be detected
+        # as an existing link span so the match inside is not double-wrapped.
+        content = "Worked with [Frank Ocean](entities/frank ocean.md)."
+        links = [
+            {
+                "from_uri": "viking://user/Calvin/memories/profile.md",
+                "to_uri": "viking://user/Calvin/memories/entities/personal/frank ocean.md",
+                "weight": 1.0,
+                "match_text": "Frank",
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Calvin/memories/profile.md",
+            links,
+        )
+        assert result == content
+
+    def test_skip_match_inside_existing_link_with_parenthesized_target(self):
+        content = "See [Version](../meta/foo(1).md)."
+        links = [
+            {
+                "from_uri": "viking://resources/wiki/guide/overview.md",
+                "to_uri": "viking://resources/wiki/meta/foo(1).md",
+                "weight": 1.0,
+                "match_text": "Version",
+            }
+        ]
+
+        result = LinkRenderer.render_links(
+            content,
+            "viking://resources/wiki/guide/overview.md",
+            links,
+        )
+
+        assert result == content
+
+    def test_render_link_with_space_in_target_is_percent_encoded(self):
+        # Generated links should escape spaces in their target so the markdown
+        # link is portable across renderers. We always emit `%20`, while still
+        # accepting the literal-space form when matching existing links.
+        content = "Saw Frank Ocean last night."
+        links = [
+            {
+                "from_uri": "viking://user/Calvin/memories/events/2023/08/22/collab.md",
+                "to_uri": "viking://user/Calvin/memories/entities/personal/frank ocean.md",
+                "weight": 1.0,
+                "match_text": "Frank Ocean",
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Calvin/memories/events/2023/08/22/collab.md",
+            links,
+        )
+        assert (
+            result
+            == "Saw [Frank Ocean](../../../../entities/personal/frank%20ocean.md) last night."
+        )
+
+    def test_render_link_with_percent_encoded_target_does_not_double_wrap(self):
+        # An existing link with a `%20`-encoded target is also recognized as an
+        # existing link span (since the regex matches any non-`)` chars).
+        content = "Worked with [Frank Ocean](entities/frank%20ocean.md)."
+        links = [
+            {
+                "from_uri": "viking://user/Calvin/memories/profile.md",
+                "to_uri": "viking://user/Calvin/memories/entities/personal/frank ocean.md",
+                "weight": 1.0,
+                "match_text": "Frank",
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Calvin/memories/profile.md",
+            links,
+        )
+        assert result == content
+
+    def test_use_later_unlinked_match_when_first_match_is_already_linked(self):
+        content = "[Frank Ocean](../../../../entities/personal/frank.md) performed. Frank stayed."
+        links = [
+            {
+                "from_uri": "viking://user/Calvin/memories/profile.md",
+                "to_uri": "viking://user/Calvin/memories/entities/personal/frank.md",
+                "weight": 1.0,
+                "match_text": "Frank",
+            }
+        ]
+        result = LinkRenderer.render_links(
+            content,
+            "viking://user/Calvin/memories/profile.md",
+            links,
+        )
+        assert (
+            result == "[Frank Ocean](../../../../entities/personal/frank.md) performed. "
+            "[Frank](entities/personal/frank.md) stayed."
+        )
+
+
+class TestStripLinks:
+    def test_strip_relative_link(self):
+        content = "See [support](../entities/groups/lgbtq_support_group.md) for details."
+        result = LinkRenderer.strip_links(content)
+        assert result == "See support for details."
+
+    def test_strip_relative_link_with_space_in_target(self):
+        content = "See [Frank Ocean](entities/frank ocean.md) for details."
+        result = LinkRenderer.strip_links(content)
+        assert result == "See Frank Ocean for details."
+
+    def test_strip_relative_link_with_percent_encoded_target(self):
+        content = "See [Frank Ocean](entities/frank%20ocean.md) for details."
+        result = LinkRenderer.strip_links(content)
+        assert result == "See Frank Ocean for details."
+
+    def test_strip_relative_link_with_title(self):
+        content = 'See [Tags](./tags.md "details") for details.'
+        result = LinkRenderer.strip_links(content)
+        assert result == "See Tags for details."
+
+    def test_strip_relative_link_with_parentheses_in_target(self):
+        content = "See [Version](../meta/foo(1).md) for details."
+        result = LinkRenderer.strip_links(content)
+        assert result == "See Version for details."
+
+    def test_keep_angle_bracket_external_link_with_title(self):
+        content = 'Visit [docs](<https://example.com/docs> "Documentation").'
+        result = LinkRenderer.strip_links(content)
+        assert result == content
+
+    def test_keep_absolute_link(self):
+        content = "Visit [docs](https://example.com/docs) for more."
+        result = LinkRenderer.strip_links(content)
+        assert result == content
+
+    def test_keep_viking_uri_link(self):
+        content = "Check [skill](viking://user/Bot/skills/research.md)."
+        result = LinkRenderer.strip_links(content)
+        assert result == content
+
+    def test_keep_viking_uri_link_when_target_uses_supported_scheme(self):
+        content = "Check [skill](viking://user/Bot/skills/research.md)."
+        result = LinkRenderer.strip_links(content)
+        assert result == content
+
+    def test_keep_anchor_link(self):
+        content = "Jump to [section](#intro)."
+        result = LinkRenderer.strip_links(content)
+        assert result == content
+
+    def test_keep_absolute_path_link(self):
+        content = "See [file](/absolute/path.md)."
+        result = LinkRenderer.strip_links(content)
+        assert result == content
+
+    def test_multiple_links(self):
+        content = "[support](../groups/support.md) and [art](../entities/art.md)"
+        result = LinkRenderer.strip_links(content)
+        assert result == "support and art"
+
+    def test_mixed_links(self):
+        content = "[local](../foo.md) and [web](https://example.com)"
+        result = LinkRenderer.strip_links(content)
+        assert result == "local and [web](https://example.com)"
+
+    def test_no_links(self):
+        content = "Just plain text."
+        result = LinkRenderer.strip_links(content)
+        assert result == content
+
+    def test_strip_all_links_removes_viking_uri_targets_for_embedding(self):
+        content = "用户上传了一张[越前龙马](viking://resources/images/yueqian_jpeg)的照片。"
+        result = LinkRenderer.strip_all_links(content)
+        assert result == "用户上传了一张越前龙马的照片。"
+
+
+class TestRoundTrip:
+    def test_render_then_strip(self):
+        original = "Caroline attended a support group meeting."
+        links = [
+            {
+                "from_uri": "viking://user/Caroline/memories/profile.md",
+                "to_uri": "viking://user/Caroline/memories/entities/groups/lgbtq_support_group.md",
+                "weight": 1.0,
+                "match_text": "support",
+            }
+        ]
+        rendered = LinkRenderer.render_links(
+            original,
+            "viking://user/Caroline/memories/profile.md",
+            links,
+        )
+        stripped = LinkRenderer.strip_links(rendered)
+        assert stripped == original
+
+    def test_render_then_strip_multiple(self):
+        original = "She enjoys painting and swimming."
+        links = [
+            {
+                "from_uri": "viking://user/Melanie/memories/profile.md",
+                "to_uri": "viking://user/Melanie/memories/entities/art/lake_sunrise.md",
+                "weight": 1.0,
+                "match_text": "painting",
+            },
+            {
+                "from_uri": "viking://user/Melanie/memories/profile.md",
+                "to_uri": "viking://user/Melanie/memories/events/2023/08/swimming.md",
+                "weight": 0.8,
+                "match_text": "swimming",
+            },
+        ]
+        rendered = LinkRenderer.render_links(
+            original,
+            "viking://user/Melanie/memories/profile.md",
+            links,
+        )
+        stripped = LinkRenderer.strip_links(rendered)
+        assert stripped == original
+
+    def test_render_then_strip_with_space_in_target(self):
+        # End-to-end round-trip: a generated link whose target has spaces
+        # (encoded as `%20`) should still strip back to the original text.
+        original = "Saw Frank Ocean last night."
+        links = [
+            {
+                "from_uri": "viking://user/Calvin/memories/events/2023/08/22/collab.md",
+                "to_uri": "viking://user/Calvin/memories/entities/personal/frank ocean.md",
+                "weight": 1.0,
+                "match_text": "Frank Ocean",
+            }
+        ]
+        rendered = LinkRenderer.render_links(
+            original,
+            "viking://user/Calvin/memories/events/2023/08/22/collab.md",
+            links,
+        )
+        stripped = LinkRenderer.strip_links(rendered)
+        assert stripped == original
+
+    def test_render_twice_with_space_in_target_does_not_nest(self):
+        # Repeated render calls must be idempotent even when an existing link
+        # already uses a literal-space target. Without the regex fix, the
+        # second render would re-wrap the inner match_text.
+        original = "Worked with [Frank Ocean](entities/frank ocean.md)."
+        links = [
+            {
+                "from_uri": "viking://user/Calvin/memories/profile.md",
+                "to_uri": "viking://user/Calvin/memories/entities/personal/frank ocean.md",
+                "weight": 1.0,
+                "match_text": "Frank",
+            }
+        ]
+        first = LinkRenderer.render_links(
+            original,
+            "viking://user/Calvin/memories/profile.md",
+            links,
+        )
+        second = LinkRenderer.render_links(
+            first,
+            "viking://user/Calvin/memories/profile.md",
+            links,
+        )
+        assert first == original
+        assert second == original
+
+    def test_memory_file_plain_content_strips_markdown_links(self):
+        memory_file = MemoryFile(
+            uri="viking://user/Calvin/memories/events/2023/08/22/collab_with_frank_ocean.md",
+            content="Worked with [Frank Ocean](../../../../entities/personal/calvin.md).",
+        )
+
+        assert memory_file.plain_content() == "Worked with Frank Ocean."
+
+    def test_memory_file_utils_write_renders_links_and_preserves_links_metadata(self):
+        memory_file = MemoryFile(
+            uri="viking://user/Caroline/memories/profile.md",
+            content="她喜欢角色扮演游戏，也喜欢开放世界游戏。",
+            links=[
+                {
+                    "from_uri": "viking://user/Caroline/memories/profile.md",
+                    "to_uri": "viking://user/Caroline/memories/entities/games/rpg.md",
+                    "weight": 1.0,
+                    "match_text": "角色扮演游戏",
+                }
+            ],
+            extra_fields={"memory_type": "profile"},
+        )
+
+        written = MemoryFileUtils.write(memory_file)
+
+        assert "她喜欢[角色扮演游戏](entities/games/rpg.md)，也喜欢开放世界游戏。" in written
+        assert '"match_text": "角色扮演游戏"' in written
+
+    def test_repeated_memory_file_utils_write_does_not_nest_links(self):
+        memory_file = MemoryFile(
+            uri="viking://user/Gina/memories/profile.md",
+            content="Gina",
+            links=[
+                {
+                    "from_uri": "viking://user/Gina/memories/profile.md",
+                    "to_uri": "viking://user/Gina/memories/events/2023/02/08/Gina与Jon的日常交流.md",
+                    "weight": 1.0,
+                    "match_text": "Gina",
+                }
+            ],
+            extra_fields={"memory_type": "profile"},
+        )
+
+        first_write = MemoryFileUtils.write(memory_file)
+        reparsed = MemoryFileUtils.read(first_write, uri=memory_file.uri)
+        second_write = MemoryFileUtils.write(reparsed)
+
+        rendered_link = "[Gina](events/2023/02/08/Gina与Jon的日常交流.md)"
+        assert first_write.count(rendered_link) == 1
+        assert second_write.count(rendered_link) == 1
+        assert '"memory_type": "profile"' in second_write

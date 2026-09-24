@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "crates/ov_cli",
+    "crates/ragfs",
+    "crates/ragfs-python",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+
+[profile.release.package.ragfs]
+codegen-units = 1

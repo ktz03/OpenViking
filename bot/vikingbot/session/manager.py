@@ -1,0 +1,448 @@
+"""Session management for conversation history."""
+
+import asyncio
+import json
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, TypeVar
+
+from loguru import logger
+
+from vikingbot.config.schema import SessionKey
+from vikingbot.providers.registry import find_by_name
+from vikingbot.sandbox.manager import SandboxManager
+from vikingbot.utils.helpers import ensure_dir, ensure_non_empty_assistant_content
+from vikingbot.utils.session_paths import (
+    find_exact_child,
+    portable_session_name,
+)
+
+T = TypeVar("T")
+
+
+_SESSION_LOCKS: dict[Path, asyncio.Lock] = {}
+
+
+@dataclass
+class Session:
+    """
+    A conversation session.
+
+    Stores messages in JSONL format for easy reading and persistence.
+    """
+
+    key: SessionKey  # channel:chat_id
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def add_message(
+        self,
+        role: str,
+        content: str,
+        sender_id: str | None = None,
+        token_usage: dict[str, Any] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Add a message to the session."""
+        msg = {"role": role, "content": content, "timestamp": datetime.now().isoformat(), **kwargs}
+        if sender_id is not None:
+            msg["sender_id"] = sender_id
+        if token_usage is not None:
+            msg["token_usage"] = token_usage
+        self.messages.append(msg)
+        self.updated_at = datetime.now()
+
+    def get_history(
+        self, max_messages: int = 50, provider_name: str | None = None
+    ) -> list[dict[str, Any]]:
+        """
+        Get message history for LLM context.
+
+        Args:
+            max_messages: Maximum messages to return.
+            provider_name: Optional provider name for provider-specific history fields.
+
+        Returns:
+            List of messages in LLM format.
+        """
+        # Get recent messages
+        recent = (
+            self.messages[-max_messages:] if len(self.messages) > max_messages else self.messages
+        )
+
+        provider_spec = find_by_name(provider_name) if provider_name else None
+        include_reasoning_content = bool(provider_spec and provider_spec.name == "deepseek")
+
+        out: list[dict[str, Any]] = []
+        for m in recent:
+            role = m["role"]
+            content: Any = m.get("content", "")
+            if role == "assistant" and isinstance(content, str):
+                content = ensure_non_empty_assistant_content(content)
+
+            msg = {"role": role, "content": content}
+
+            if role == "assistant" and include_reasoning_content and m.get("reasoning_content"):
+                msg["reasoning_content"] = m["reasoning_content"]
+
+            out.append(msg)
+        return out
+
+    def clear(self) -> None:
+        """Clear all messages in the session."""
+        self.messages = []
+        self.updated_at = datetime.now()
+
+    def clone(self) -> "Session":
+        """Create a deep copy of this session."""
+        import copy
+
+        return Session(
+            key=self.key,
+            messages=copy.deepcopy(self.messages),
+            created_at=self.created_at,
+            updated_at=self.updated_at,
+            metadata=copy.deepcopy(self.metadata),
+        )
+
+
+class SessionManager:
+    """
+    Manages conversation sessions with persistence and caching.
+
+    SessionManager handles the lifecycle of conversation sessions, including
+    creation, retrieval, caching, and persistent storage. Sessions are stored
+    as JSONL files in a designated directory for durability.
+
+    The manager maintains an in-memory cache of active sessions to improve
+    performance and reduce disk I/O. Sessions are automatically persisted when
+    modified.
+
+    Attributes:
+        bot_data_path: Path to the bot's data directory.
+        workspace: Path to the workspace directory within bot_data.
+        sessions_dir: Path where session JSONL files are stored.
+        _cache: In-memory cache mapping SessionKey to Session objects.
+        sandbox_manager: Optional sandbox manager for isolated operations.
+
+    Example:
+        >>> manager = SessionManager(Path("/path/to/bot/data"))
+        >>> session_key = SessionKey(channel="telegram", chat_id="12345")
+        >>> session = manager.get_or_create(session_key)
+        >>> session.add_message("user", "Hello!")
+        >>> await manager.save(session)
+    """
+
+    def __init__(
+        self,
+        bot_data_path: Path,
+        sandbox_manager: "SandboxManager | None" = None,
+    ):
+        self.bot_data_path = bot_data_path
+        self.workspace = bot_data_path / "workspace"
+        self.sessions_dir = ensure_dir(bot_data_path / "sessions")
+        self._cache: dict[SessionKey, Session] = {}
+        self.sandbox_manager = sandbox_manager
+
+    def _get_lock(self, session_key: SessionKey) -> asyncio.Lock:
+        path = self._get_session_path(session_key)
+        lock = _SESSION_LOCKS.get(path)
+        if lock is None:
+            lock = asyncio.Lock()
+            _SESSION_LOCKS[path] = lock
+        return lock
+
+    def _get_session_path(self, session_key: SessionKey) -> Path:
+        return self.sessions_dir / f"{portable_session_name(session_key)}.jsonl"
+
+    def _get_legacy_session_path(self, session_key: SessionKey) -> Path | None:
+        """Return the pre-portability path when it is a local path component."""
+        filename = f"{session_key.safe_name()}.jsonl"
+        path = self.sessions_dir / filename
+        if path.parent != self.sessions_dir:
+            return None
+        return path
+
+    def _find_legacy_session_path(self, session_key: SessionKey) -> Path | None:
+        """Find a legacy file without accepting another folded SessionKey."""
+        candidate = self._get_legacy_session_path(session_key)
+        if candidate is None:
+            return None
+
+        exact = find_exact_child(self.sessions_dir, candidate.name)
+        if exact is not None:
+            return exact
+        if not candidate.exists():
+            return None
+
+        # A normalizing filesystem may expose the same logical filename with a
+        # different spelling. Accept it only when its persisted identity agrees.
+        try:
+            with open(candidate, encoding="utf-8") as stream:
+                data = json.loads(stream.readline())
+            raw_session_key = data.get("session_key_fields")
+            persisted_key = (
+                SessionKey.model_validate(raw_session_key)
+                if isinstance(raw_session_key, dict)
+                else SessionKey.from_safe_name(data.get("session_key"))
+            )
+        except Exception:
+            return None
+        return candidate if persisted_key == session_key else None
+
+    def _find_session_path(self, session_key: SessionKey) -> Path | None:
+        """Prefer the portable path while accepting existing legacy files."""
+        path = self._get_session_path(session_key)
+        if path.exists():
+            return path
+        legacy_path = self._get_legacy_session_path(session_key)
+        if legacy_path is not None and legacy_path != path:
+            return self._find_legacy_session_path(session_key)
+        return None
+
+    def has_persisted(self, session_key: SessionKey) -> bool:
+        return self._find_session_path(session_key) is not None
+
+    def get_or_create(self, key: SessionKey, skip_heartbeat: bool = False) -> Session:
+        """
+        Get an existing session or create a new one.
+
+        Args:
+            key: Session key (usually channel:chat_id).
+            skip_heartbeat: Whether to skip heartbeat for this session.
+
+        Returns:
+            The session.
+        """
+        # Check cache
+        if key in self._cache:
+            return self._cache[key]
+
+        # Try to load from disk
+        session = self._load(key)
+        if session is None:
+            session = Session(key=key)
+            if skip_heartbeat:
+                session.metadata["skip_heartbeat"] = True
+
+        self._cache[key] = session
+
+        if self.sandbox_manager:
+            from vikingbot.utils.helpers import ensure_session_workspace
+
+            workspace_path = self.sandbox_manager.get_workspace_path(key)
+            ensure_session_workspace(workspace_path)
+
+        # Initialize sandbox
+        if self.sandbox_manager:
+            asyncio.create_task(self._init_sandbox(key))
+
+        return session
+
+    async def _init_sandbox(self, key: SessionKey) -> None:
+        """Initialize sandbox for a session."""
+        if self.sandbox_manager is None:
+            return
+        try:
+            await self.sandbox_manager.get_sandbox(key)
+        except Exception as e:
+            logger.warning(f"Failed to initialize sandbox for {key}: {e}")
+
+    def _load(self, session_key: SessionKey) -> Session | None:
+        """Load a session from disk."""
+        path = self._find_session_path(session_key)
+        if path is None:
+            return None
+
+        try:
+            messages = []
+            metadata = {}
+            created_at = None
+            session_key_from_metadata = None
+
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    data = json.loads(line)
+
+                    if data.get("_type") == "metadata":
+                        metadata = data.get("metadata", {})
+                        created_at = (
+                            datetime.fromisoformat(data["created_at"])
+                            if data.get("created_at")
+                            else None
+                        )
+                        raw_session_key = data.get("session_key_fields")
+                        session_key_from_metadata = (
+                            SessionKey.model_validate(raw_session_key)
+                            if isinstance(raw_session_key, dict)
+                            else SessionKey.from_safe_name(data.get("session_key"))
+                        )
+                    else:
+                        messages.append(data)
+
+            effective_key = session_key_from_metadata if session_key_from_metadata else session_key
+
+            return Session(
+                key=effective_key,
+                messages=messages,
+                created_at=created_at or datetime.now(),
+                metadata=metadata,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to load session from {path}: {e}") from e
+
+    async def save(self, session: Session) -> None:
+        """Save a session to disk."""
+        async with self._get_lock(session.key):
+            latest = self._load(session.key)
+            if latest is not None:
+                session.created_at = latest.created_at
+                session.metadata = self._merge_metadata(latest.metadata, session.metadata)
+            self._save_unlocked(session)
+
+    def _save_unlocked(self, session: Session) -> None:
+        """Persist a session while holding the per-session lock."""
+        path = self._get_session_path(session.key)
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with open(temporary, "w", encoding="utf-8") as f:
+                # Write metadata first. Keep the logical SessionKey unchanged.
+                metadata_line = {
+                    "_type": "metadata",
+                    "session_key": session.key.safe_name(),
+                    "session_key_fields": session.key.model_dump(mode="json"),
+                    "created_at": session.created_at.isoformat(),
+                    "updated_at": session.updated_at.isoformat(),
+                    "metadata": session.metadata,
+                }
+                f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
+
+                for msg in session.messages:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+        # A successful canonical write completes the lazy legacy migration.
+        legacy_path = self._find_legacy_session_path(session.key)
+        if legacy_path == path:
+            legacy_path = None
+        if legacy_path is not None:
+            legacy_path.unlink(missing_ok=True)
+
+        self._cache[session.key] = session
+
+    async def update_session(
+        self,
+        session_key: SessionKey,
+        updater: Callable[[Session], T],
+        *,
+        skip_heartbeat: bool = False,
+    ) -> tuple[Session, T]:
+        """Reload, mutate, and persist a session under a shared lock."""
+        async with self._get_lock(session_key):
+            self._cache.pop(session_key, None)
+            session = self.get_or_create(session_key, skip_heartbeat=skip_heartbeat)
+            result = updater(session)
+            self._save_unlocked(session)
+            return session, result
+
+    @classmethod
+    def _merge_metadata(cls, base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+        """Merge nested metadata dictionaries without dropping persisted keys."""
+        merged = dict(base)
+        for key, value in override.items():
+            if key not in merged:
+                merged[key] = value
+                continue
+
+            current = merged[key]
+            if key == "openviking":
+                merged[key] = value
+            elif isinstance(current, dict) and isinstance(value, dict):
+                merged[key] = cls._merge_metadata(current, value)
+            elif isinstance(current, list) and isinstance(value, list):
+                merged[key] = current + [item for item in value if item not in current]
+            else:
+                merged[key] = value
+        return merged
+
+    def delete(self, key: SessionKey) -> bool:
+        """
+        Delete a session.
+
+        Args:
+            key: Session key.
+
+        Returns:
+            True if deleted, False if not found.
+        """
+        # Clean up sandbox if enabled
+        if self.sandbox_manager is not None:
+            asyncio.create_task(self.sandbox_manager.cleanup_session(key))
+
+        # Remove from cache
+        self._cache.pop(key, None)
+
+        # Remove both representations in case migration was interrupted.
+        deleted = False
+        legacy_path = self._find_legacy_session_path(key)
+        paths = {self._get_session_path(key), legacy_path}
+        for path in paths:
+            if path is not None and path.exists():
+                path.unlink()
+                deleted = True
+        return deleted
+
+    def list_sessions(self) -> list[dict[str, Any]]:
+        """
+        List all sessions.
+
+        Returns:
+            List of session info dicts.
+        """
+        sessions_by_key: dict[SessionKey, dict[str, Any]] = {}
+
+        for path in self.sessions_dir.glob("*.jsonl"):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    first_line = f.readline().strip()
+                    if first_line:
+                        data = json.loads(first_line)
+                        if data.get("_type") == "metadata":
+                            raw_session_key = data.get("session_key_fields")
+                            session_key = (
+                                SessionKey.model_validate(raw_session_key)
+                                if isinstance(raw_session_key, dict)
+                                else SessionKey.from_safe_name(data.get("session_key"))
+                            )
+                            metadata = data.get("metadata", {})
+                            session_info = {
+                                "key": session_key,
+                                "created_at": data.get("created_at"),
+                                "updated_at": data.get("updated_at"),
+                                "metadata": metadata,
+                                "path": str(path),
+                            }
+                            existing = sessions_by_key.get(session_key)
+                            canonical_path = self._get_session_path(session_key)
+                            if existing is None or (
+                                path == canonical_path and Path(existing["path"]) != canonical_path
+                            ):
+                                sessions_by_key[session_key] = session_info
+            except Exception:
+                continue
+
+        return sorted(
+            sessions_by_key.values(),
+            key=lambda x: x.get("updated_at") or "",
+            reverse=True,
+        )

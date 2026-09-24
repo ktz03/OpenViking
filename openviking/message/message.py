@@ -1,0 +1,205 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""Message class definition - based on opencode Message design.
+
+Message = role + parts, supports serialization to JSONL.
+"""
+
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import List, Literal, Optional
+
+from openviking.core.peer_id import normalize_peer_id
+from openviking.message.part import ContextPart, ImagePart, Part, TextPart, ToolPart, part_from_dict
+from openviking.utils.token_estimation import estimate_text_tokens
+
+
+@dataclass
+class Message:
+    """Message = role + parts."""
+
+    id: str
+    role: Literal["user", "assistant"]
+    parts: List[Part]
+    peer_id: Optional[str] = None
+    created_at: str = None
+    turn_id: Optional[str] = None
+    message_kind: Optional[
+        Literal["user_query", "assistant_step", "tool_transport", "checkpoint"]
+    ] = None
+    source_message_ids: Optional[List[str]] = None
+
+    @property
+    def content(self) -> str:
+        """Quick access to first TextPart content."""
+        for p in self.parts:
+            if isinstance(p, TextPart):
+                return p.text
+        return ""
+
+    @property
+    def estimated_tokens(self) -> int:
+        """Estimate token count from all parts using a CJK-aware fallback.
+
+        Counts fields that actually appear in the assembled prompt:
+        - TextPart.text: always emitted
+        - ContextPart.abstract: injected as text (uri is not sent to the model)
+        - ImagePart: not counted here; image captioning/model usage is tracked
+          by the VLM call that converts images into text for extraction
+        - ToolPart: tool_id (appears in toolUse.id / toolResult.toolCallId),
+          tool_name, tool_input (JSON), tool_output
+
+        Known limitation: ToolPart estimation undercounts by ~10-20 tokens per
+        tool call because tool_id/toolName appear twice in the assembled transcript
+        (toolUse + toolResult), and small literals like "(no output)" / "{}" are
+        not counted. Under 128k budgets this is negligible; for smaller budgets
+        (8k/16k) or tool-dense sessions, consider adding a conservative per-tool
+        buffer instead of mirroring the full convertToAgentMessages logic.
+        """
+        token_text = []
+        for p in self.parts:
+            if isinstance(p, TextPart):
+                token_text.append(p.text)
+            elif isinstance(p, ContextPart):
+                token_text.append(p.abstract)
+            elif isinstance(p, ToolPart):
+                token_text.extend([p.tool_id, p.tool_name])
+                if p.tool_input:
+                    token_text.append(json.dumps(p.tool_input, ensure_ascii=False))
+                if p.tool_output:
+                    token_text.append(p.tool_output)
+        return estimate_text_tokens("".join(token_text))
+
+    def to_dict(self) -> dict:
+        """Serialize to JSONL."""
+        created_at_val = self.created_at or datetime.now(timezone.utc).isoformat()
+        if isinstance(created_at_val, datetime):
+            created_at_val = (
+                created_at_val.astimezone(timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z")
+            )
+        data = {
+            "id": self.id,
+            "role": self.role,
+            "parts": [self._part_to_dict(p) for p in self.parts],
+            "created_at": created_at_val,
+        }
+        if self.peer_id is not None:
+            data["peer_id"] = self.peer_id
+        if self.turn_id is not None:
+            data["turn_id"] = self.turn_id
+        if self.message_kind is not None:
+            data["message_kind"] = self.message_kind
+        if self.source_message_ids is not None:
+            data["source_message_ids"] = list(self.source_message_ids)
+        return data
+
+    def _part_to_dict(self, part: Part) -> dict:
+        if isinstance(part, TextPart):
+            return {"type": part.type, "text": part.text}
+        elif isinstance(part, ContextPart):
+            return {
+                "type": part.type,
+                "uri": part.uri,
+                "context_type": part.context_type,
+                "abstract": part.abstract,
+            }
+        elif isinstance(part, ImagePart):
+            image_url = {"url": part.url}
+            if part.detail is not None:
+                image_url["detail"] = part.detail
+            return {
+                "type": part.type,
+                "image_url": image_url,
+            }
+        elif isinstance(part, ToolPart):
+            d = {
+                "type": part.type,
+                "tool_id": part.tool_id,
+                "tool_name": part.tool_name,
+                "tool_uri": part.tool_uri,
+                "skill_uri": part.skill_uri,
+                "tool_status": part.tool_status,
+            }
+            if part.tool_input:
+                d["tool_input"] = part.tool_input
+            if part.tool_output:
+                d["tool_output"] = part.tool_output
+            if part.duration_ms is not None:
+                d["duration_ms"] = part.duration_ms
+            if part.prompt_tokens is not None:
+                d["prompt_tokens"] = part.prompt_tokens
+            if part.completion_tokens is not None:
+                d["completion_tokens"] = part.completion_tokens
+            if part.tool_output_ref:
+                d["tool_output_ref"] = part.tool_output_ref
+            if part.tool_output_truncated:
+                d["tool_output_truncated"] = part.tool_output_truncated
+            if part.tool_output_original_chars is not None:
+                d["tool_output_original_chars"] = part.tool_output_original_chars
+            if part.tool_output_preview_chars is not None:
+                d["tool_output_preview_chars"] = part.tool_output_preview_chars
+            if part.tool_output_sha256:
+                d["tool_output_sha256"] = part.tool_output_sha256
+            if part.tool_output_storage_uri:
+                d["tool_output_storage_uri"] = part.tool_output_storage_uri
+            if part.tool_output_mime_type and part.tool_output_mime_type != "text/plain":
+                d["tool_output_mime_type"] = part.tool_output_mime_type
+            if part.tool_output_source_ref:
+                d["tool_output_source_ref"] = part.tool_output_source_ref
+            if part.tool_output_source_offset is not None:
+                d["tool_output_source_offset"] = part.tool_output_source_offset
+            if part.tool_output_source_limit is not None:
+                d["tool_output_source_limit"] = part.tool_output_source_limit
+            if part.tool_output_externalization_error:
+                d["tool_output_externalization_error"] = part.tool_output_externalization_error
+            if part.tool_output_group_id:
+                d["tool_output_group_id"] = part.tool_output_group_id
+            if part.tool_output_externalized_reason:
+                d["tool_output_externalized_reason"] = part.tool_output_externalized_reason
+            if part.tool_output_group_original_chars is not None:
+                d["tool_output_group_original_chars"] = part.tool_output_group_original_chars
+            if part.tool_output_group_budget_chars is not None:
+                d["tool_output_group_budget_chars"] = part.tool_output_group_budget_chars
+            return d
+        return {}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Message":
+        """Deserialize from JSONL."""
+        parts = []
+        raw_parts = data.get("parts")
+        if raw_parts is None:
+            legacy_content = data.get("content")
+            if legacy_content is not None:
+                raw_parts = [{"type": "text", "text": legacy_content}]
+            else:
+                raw_parts = []
+
+        for p in raw_parts:
+            parts.append(part_from_dict(p))
+        try:
+            peer_id = normalize_peer_id(data.get("peer_id"))
+        except ValueError:
+            peer_id = data.get("peer_id")
+
+        return cls(
+            id=data["id"],
+            role=data["role"],
+            parts=parts,
+            peer_id=peer_id,
+            created_at=data.get("created_at"),
+            turn_id=data.get("turn_id"),
+            message_kind=data.get("message_kind"),
+            source_message_ids=(
+                list(data.get("source_message_ids"))
+                if isinstance(data.get("source_message_ids"), list)
+                else None
+            ),
+        )
+
+    def to_jsonl(self) -> str:
+        """Serialize to JSONL string."""
+        return json.dumps(self.to_dict(), ensure_ascii=False)

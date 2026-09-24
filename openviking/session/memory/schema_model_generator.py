@@ -1,0 +1,462 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""
+Dynamic Pydantic model generator based on YAML schemas.
+
+Generates type-safe Pydantic models at runtime from MemoryTypeSchema
+definitions, with discriminator support for polymorphic fields.
+"""
+
+import re
+from typing import Annotated, Any, Dict, List, Optional, Tuple, Type, Union
+
+from pydantic import BaseModel, Field, WithJsonSchema, create_model
+from pydantic.config import ConfigDict
+
+from openviking.session.memory.dataclass import (
+    DeleteId,
+    FaultTolerantBaseModel,
+    MemoryTypeSchema,
+    WikiLink,
+)
+from openviking.session.memory.memory_isolation_handler import RoleScope
+from openviking.session.memory.merge_op import MergeOp, MergeOpFactory
+from openviking.session.memory.merge_op.base import FieldType, get_python_type_for_field
+from openviking.session.memory.utils.description_template import render_description_template
+from openviking_cli.utils import get_logger
+
+logger = get_logger(__name__)
+
+
+def to_pascal_case(s: str) -> str:
+    """Convert snake_case or kebab-case to PascalCase."""
+    # Replace non-alphanumeric with spaces
+    s = re.sub(r"[^a-zA-Z0-9]+", " ", s)
+    # Split and capitalize
+    words = s.strip().split()
+    return "".join(word.title() for word in words)
+
+
+# from typing import Literal
+#
+# class PageDecision(BaseModel):
+#     """Temporary page-level reasoning for memory bad-case analysis."""
+#
+#     page_id: int = Field(..., description="The related page_id from read results.")
+#     remove: List[str] = Field(
+#         ...,
+#         description=(
+#             "For UPDATE, list exact affected `- ...` bullets or standalone summary sentences. "
+#             "Use [] for KEEP or DELETE."
+#         ),
+#     )
+#     has_unaffected_facts: bool = Field(
+#         ...,
+#         description="Whether the page contains any fact outside remove that must be preserved.",
+#     )
+#     action: Literal["KEEP", "UPDATE", "DELETE"] = Field(
+#         ...,
+#         description=(
+#             "KEEP when no fact is affected; UPDATE when remove is non-empty and "
+#             "has_unaffected_facts is true; DELETE when the whole page is affected and "
+#             "has_unaffected_facts is false. For DELETE, leave remove empty."
+#         ),
+#     )
+
+
+class SchemaModelGenerator:
+    """
+    Dynamic Pydantic model generator from memory type schemas.
+
+    Creates type-safe models at runtime with discriminator support
+    for polymorphic memory data.
+    """
+
+    def __init__(
+        self,
+        schemas: List[MemoryTypeSchema],
+        template_context: Optional[Dict[str, Any]] = None,
+        # include_decision_reasoning: bool = True,
+    ):
+        if hasattr(schemas, "list_all"):
+            self._all_schemas = schemas.list_all(include_disabled=True)
+            schemas = schemas.list_all(include_disabled=False)
+        else:
+            self._all_schemas = list(schemas)
+        self.schemas = list(schemas)
+        self._template_context = dict(template_context or {})
+        # self._include_decision_reasoning = include_decision_reasoning
+        self._model_cache: Dict[str, Type[BaseModel]] = {}
+        self._flat_data_models: Dict[str, Type[BaseModel]] = {}
+        self._operations_model: Optional[Type[BaseModel]] = None
+
+    def _render_description(self, description: str) -> str:
+        return render_description_template(description, self._template_context, strip=False)
+
+    def _map_field_type(self, field_type: FieldType) -> Type[Any]:
+        """Map YAML field type to Python type."""
+        return get_python_type_for_field(field_type)
+
+    def create_flat_data_model(
+        self, memory_type: MemoryTypeSchema, role_scope: Optional[RoleScope] = None
+    ) -> Type[BaseModel]:
+        """
+        Create a fully flat Pydantic model for a specific memory type.
+
+        Note: memory_type field is NOT included since each type has its own
+        output field in the structured operations model.
+
+        Args:
+            memory_type: The memory type schema
+            role_scope: Role scope to determine if peer_id fields are needed
+
+        Returns:
+            Dynamically created flat Pydantic model class
+        """
+        # Determine cache key based on role_scope
+        has_peer_scope = bool(role_scope and role_scope.peer_ids)
+        cache_key = memory_type.memory_type
+        model_name = f"{to_pascal_case(memory_type.memory_type)}Data"
+        if has_peer_scope:
+            cache_key = f"{cache_key}_peer"
+            model_name = f"{model_name}Peer"
+
+        # Check cache for both single and multi-user cases
+        if cache_key in self._flat_data_models:
+            return self._flat_data_models[cache_key]
+
+        # Build field definitions - no memory_type field needed
+        field_definitions: Dict[str, Tuple[Type[Any], Any]] = {}
+
+        # Skip if schema has "ranges" field (like events) - these are message-based and
+        # their self/peer targets are derived from message ranges instead of explicit routing fields.
+        has_ranges = any(field.name == "ranges" for field in memory_type.fields)
+        if has_peer_scope and memory_type.peer_enabled and not has_ranges:
+            peer_values = ", ".join(role_scope.peer_ids)
+            field_definitions["peer_id"] = (
+                Optional[str],
+                Field(
+                    None,
+                    description=(
+                        "Stable peer identity to write peer memory for. "
+                        "Use only when the memory describes a peer instead of the current user. "
+                        f"Available peer_id values in this session: {peer_values}"
+                    ),
+                ),
+            )
+
+        page_id_json_schema = {"type": "integer"}
+        page_id_description = "Temporary page_id for identifying the target memory item."
+        if memory_type.memory_type == "events" and memory_type.operation_mode == "add_only":
+            page_id_json_schema["minimum"] = 100
+            page_id_description = "Unique page_id for this new event; it MUST be at least 100."
+
+        field_definitions["page_id"] = (
+            Annotated[int, WithJsonSchema(page_id_json_schema)],
+            Field(
+                ...,
+                description=page_id_description,
+            ),
+        )
+
+        immutable_field_names = []
+
+        # Add business fields from schema
+        for field in memory_type.fields:
+            base_type = self._map_field_type(field.field_type)
+            if field.merge_op == MergeOp.IMMUTABLE:
+                # Immutable fields: only base type, required
+                immutable_field_names.append(field.name)
+                field_definitions[field.name] = (
+                    base_type,
+                    Field(..., description=self._render_description(field.description)),
+                )
+            else:
+                # Mutable fields: Union[base_type, patch_type], optional
+                merge_op = MergeOpFactory.from_field(field)
+                patch_type = merge_op.get_output_schema_type(field.field_type)
+                union_type = Union[base_type, patch_type]
+                desc = merge_op.get_output_schema_description(
+                    self._render_description(field.description)
+                )
+                field_definitions[field.name] = (
+                    Optional[union_type],
+                    Field(None, description=desc),
+                )
+        # Create the model
+        model = create_model(
+            model_name,
+            __config__=ConfigDict(extra="ignore"),
+            **field_definitions,
+        )
+
+        # Store in cache with appropriate key
+        self._flat_data_models[cache_key] = model
+        return model
+
+    def generate_all_models(self, include_disabled: bool = True) -> Dict[str, Type[BaseModel]]:
+        """
+        Generate flat data models for all registered memory types.
+
+        Args:
+            include_disabled: If True, include disabled memory types
+
+        Returns:
+            Dictionary mapping memory_type to generated model class
+        """
+        models: Dict[str, Type[BaseModel]] = {}
+        schemas = self._all_schemas if include_disabled else self.schemas
+        for memory_type in schemas:
+            models[memory_type.memory_type] = self.create_flat_data_model(memory_type)
+        return models
+
+    def create_structured_operations_model(self, role_scope: Optional[RoleScope] = None) -> Type[BaseModel]:
+        """
+        Create a structured MemoryOperations model with type-safe write operations.
+
+        Each memory_type gets its own field (mixed add + edit), with:
+        - Single value if filename_template has no variable (e.g., profile)
+        - List if filename_template has variable (e.g., {skill_name})
+
+        Returns:
+            Pydantic model for structured operations
+        """
+        if self._operations_model is not None:
+            return self._operations_model
+
+        # Generate all flat data models
+        self.generate_all_models(include_disabled=True)
+
+        # Get enabled memory types
+        enabled_memory_types = self.schemas
+        memory_type_fields = [mt.memory_type for mt in enabled_memory_types]
+
+        # Build field definitions for each memory_type
+        field_definitions: Dict[str, Tuple[Type[Any], Any]] = {}
+
+        # if self._include_decision_reasoning:
+        #     field_definitions["decision_reasoning"] = (
+        #         List[PageDecision],
+        #         Field(
+        #             default_factory=list,
+        #             description=(
+        #                 "Before choosing operations, return one decision for every related "
+        #                 "read page."
+        #             ),
+        #         ),
+        #     )
+
+        for mt in enabled_memory_types:
+            flat_model = self.create_flat_data_model(mt, role_scope)
+            # Always use List to support multiple users' memories.
+            field_definitions[mt.memory_type] = (
+                List[flat_model],  # type: ignore
+                Field(
+                    default_factory=list,
+                    description=(
+                        f"{mt.memory_type} memories: {self._render_description(mt.description)} "
+                        "(top-level field, do not nest inside other arrays)"
+                    ),
+                ),
+            )
+
+        # Only expose delete_ids when at least one schema supports deletion.
+        # add_only schemas (e.g. trajectories) never delete existing records,
+        # so excluding this field prevents the LLM from hallucinating fake deletes.
+        has_deletable_schema = any(mt.operation_mode != "add_only" for mt in enabled_memory_types)
+        if has_deletable_schema:
+            field_definitions["delete_ids"] = (
+                List[DeleteId],
+                Field(
+                    default_factory=list,
+                    description=(
+                        "Delete operations by page_id. Each item has delete_page_id and "
+                        "replacement_page_id; set replacement_page_id to null for a pure delete, "
+                        "or to the canonical replacement page_id so existing links/backlinks are inherited."
+                    ),
+                ),
+            )
+
+        # Add links field for link extraction (only when enabled globally)
+        from openviking_cli.utils.config import get_openviking_config
+
+        config = get_openviking_config()
+        link_enabled = config.memory.link_enabled if config.memory else False
+        if link_enabled:
+            field_definitions["links"] = (
+                List[WikiLink],
+                Field(
+                    default_factory=list,
+                    description=(
+                        "Links between memory pages. Follow the link rules above. "
+                        "Use page_ids for `f` and `t`. Use `weight` from 0 to 1 to rank competing links."
+                    ),
+                ),
+            )
+
+        # Create model using create_model
+        StructuredMemoryOperations = create_model(
+            "StructuredMemoryOperations",
+            __config__=ConfigDict(extra="ignore"),
+            __base__=FaultTolerantBaseModel,
+            **field_definitions,
+        )
+
+        # Add custom methods
+        def is_empty(self) -> bool:
+            """Check if there are any operations."""
+            for mt_name in memory_type_fields:
+                value = getattr(self, mt_name, None)
+                if value is not None:
+                    if isinstance(value, list):
+                        if len(value) > 0:
+                            return False
+                    else:
+                        # Single value (not None)
+                        return False
+            return len(getattr(self, "delete_ids", [])) == 0
+
+        def to_legacy_operations(self) -> Dict[str, Any]:
+            """Convert new per-type structure to legacy write_uris/edit_uris format."""
+            write_uris = []
+            edit_uris = []
+
+            for mt_name in memory_type_fields:
+                value = getattr(self, mt_name, None)
+                if value is None:
+                    continue
+                if isinstance(value, list):
+                    for item in value:
+                        if hasattr(item, "uri") and item.uri:
+                            edit_uris.append(item)
+                        else:
+                            write_uris.append(item)
+                else:
+                    if hasattr(value, "uri") and value.uri:
+                        edit_uris.append(value)
+                    else:
+                        write_uris.append(value)
+
+            return {
+                "write_uris": write_uris,
+                "edit_uris": edit_uris,
+                "delete_ids": self.delete_ids,
+            }
+
+        # Attach methods
+        StructuredMemoryOperations.is_empty = is_empty
+        StructuredMemoryOperations.to_legacy_operations = to_legacy_operations
+        StructuredMemoryOperations._memory_type_fields = memory_type_fields  # type: ignore
+        # Every top-level field defaults to a list, so [] is a valid no-operations result.
+        StructuredMemoryOperations._allow_empty_list_response = True  # type: ignore
+
+        self._operations_model = StructuredMemoryOperations
+        return self._operations_model
+
+class SchemaPromptGenerator:
+    """
+    Prompt generator that incorporates schema information into LLM prompts.
+
+    Generates descriptive text about memory types and their fields
+    based on the YAML schema definitions.
+    """
+
+    def __init__(
+        self,
+        schemas: List[MemoryTypeSchema],
+        template_context: Optional[Dict[str, Any]] = None,
+    ):
+        if hasattr(schemas, "list_all"):
+            schemas = schemas.list_all()
+        self.schemas = schemas
+        self._template_context = dict(template_context or {})
+
+    def _render_description(self, description: str) -> str:
+        return render_description_template(description, self._template_context)
+
+    def generate_type_descriptions(self) -> str:
+        """
+        Generate descriptions of all memory types.
+
+        Returns:
+            Formatted string with all memory type descriptions
+        """
+        lines = ["## Available Memory Types"]
+
+        for mt in self.schemas:
+            lines.append(f"\n### {mt.memory_type}")
+            lines.append(self._render_description(mt.description))
+
+            # Add URI format information
+            if mt.directory or mt.filename_template:
+                lines.append("\n**URI Format:**")
+                if mt.directory and mt.filename_template:
+                    lines.append(f"- URI: `{mt.directory}/{mt.filename_template}`")
+                elif mt.directory:
+                    lines.append(f"- Directory: `{mt.directory}`")
+                elif mt.filename_template:
+                    lines.append(f"- Filename: `{mt.filename_template}`")
+
+                # Add variable substitution info
+                lines.append("\n**Variable Substitution:**")
+                lines.append("- `{{ user_space }}` → 'default'")
+                if mt.fields:
+                    for field in mt.fields:
+                        lines.append(f"- `{{ {field.name} }}` → use value from fields")
+
+            if mt.fields:
+                lines.append("\n**Fields:**")
+                for field in mt.fields:
+                    lines.append(
+                        f"- `{field.name}` ({field.field_type.value}): "
+                        f"{self._render_description(field.description)}"
+                    )
+
+        return "\n".join(lines)
+
+    def generate_field_descriptions(self, memory_type: str) -> Optional[str]:
+        """
+        Generate descriptions for a specific memory type's fields.
+
+        Args:
+            memory_type: The memory type to describe
+
+        Returns:
+            Formatted string with field descriptions, or None if not found
+        """
+        mt = next((s for s in self.schemas if s.memory_type == memory_type), None)
+        if not mt:
+            return None
+
+        lines = [f"### {mt.memory_type} Fields"]
+        for field in mt.fields:
+            lines.append(f"- `{field.name}`: {self._render_description(field.description)}")
+
+        return "\n".join(lines)
+
+    def get_full_prompt_context(self) -> Dict[str, Any]:
+        """
+        Get the full prompt context including all schema information.
+
+        Returns:
+            Dictionary with all prompt context components
+        """
+        return {
+            "type_descriptions": self.generate_type_descriptions(),
+            "memory_types": [
+                {
+                    "memory_type": mt.memory_type,
+                    "description": mt.description,
+                    "fields": [
+                        {
+                            "name": f.name,
+                            "type": f.field_type.value,
+                            "description": f.description,
+                            "merge_op": f.merge_op.value,
+                        }
+                        for f in mt.fields
+                    ],
+                }
+                for mt in self.schemas
+            ],
+        }

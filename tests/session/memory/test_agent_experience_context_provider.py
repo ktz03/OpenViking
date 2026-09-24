@@ -1,0 +1,189 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from openviking.server.identity import RequestContext, Role
+from openviking.session.memory.agent_experience_context_provider import (
+    AgentExperienceContextProvider,
+)
+from openviking.session.memory.agent_trajectory_context_provider import (
+    AgentTrajectoryContextProvider,
+)
+from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
+from openviking.session.memory.memory_updater import ExtractContext
+from openviking.session.memory.session_extract_context_provider import (
+    SessionExtractContextProvider,
+)
+from openviking.message import Message
+from openviking.message.part import TextPart
+from openviking_cli.session.user_id import UserIdentifier
+
+
+def test_create_tool_context_uses_extract_context_page_id_map():
+    provider = AgentExperienceContextProvider(
+        messages=[],
+        trajectory_summary="album release party discussion",
+        trajectory_uri="viking://user/user_sample_9/memories/trajectories/album_release_party_discussion.md",
+    )
+
+    extract_context = provider.get_extract_context()
+    extract_context.page_id_map.get_page_id(
+        "viking://user/user_sample_9/memories/trajectories/album_release_party_discussion.md"
+    )
+
+    tool_ctx = provider.create_tool_context()
+
+    assert tool_ctx.page_id_map is extract_context.page_id_map
+
+
+def test_user_memory_provider_splits_but_trajectory_provider_keeps_messages_whole():
+    text = "第一句很长很长很长很长很长很长很长很长很长很长很长。" * 8
+    messages = [Message(id="1", role="user", parts=[TextPart(text=text)])]
+
+    user_provider = SessionExtractContextProvider(messages=messages)
+    trajectory_provider = AgentTrajectoryContextProvider(messages=messages)
+
+    assert len(user_provider.get_extract_context().messages) > 1
+    assert len(trajectory_provider.get_extract_context().messages) == 1
+    assert trajectory_provider.get_extract_context().messages[0] is messages[0]
+
+
+def test_agent_only_schemas_are_excluded_from_peer_user_memory_extraction():
+    messages = [
+        Message(
+            id="1",
+            role="user",
+            parts=[TextPart(text="帮我导出 B 站投稿数据")],
+            peer_id="case_demo_peer",
+        )
+    ]
+    ctx = RequestContext(
+        user=UserIdentifier(account_id="acc", user_id="default"),
+        role=Role.USER,
+    )
+    provider = SessionExtractContextProvider(messages=messages)
+    provider._isolation_handler = MemoryIsolationHandler(
+        ctx,
+        ExtractContext(messages),
+        allow_self=False,
+        allowed_peer_ids={"case_demo_peer"},
+    )
+
+    schema_types = {schema.memory_type for schema in provider.get_memory_schemas(ctx)}
+
+    assert "experiences" not in schema_types
+    assert "trajectories" not in schema_types
+
+
+@pytest.mark.asyncio
+async def test_agent_experience_prefetch_starts_with_conversation_and_new_trajectory_read():
+    provider = AgentExperienceContextProvider(
+        messages=[],
+        trajectory_summary="album release party discussion",
+        trajectory_uri="viking://user/user_sample_9/memories/trajectories/album_release_party_discussion.md",
+    )
+    provider._ctx = RequestContext(
+        user=UserIdentifier(account_id="acc", user_id="user_1"),
+        role=Role.USER,
+    )
+    provider._viking_fs = AsyncMock()
+    provider._transaction_handle = None
+    provider.search_files = AsyncMock(return_value=[])
+
+    with patch(
+        "openviking.session.memory.agent_experience_context_provider.add_tool_call_pair_to_messages"
+    ) as add_tool_call_pair:
+        messages = await provider.prefetch()
+
+    assert messages[0]["role"] == "user"
+    assert "## Conversation History" in messages[0]["content"]
+    assert "After exploring, analyze the conversation" in messages[0]["content"]
+    assert add_tool_call_pair.call_count == 1
+    assert add_tool_call_pair.call_args_list[0].kwargs["result"]["context_role"] == "new_trajectory"
+    assert add_tool_call_pair.call_args_list[0].kwargs["result"]["memory_type"] == "trajectories"
+    assert add_tool_call_pair.call_args_list[0].kwargs["result"]["uri"] == provider.trajectory_uri
+    assert messages[-1]["role"] == "user"
+    assert "candidate_experience" in messages[-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_agent_experience_prefetch_includes_structured_read_results():
+    provider = AgentExperienceContextProvider(
+        messages=[],
+        trajectory_summary="album release party discussion",
+        trajectory_uri="viking://user/user_sample_9/memories/trajectories/album_release_party_discussion.md",
+    )
+    provider._ctx = RequestContext(
+        user=UserIdentifier(account_id="acc", user_id="user_1"),
+        role=Role.USER,
+    )
+    provider._viking_fs = AsyncMock()
+    provider._transaction_handle = None
+
+    provider.search_files = AsyncMock(
+        return_value=[
+            "viking://user/user_sample_9/memories/experiences/personal_experience_sharing_conversation_flow.md"
+        ]
+    )
+
+    read_result = {
+        "experience_name": "personal_experience_sharing_conversation_flow",
+        "content": "1 | line one\n2 | line two",
+        "page_id": 1,
+        "memory_type": "experiences",
+    }
+    provider.read_file = AsyncMock(return_value=read_result)
+    provider._read_file_contents = {
+        "viking://user/user_sample_9/memories/experiences/personal_experience_sharing_conversation_flow.md": SimpleNamespace(
+            extra_fields={"experience_name": "personal_experience_sharing_conversation_flow"},
+            content="line one\nline two",
+            links=[],
+        )
+    }
+
+    with patch(
+        "openviking.session.memory.agent_experience_context_provider.add_tool_call_pair_to_messages"
+    ) as add_tool_call_pair:
+        messages = await provider.prefetch()
+
+    assert any(msg.get("role") == "user" for msg in messages)
+    assert add_tool_call_pair.call_count == 2
+    assert (
+        add_tool_call_pair.call_args_list[1].kwargs["result"]["context_role"]
+        == "candidate_experience"
+    )
+    assert add_tool_call_pair.call_args_list[1].kwargs["result"]["page_id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_experience_prefetch_missing_experience_dir_returns_empty_candidates():
+    provider = AgentExperienceContextProvider(
+        messages=[],
+        trajectory_summary="new execution",
+        trajectory_uri="viking://user/user_1/memories/trajectories/new_execution.md",
+    )
+    provider._ctx = RequestContext(
+        user=UserIdentifier(account_id="acc", user_id="user_1"),
+        role=Role.USER,
+    )
+    provider._viking_fs = AsyncMock()
+    provider._viking_fs.ls = AsyncMock(
+        side_effect=Exception("Directory not found: viking://user/user_1/memories/experiences")
+    )
+    provider._transaction_handle = None
+    provider.search_files = AsyncMock(return_value=[])
+
+    with patch(
+        "openviking.session.memory.agent_experience_context_provider.tracer.error"
+    ) as tracer_error, patch(
+        "openviking.session.memory.agent_experience_context_provider.add_tool_call_pair_to_messages"
+    ) as add_tool_call_pair:
+        messages = await provider.prefetch()
+
+    assert messages[-1]["role"] == "user"
+    assert add_tool_call_pair.call_count == 1
+    tracer_error.assert_not_called()

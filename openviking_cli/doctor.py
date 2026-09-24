@@ -1,0 +1,741 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""openviking-server doctor - validate OpenViking subsystems and report actionable diagnostics.
+
+Unlike ``ov health`` (which pings a running server), ``openviking-server doctor`` checks
+local prerequisites without requiring a server: config file, Python version,
+native vector engine, AGFS, embedding provider, VLM provider, VikingBot auth,
+and disk space.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import importlib
+import json
+import os
+import platform
+import shutil
+import sys
+from pathlib import Path
+from typing import Any, Literal, Optional
+
+from openviking.server.config import (
+    ServerConfig,
+    get_server_url_from_server_data,
+)
+from openviking_cli.utils.config.config_loader import resolve_config_path
+from openviking_cli.utils.config.consts import OPENVIKING_CONFIG_ENV
+from openviking_cli.utils.config.ovcli_config import load_ovcli_config
+from openviking_cli.utils.config.vlm_config import VLMConfig
+
+CheckStatus = Literal["pass", "warn", "fail"]
+CheckResult = tuple[bool | CheckStatus, str, Optional[str]]
+
+# ANSI helpers (disabled when stdout is not a terminal)
+_USE_COLOR = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+
+def _green(text: str) -> str:
+    return f"\033[32m{text}\033[0m" if _USE_COLOR else text
+
+
+def _red(text: str) -> str:
+    return f"\033[31m{text}\033[0m" if _USE_COLOR else text
+
+
+def _yellow(text: str) -> str:
+    return f"\033[33m{text}\033[0m" if _USE_COLOR else text
+
+
+def _dim(text: str) -> str:
+    return f"\033[2m{text}\033[0m" if _USE_COLOR else text
+
+
+# ---------------------------------------------------------------------------
+# Individual check functions
+# ---------------------------------------------------------------------------
+
+
+def _find_config() -> Optional[Path]:
+    return resolve_config_path(None, OPENVIKING_CONFIG_ENV, "ov.conf")
+
+
+def _load_config_json(config_path: Path) -> Optional[dict]:
+    """Parse ov.conf as JSON. Returns None if the file is unreadable or not valid JSON."""
+    try:
+        raw = config_path.read_text(encoding="utf-8-sig")
+        raw = os.path.expandvars(raw)
+        return json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _normalize_check_result(result: CheckResult) -> tuple[CheckStatus, str, Optional[str]]:
+    """Normalize legacy bool checks and newer tri-state checks."""
+    status, detail, fix = result
+    if status is True:
+        return "pass", detail, fix
+    if status is False:
+        return "fail", detail, fix
+    if status in {"pass", "warn", "fail"}:
+        return status, detail, fix
+    return "fail", f"Invalid check status: {status!r}", None
+
+
+def check_config() -> tuple[bool, str, Optional[str]]:
+    """Validate ov.conf exists and is valid JSON with required sections."""
+    config_path = _find_config()
+    if config_path is None:
+        return (
+            False,
+            "Configuration file not found",
+            f"Create ~/.openviking/ov.conf or set {OPENVIKING_CONFIG_ENV}",
+        )
+
+    try:
+        raw = config_path.read_text(encoding="utf-8-sig")
+        raw = os.path.expandvars(raw)
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return False, f"Invalid JSON in {config_path}", f"Fix syntax error: {exc}"
+
+    if not isinstance(data, dict):
+        return (
+            False,
+            f"{config_path} must contain a JSON object",
+            "The top-level config must be a JSON object",
+        )
+
+    # Validate the parsed config the same way the server does on startup, so
+    # `doctor` reports unknown or invalid fields instead of passing a config
+    # that would actually fail to load on `openviking-server` startup (#2373).
+    from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
+
+    try:
+        OpenVikingConfig.from_dict(data)
+    except ValueError as exc:
+        first_error = next((line for line in str(exc).splitlines() if line.strip()), "")
+        detail = (
+            f"{config_path}: {first_error}"
+            if first_error
+            else f"Invalid configuration in {config_path}"
+        )
+        return (
+            False,
+            detail,
+            "Fix the reported field(s); run `openviking-server` to see full details",
+        )
+
+    return True, str(config_path), None
+
+
+def check_python() -> tuple[bool, str, Optional[str]]:
+    """Verify Python >= 3.10."""
+    version = sys.version_info
+    version_str = f"{version[0]}.{version[1]}.{version[2]}"
+    if version >= (3, 10):
+        return True, f"{version_str} (>= 3.10 required)", None
+    return (
+        False,
+        f"{version_str} (>= 3.10 required)",
+        "Upgrade Python to 3.10 or later",
+    )
+
+
+def check_native_engine() -> tuple[bool, str, Optional[str]]:
+    """Check if the native vector engine (PersistStore) is available."""
+    try:
+        from openviking.storage.vectordb.engine import (
+            AVAILABLE_ENGINE_VARIANTS,
+            ENGINE_VARIANT,
+        )
+    except ImportError as exc:
+        return (
+            False,
+            f"Cannot import engine module: {exc}",
+            "pip install openviking --upgrade --force-reinstall",
+        )
+
+    if ENGINE_VARIANT == "unavailable":
+        variants = ", ".join(AVAILABLE_ENGINE_VARIANTS) if AVAILABLE_ENGINE_VARIANTS else "none"
+        machine = platform.machine()
+        return (
+            False,
+            f"No compatible engine variant (platform: {machine}, packaged: {variants})",
+            'pip install openviking --upgrade --force-reinstall\n  Alt: Use vectordb.backend = "volcengine" instead of "local"',
+        )
+
+    return True, f"variant={ENGINE_VARIANT}", None
+
+
+def check_agfs() -> tuple[bool, str, Optional[str]]:
+    """Verify the bundled OpenViking AGFS client loads."""
+    try:
+        pyagfs = importlib.import_module("openviking.pyagfs")
+
+        version = getattr(pyagfs, "__version__", "unknown")
+        return True, f"AGFS SDK {version}", None
+    except ImportError:
+        return (
+            False,
+            "Bundled AGFS client not found",
+            "pip install openviking --upgrade --force-reinstall",
+        )
+
+
+def _embedding_probe_label(provider: str, model: str, dense: dict[str, Any]) -> str:
+    api_base = dense.get("api_base")
+    dimension = dense.get("dimension")
+    parts = [f"{provider}/{model}"]
+    if api_base:
+        parts.append(f"api_base={api_base}")
+    if dimension:
+        parts.append(f"dimension={dimension}")
+    return " ".join(parts)
+
+
+def _probe_embedding_provider(
+    embedding: dict[str, Any],
+    dense: dict[str, Any],
+) -> tuple[bool, str, Optional[str]]:
+    """Create the configured embedder, make one request, and validate vector shape."""
+    from openviking.models.embedder.base import embed_compat
+    from openviking_cli.utils.config.embedding_config import EmbeddingConfig, EmbeddingModelConfig
+
+    provider = dense.get("provider", "local")
+    model = dense.get("model", "bge-small-zh-v1.5-f16")
+    label = _embedding_probe_label(provider, model, dense)
+
+    try:
+        model_config = EmbeddingModelConfig(**dense)
+        config_kwargs = {
+            key: embedding[key]
+            for key in ("max_concurrent", "max_retries", "text_source", "max_input_tokens")
+            if key in embedding
+        }
+        embedding_config = EmbeddingConfig(dense=model_config, **config_kwargs)
+        embedder = embedding_config.get_embedder()
+        expected_dimension = (
+            model_config.dimension
+            if model_config.dimension is not None
+            else embedder.get_dimension()
+        )
+    except Exception as exc:
+        return (
+            False,
+            f"{label} (invalid embedding config: {exc})",
+            "Fix embedding.dense provider/model/api_base/dimension in ov.conf",
+        )
+
+    async def _run_probe():
+        return await asyncio.wait_for(
+            embed_compat(embedder, "OpenViking doctor embedding probe", is_query=True),
+            timeout=10.0,
+        )
+
+    try:
+        result = asyncio.run(_run_probe())
+    except TimeoutError:
+        return (
+            False,
+            f"{label} (probe timed out)",
+            "Check embedding.dense.api_base and make sure the embedding provider is reachable",
+        )
+    except Exception as exc:
+        return (
+            False,
+            f"{label} (probe failed: {exc})",
+            "Check the embedding provider service, model name, API key, and api_base",
+        )
+
+    vector = getattr(result, "dense_vector", None)
+    if not vector:
+        return (
+            False,
+            f"{label} (probe returned no dense vector)",
+            "Use a dense embedding model or configure embedding.dense correctly",
+        )
+
+    actual_dimension = len(vector)
+    if actual_dimension != expected_dimension:
+        return (
+            False,
+            f"{label} (dimension mismatch: expected {expected_dimension}, got {actual_dimension})",
+            "Set embedding.dense.dimension to match the provider output, or use a matching model/index",
+        )
+
+    return True, f"{label} probe ok (dimension={actual_dimension})", None
+
+
+def check_embedding() -> tuple[bool, str, Optional[str]]:
+    """Load embedding config and verify provider connectivity."""
+    config_path = _find_config()
+    if config_path is None:
+        return False, "Cannot check (no config file)", None
+
+    data = _load_config_json(config_path)
+    if data is None:
+        return False, "Cannot check (config unreadable)", None
+
+    embedding = data.get("embedding", {}) or {}
+    dense = embedding.get("dense", {}) or {}
+    provider = dense.get("provider", "local")
+    model = dense.get("model", "bge-small-zh-v1.5-f16")
+
+    if provider == "local":
+        from openviking.models.embedder.local_embedders import (
+            get_local_model_cache_path,
+            get_local_model_spec,
+        )
+
+        try:
+            get_local_model_spec(model)
+        except ValueError as exc:
+            return (
+                False,
+                f"{provider}/{model} (unsupported local model)",
+                str(exc),
+            )
+
+        try:
+            importlib.import_module("llama_cpp")
+        except ImportError:
+            return (
+                False,
+                f"{provider}/{model} (missing llama-cpp-python)",
+                'pip install "openviking[local-embed]"',
+            )
+
+        model_path = dense.get("model_path", "")
+        cache_dir = Path(dense.get("cache_dir", "~/.cache/openviking/models")).expanduser()
+        if model_path:
+            if not Path(model_path).expanduser().exists():
+                return (
+                    False,
+                    f"{provider}/{model} (model_path missing)",
+                    f"Download the GGUF model to {Path(model_path).expanduser()} or update embedding.dense.model_path",
+                )
+            return True, f"{provider}/{model} ({Path(model_path).expanduser()})", None
+
+        cached_file = get_local_model_cache_path(model, str(cache_dir))
+        if cached_file.exists():
+            return True, f"{provider}/{model} ({cached_file})", None
+        return (
+            True,
+            f"{provider}/{model} (will auto-download during startup initialization)",
+            None,
+        )
+
+    api_key = dense.get("api_key", "")
+    api_base = dense.get("api_base", "")
+    if provider != "ollama" and not api_base and (not api_key or api_key.startswith("{")):
+        return (
+            False,
+            f"{provider}/{model} (no API key)",
+            "Set embedding.dense.api_key in ov.conf",
+        )
+
+    return _probe_embedding_provider(embedding, dense)
+
+
+def check_vlm() -> tuple[bool, str, Optional[str]]:
+    """Load VLM config and verify it's configured."""
+    config_path = _find_config()
+    if config_path is None:
+        return False, "Cannot check (no config file)", None
+
+    data = _load_config_json(config_path)
+    if data is None:
+        return False, "Cannot check (config unreadable)", None
+
+    raw_vlm = data.get("vlm", {})
+    normalized_vlm = VLMConfig.sync_provider_backend(dict(raw_vlm))
+    try:
+        # Doctor owns the runtime credential probe below. Skip only the model's
+        # Codex availability check while retaining all structural validation.
+        vlm = VLMConfig.model_validate(
+            normalized_vlm,
+            context={"skip_codex_auth_availability": True},
+        )
+    except Exception as exc:
+        return False, f"Invalid VLM config: {exc}", "Fix vlm section in ov.conf"
+    _, provider = vlm.get_provider_config()
+    model = vlm.model or ""
+
+    if not provider:
+        return False, "No VLM provider configured", "Add vlm section to ov.conf"
+
+    if provider == "openai-codex":
+        api_key = vlm._get_effective_api_key()
+        if api_key and not api_key.startswith("{"):
+            return True, f"openai-codex/{model} (explicit api_key)", None
+
+        importlib.import_module("openviking.models.vlm")
+        codex_auth = importlib.import_module("openviking.models.vlm.backends.codex_auth")
+
+        try:
+            creds = codex_auth.resolve_codex_runtime_credentials()
+            source = creds.get("source", "unknown")
+            return True, f"openai-codex/{model} (oauth via {source})", None
+        except Exception as exc:
+            status = codex_auth.get_codex_auth_status()
+            store_path = status.get("store_path") or "~/.openviking/codex_auth.json"
+            bootstrap_path = status.get("bootstrap_path") or "~/.codex/auth.json"
+            return (
+                False,
+                f"openai-codex/{model} ({exc})",
+                "Run `openviking-server init` and choose `OpenAI Codex` to create OV-owned auth state\n"
+                f"Or bootstrap once from {bootstrap_path} into {store_path}",
+            )
+
+    # Ollama via LiteLLM doesn't need a real API key
+    if provider == "litellm" and model.startswith("ollama/"):
+        return True, f"{provider}/{model}", None
+
+    api_key = vlm._get_effective_api_key()
+    if not api_key or api_key.startswith("{"):
+        return (
+            False,
+            f"{provider}/{model} (no API key)",
+            "Set vlm.api_key in ov.conf",
+        )
+
+    return True, f"{provider}/{model}", None
+
+
+def check_ollama() -> tuple[bool, str, Optional[str]]:
+    """Check Ollama connectivity if the config uses an Ollama provider."""
+    config_path = _find_config()
+    if config_path is None:
+        return True, "not configured", None
+
+    data = _load_config_json(config_path)
+    if data is None:
+        return True, "not configured", None
+
+    # Detect whether config uses Ollama
+    dense = data.get("embedding", {}).get("dense", {})
+    vlm = data.get("vlm", {})
+    query_planner = data.get("query_planner") or {}
+    uses_embedding = dense.get("provider") == "ollama"
+    uses_vlm = vlm.get("provider") == "litellm" and (vlm.get("model", "")).startswith("ollama/")
+    uses_query_planner = query_planner.get("provider") == "litellm" and (
+        query_planner.get("model", "")
+    ).startswith("ollama/")
+
+    if not uses_embedding and not uses_vlm and not uses_query_planner:
+        return True, "not configured", None
+
+    from openviking_cli.utils.ollama import check_ollama_running, parse_ollama_url
+
+    # Determine host/port from config (embedding -> vlm -> query_planner)
+    if uses_embedding:
+        host, port = parse_ollama_url(dense.get("api_base"))
+    elif uses_vlm:
+        host, port = parse_ollama_url(vlm.get("api_base"))
+    else:
+        host, port = parse_ollama_url(query_planner.get("api_base"))
+
+    if check_ollama_running(host, port):
+        return True, f"running at {host}:{port}", None
+
+    return (
+        False,
+        f"unreachable at {host}:{port}",
+        "Run 'ollama serve' or check your Ollama configuration",
+    )
+
+
+def _is_placeholder_secret(value: str) -> bool:
+    stripped = value.strip()
+    return (
+        not stripped
+        or stripped.startswith("{")
+        or stripped.startswith("<")
+        or stripped.startswith("$")
+    )
+
+
+def _load_ovcli_api_key_for_doctor() -> str:
+    try:
+        cli_config = load_ovcli_config()
+    except ValueError:
+        return ""
+    if cli_config is None:
+        return ""
+    return str(getattr(cli_config, "api_key", "") or "").strip()
+
+
+def _bot_openviking_server_url(ov_server: dict[str, Any], server: dict[str, Any]) -> str:
+    configured_url = str(ov_server.get("server_url") or "").strip()
+    if configured_url:
+        return configured_url
+    return get_server_url_from_server_data(server)
+
+
+def check_vikingbot() -> CheckResult:
+    """Check VikingBot OpenViking Server auth config.
+
+    VikingBot is optional, so missing auth configuration is a warning rather
+    than a hard failure. In api_key mode VikingBot must use a User API key; in
+    trusted mode it uses a root API key through bot.ov_server.api_key plus
+    trusted identity headers.
+    """
+    config_path = _find_config()
+    if config_path is None:
+        return "warn", "Cannot check (no config file)", None
+
+    data = _load_config_json(config_path)
+    if data is None:
+        return "warn", "Cannot check (config unreadable)", None
+
+    server = data.get("server") if isinstance(data.get("server"), dict) else {}
+    auth_mode = ServerConfig(
+        auth_mode=server.get("auth_mode"),
+        root_api_key=server.get("root_api_key"),
+    ).get_effective_auth_mode()
+    server_root_api_key = str(server.get("root_api_key") or "").strip()
+
+    bot = data.get("bot")
+    if not isinstance(bot, dict):
+        bot = {}
+
+    ov_server = bot.get("ov_server")
+    if not isinstance(ov_server, dict):
+        ov_server = {}
+
+    api_key = str(ov_server.get("api_key") or "").strip()
+    root_api_key = str(ov_server.get("root_api_key") or "").strip()
+    explicit_api_key_type = str(ov_server.get("api_key_type") or "").strip().lower()
+    bot_server_url = _bot_openviking_server_url(ov_server, server)
+    bot_uses_current_server = not str(ov_server.get("server_url") or "").strip()
+    if explicit_api_key_type:
+        api_key_type = explicit_api_key_type
+    elif bot_uses_current_server:
+        api_key_type = "root" if auth_mode == "trusted" else "user"
+    else:
+        api_key_type = "user"
+
+    if api_key_type == "root":
+        if bot_uses_current_server and auth_mode != "trusted":
+            return (
+                "warn",
+                f"bot.ov_server targets {bot_server_url} with api_key_type=root, "
+                f"but that server is auth_mode={auth_mode}",
+                f"To use {bot_server_url}, set bot.ov_server.api_key_type to 'user' "
+                "and configure a User API key in bot.ov_server.api_key or ovcli.conf api_key.\n"
+                "To use root mode, change that OpenViking server to server.auth_mode='trusted'.\n"
+                "To use another trusted server, set bot.ov_server.server_url to that server "
+                "and keep api_key_type='root'.",
+            )
+        trusted_root_key = (
+            server_root_api_key if bot_uses_current_server and auth_mode == "trusted" else api_key
+        )
+        if _is_placeholder_secret(trusted_root_key):
+            if root_api_key:
+                return (
+                    "warn",
+                    "bot.ov_server.root_api_key is deprecated and ignored",
+                    "Move the root API key to bot.ov_server.api_key and keep "
+                    "bot.ov_server.api_key_type='root'",
+                )
+            if auth_mode == "trusted" and not ov_server:
+                return (
+                    "warn",
+                    "server.auth_mode=trusted without server.root_api_key",
+                    "Configure server.root_api_key for VikingBot trusted OpenViking calls "
+                    "outside localhost",
+                )
+            return (
+                "warn",
+                "bot.ov_server.api_key_type=root without root API key",
+                "Configure bot.ov_server.api_key with a root API key for trusted OpenViking access",
+            )
+        return "pass", "bot.ov_server configured for trusted OpenViking auth", None
+
+    if bot_uses_current_server and auth_mode == "dev":
+        return "pass", "VikingBot aligned with dev OpenViking auth", None
+
+    ovcli_api_key = "" if not _is_placeholder_secret(api_key) else _load_ovcli_api_key_for_doctor()
+    if not _is_placeholder_secret(api_key):
+        return "pass", "bot.ov_server.api_key configured for api_key mode", None
+    if not _is_placeholder_secret(ovcli_api_key):
+        return "pass", "ovcli.conf api_key configured for VikingBot api_key mode", None
+
+    if _is_placeholder_secret(api_key):
+        if root_api_key:
+            return (
+                "warn",
+                "bot.ov_server.root_api_key is deprecated and ignored",
+                "Use bot.ov_server.api_key for the active key. In api_key mode configure "
+                "a User API key in bot.ov_server.api_key or ovcli.conf api_key.",
+            )
+        if not bot or not ov_server:
+            return (
+                "warn",
+                "bot.ov_server not configured and ovcli.conf api_key not configured",
+                "Configure bot.ov_server.api_key or ovcli.conf api_key with an "
+                "OpenViking User API key",
+            )
+        return (
+            "warn",
+            "bot.ov_server.api_key and ovcli.conf api_key not configured",
+            "Create an OpenViking User API key and set bot.ov_server.api_key or ovcli.conf api_key",
+        )
+    return "pass", "bot.ov_server.api_key configured for api_key mode", None
+
+
+def check_authentication() -> CheckResult:
+    """Check authentication configuration using auth health checks."""
+    config_path = _find_config()
+    if config_path is None:
+        return "warn", "Cannot check (no config file)", None
+
+    data = _load_config_json(config_path)
+    if data is None:
+        return "warn", "Cannot check (config unreadable)", None
+
+    # Load server config
+    try:
+        from openviking.server.auth.health_check import run_health_check
+        from openviking.server.config import ServerConfig
+
+        server_data = data.get("server", {}) if isinstance(data.get("server"), dict) else {}
+        config = ServerConfig(**server_data)
+    except ImportError:
+        return "warn", "Auth health check not available (module missing)", None
+    except Exception as exc:
+        return "warn", f"Could not load server config: {exc}", None
+
+    # Run auth health checks
+    try:
+        report = asyncio.run(run_health_check(config, fail_on_warn=False))
+    except Exception as exc:
+        return "warn", f"Auth health check failed to run: {exc}", None
+
+    # Format results
+    auth_mode = report.auth_mode
+    pass_count = sum(1 for c in report.checks if c.status == "pass")
+    warn_count = sum(1 for c in report.checks if c.status == "warn")
+    fail_count = sum(1 for c in report.checks if c.status == "fail")
+
+    detail = f"{auth_mode}: {pass_count} passed, {warn_count} warned, {fail_count} failed"
+
+    if report.overall_status == "pass":
+        return "pass", detail, None
+    elif report.overall_status == "warn":
+        # Collect warning messages
+        warn_msgs = []
+        for c in report.checks:
+            if c.status == "warn":
+                warn_msgs.append(f"  - {c.name}: {c.message}")
+        fix = "\n".join(warn_msgs) if warn_msgs else None
+        return "warn", detail, fix
+    else:
+        # Collect fail messages
+        fail_msgs = []
+        for c in report.checks:
+            if c.status == "fail":
+                fail_msgs.append(f"  - {c.name}: {c.message}")
+        fix = "\n".join(fail_msgs) if fail_msgs else None
+        return "fail", detail, fix
+
+
+def check_disk() -> tuple[bool, str, Optional[str]]:
+    """Check free disk space in the workspace directory."""
+    config_path = _find_config()
+    workspace = Path.home() / ".openviking"
+
+    if config_path:
+        data = _load_config_json(config_path)
+        if data is not None:
+            ws = data.get("storage", {}).get("workspace", "")
+            if ws:
+                workspace = Path(ws).expanduser()
+
+    check_path = workspace if workspace.exists() else Path.home()
+
+    usage = shutil.disk_usage(check_path)
+    free_gb = usage.free / (1024**3)
+
+    if free_gb < 1.0:
+        return (
+            False,
+            f"{free_gb:.1f} GB free in {check_path}",
+            "Free up disk space (OpenViking needs at least 1 GB for vector storage)",
+        )
+
+    return True, f"{free_gb:.1f} GB free in {check_path}", None
+
+
+# ---------------------------------------------------------------------------
+# Main orchestrator
+# ---------------------------------------------------------------------------
+
+_CHECKS = [
+    ("Config", check_config),
+    ("Python", check_python),
+    ("Native Engine", check_native_engine),
+    ("AGFS", check_agfs),
+    ("Authentication", check_authentication),
+    ("Embedding", check_embedding),
+    ("VLM", check_vlm),
+    ("Ollama", check_ollama),
+    ("VikingBot", check_vikingbot),
+    ("Disk", check_disk),
+]
+
+
+def run_doctor() -> int:
+    """Run all diagnostic checks and print a formatted report.
+
+    Returns 0 if all checks pass, 1 otherwise.
+    """
+    print("\nOpenViking Doctor\n")
+
+    failed = 0
+    warned = 0
+    max_label = max(len(label) for label, _ in _CHECKS)
+
+    for label, check_fn in _CHECKS:
+        try:
+            status_key, detail, fix = _normalize_check_result(check_fn())
+        except Exception as exc:
+            status_key, detail, fix = "fail", f"Unexpected error: {type(exc).__name__}: {exc}", None
+
+        pad = " " * (max_label - len(label) + 1)
+        if status_key == "pass":
+            status = _green("PASS")
+            print(f"  {label}:{pad}{status}  {detail}")
+        elif status_key == "warn":
+            status = _yellow("WARN")
+            print(f"  {label}:{pad}{status}  {detail}")
+            warned += 1
+            if fix:
+                for line in fix.split("\n"):
+                    print(f"  {' ' * (max_label + 2)}{_dim('Fix: ' + line)}")
+        else:
+            status = _red("FAIL")
+            print(f"  {label}:{pad}{status}  {detail}")
+            failed += 1
+            if fix:
+                for line in fix.split("\n"):
+                    print(f"  {' ' * (max_label + 2)}{_dim('Fix: ' + line)}")
+
+    print()
+    if failed:
+        print(f"  {_red(f'{failed} check(s) failed.')} See above for fix suggestions.\n")
+        return 1
+
+    if warned:
+        print(f"  {_yellow(f'{warned} warning(s).')} Review the suggestions above.\n")
+        return 0
+
+    print(f"  {_green('All checks passed.')}\n")
+    return 0
+
+
+def main() -> int:
+    """Entry point for ``openviking-server doctor``."""
+    return run_doctor()

@@ -1,0 +1,66 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""Response models and error codes for OpenViking HTTP Server."""
+
+from typing import Any, Dict, Optional
+
+from pydantic import BaseModel
+
+
+class ErrorInfo(BaseModel):
+    """Error information."""
+
+    code: str
+    message: str
+    details: Optional[dict] = None
+
+
+class Response(BaseModel):
+    """Standard API response."""
+
+    status: str  # "ok" | "error"
+    result: Optional[Any] = None
+    error: Optional[ErrorInfo] = None
+    telemetry: Optional[Dict[str, Any]] = None
+    profile: Optional[list[str]] = None
+
+
+# Error code to HTTP status code mapping
+ERROR_CODE_TO_HTTP_STATUS = {
+    "OK": 200,
+    "INVALID_ARGUMENT": 400,
+    "GIT_AUTH_FAILED": 400,
+    "INVALID_URI": 400,
+    "NOT_FOUND": 404,
+    "ALREADY_EXISTS": 409,
+    "CONFLICT": 409,
+    "PERMISSION_DENIED": 403,
+    "UNAUTHENTICATED": 401,
+    "RESOURCE_EXHAUSTED": 429,
+    "FAILED_PRECONDITION": 412,
+    "ABORTED": 409,
+    "DEADLINE_EXCEEDED": 504,
+    "UNAVAILABLE": 503,
+    "INTERNAL": 500,
+    "UNIMPLEMENTED": 501,
+    "NOT_INITIALIZED": 500,
+    "PROCESSING_ERROR": 500,
+    "EMBEDDING_FAILED": 500,
+    "VLM_FAILED": 500,
+    "SESSION_EXPIRED": 410,
+    "UNSUPPORTED_URI": 400,
+    "UNSUPPORTED_MODE": 400,
+    "RESTORE_WRITEBACK_PARTIAL": 500,
+    "SKILL_INVALID": 400,
+    "SKILL_CAPABILITY_UNAVAILABLE": 400,
+    "AGENT_OUTPUT_INVALID": 500,
+    "MODEL_UNAVAILABLE": 503,
+    "WRITE_CONFLICT": 409,
+    "WRITE_FAILED": 500,
+    "REFRESH_FAILED": 500,
+    "BOT_RESTARTED": 503,
+    "INTERNAL_ERROR": 500,
+    "NO_VECTOR_DB": 503,
+    "INVALID_FILTER": 400,
+    "UNKNOWN": 500,
+}

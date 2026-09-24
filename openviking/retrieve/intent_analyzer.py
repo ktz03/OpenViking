@@ -1,0 +1,190 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""
+Intent analyzer for OpenViking retrieval.
+
+Analyzes session context to generate query plans.
+"""
+
+from typing import Any, List, Optional
+
+from openviking.message import Message
+from openviking.prompts import render_prompt
+from openviking_cli.retrieve.types import ContextType, QueryPlan, TypedQuery
+from openviking_cli.utils.config import get_openviking_config
+from openviking_cli.utils.llm import parse_json_from_response
+from openviking_cli.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+DEFAULT_INTENT_ANALYSIS_PROMPT = "retrieval.intent_analysis"
+
+# Model-specific query-planner prompts. Models not listed here keep using the
+# default intent-analysis prompt for backward compatibility.
+QUERY_PLANNER_PROMPT_BY_MODEL: dict[str, str] = {
+    "ollama/guoxuter/ov_intent_analysis_sft:v7_q8": "retrieval.ov_intent_analysis_sft_v7",
+    "ollama/guoxuter/ov_intent_analysis_sft:v4_q8": "retrieval.ov_intent_analysis_sft_v4",
+}
+
+
+def resolve_intent_analysis_prompt_id(query_planner: Any) -> str:
+    """Return the prompt id expected by the configured query-planner model."""
+    model = getattr(query_planner, "model", None)
+    if not isinstance(model, str):
+        return DEFAULT_INTENT_ANALYSIS_PROMPT
+    return QUERY_PLANNER_PROMPT_BY_MODEL.get(model.strip(), DEFAULT_INTENT_ANALYSIS_PROMPT)
+
+
+class IntentAnalyzer:
+    """
+    Intent analyzer: generates query plans from session context.
+
+    Responsibilities:
+    1. Integrate session context (compression + recent messages + current message)
+    2. Call LLM to analyze intent
+    3. Generate multiple TypedQueries for memory/resources/skill
+    """
+
+    # Limit content length (about 10000 tokens)
+    MAX_COMPRESSION_SUMMARY_CHARS = 30000
+
+    def __init__(self, max_recent_messages: int = 5):
+        """Initialize intent analyzer."""
+        self.max_recent_messages = max_recent_messages
+
+    async def analyze(
+        self,
+        compression_summary: str,
+        messages: List[Message],
+        current_message: Optional[str] = None,
+        context_type: Optional[ContextType] = None,
+        target_abstract: str = "",
+    ) -> QueryPlan:
+        """Analyze session context and generate query plan.
+
+        Args:
+            compression_summary: Session compression summary
+            messages: Session message history
+            current_message: Current message (if any)
+            context_type: Constrained context type (only generate queries for this type)
+            target_abstract: Target directory abstract for more precise queries
+        """
+        # Call the lightweight query planner when configured; otherwise keep using VLM.
+        config = get_openviking_config()
+        query_planner = config.get_query_planner()
+
+        # Build context prompt. Some fine-tuned planner models expect a compact
+        # prompt/output contract, selected by exact model mapping above.
+        prompt = self._build_context_prompt(
+            compression_summary,
+            messages,
+            current_message,
+            context_type,
+            target_abstract,
+            prompt_id=resolve_intent_analysis_prompt_id(query_planner),
+        )
+
+        response = await query_planner.get_completion_async(prompt)
+
+        # Parse result
+        parsed = parse_json_from_response(response)
+        if not parsed:
+            raise ValueError("Failed to parse intent analysis response")
+
+        if isinstance(parsed, list):
+            parsed = {"reasoning": "", "queries": parsed}
+        elif not isinstance(parsed, dict):
+            raise ValueError(
+                "Intent analysis response must be a JSON object or array, got "
+                f"{type(parsed).__name__}"
+            )
+
+        reasoning = parsed.get("reasoning", "")
+        if not isinstance(reasoning, str):
+            reasoning = str(reasoning)
+
+        # Build QueryPlan
+        queries = []
+        for q in parsed.get("queries", []):
+            if not isinstance(q, dict):
+                continue
+            try:
+                context_type = ContextType(q.get("context_type", "resource"))
+            except ValueError:
+                context_type = ContextType.RESOURCE
+
+            queries.append(
+                TypedQuery(
+                    query=q.get("query", ""),
+                    context_type=context_type,
+                    intent=q.get("intent", ""),
+                    priority=q.get("priority", 3),
+                )
+            )
+
+        # Log analysis result
+        for i, q in enumerate(queries):
+            logger.info(
+                f'  [{i + 1}] type={q.context_type.value}, priority={q.priority}, query="{q.query}"'
+            )
+        logger.debug(f"[IntentAnalyzer] Reasoning: {reasoning[:200]}...")
+
+        return QueryPlan(
+            queries=queries,
+            session_context=self._summarize_context(compression_summary, current_message),
+            reasoning=reasoning,
+        )
+
+    def _build_context_prompt(
+        self,
+        compression_summary: str,
+        messages: List[Message],
+        current_message: Optional[str],
+        context_type: Optional[ContextType] = None,
+        target_abstract: str = "",
+        prompt_id: str = DEFAULT_INTENT_ANALYSIS_PROMPT,
+    ) -> str:
+        """Build prompt for intent analysis."""
+        # Format compression info
+        summary = self._truncate_text(compression_summary, self.MAX_COMPRESSION_SUMMARY_CHARS)
+        summary = summary if summary else "None"
+
+        # Format recent messages
+        recent = messages[-self.max_recent_messages :] if messages else []
+        recent_messages = (
+            "\n".join(f"[{m.role}]: {m.content}" for m in recent if m.content) if recent else "None"
+        )
+
+        # Current message
+        current = current_message if current_message else "None"
+
+        return render_prompt(
+            prompt_id,
+            {
+                "compression_summary": summary,
+                "recent_messages": recent_messages,
+                "current_message": current,
+                "context_type": context_type.value if context_type else "",
+                "target_abstract": target_abstract,
+            },
+        )
+
+    @staticmethod
+    def _truncate_text(text: str, max_chars: int) -> str:
+        """Truncate text to avoid oversized prompt context."""
+        if not text or len(text) <= max_chars:
+            return text
+        return text[: max_chars - 15] + "\n...(truncated)"
+
+    def _summarize_context(
+        self,
+        compression_summary: str,
+        current_message: Optional[str],
+    ) -> str:
+        """Generate context summary."""
+        parts = []
+        if compression_summary:
+            parts.append(f"Session summary: {compression_summary}")
+        if current_message:
+            parts.append(f"Current message: {current_message[:100]}")
+        return " | ".join(parts) if parts else "No context"

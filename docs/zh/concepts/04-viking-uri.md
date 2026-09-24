@@ -1,0 +1,401 @@
+# Viking URI
+
+Viking URI 是 OpenViking 中所有内容的统一资源标识符。
+
+## 格式
+
+```
+viking://{scope}/{path}
+```
+
+- **scheme**: 始终为 `viking`
+- **scope**: 顶级命名空间（`resources`、`user`、`agent`；`temp`、`queue` 和 `upload` 为内部作用域）
+- **path**: 作用域内的资源路径
+
+## 作用域
+
+| 作用域 | 说明 | 生命周期 | 可见性 |
+|--------|------|----------|--------|
+| **resources** | 独立资源/客观知识 | 长期 | account 全局 |
+| **user** | 用户级数据，包括 session | 长期 / 会话生命周期 | 当前用户 |
+| **agent** | agent 能力与配置（技能、端点、工具、支付等） | 长期 | account 全局 |
+| **queue** | 处理队列 | 临时 | 内部 |
+| **temp** | 临时文件 | 解析期间 | 内部 |
+| **upload** | 临时上传文件 | 临时 | 内部 |
+
+公开 API 和 CLI 的文件系统/内容操作接受公开作用域 `resources`、`user` 和 `agent`，
+以及根 URI `viking://`。`session` 保留为 user session 路径的向后兼容别名；
+新 session 数据位于 `viking://user/{user_id}/sessions`。
+`temp`、`queue` 和 `upload` 是内部实现作用域，不能通过公开 API 的 URI 参数直接访问。
+
+### Home 别名 `~`
+
+`~` 是当前调用方用户根目录的服务端别名。`viking://~` 展开为 `viking://user/{user_id}`，
+`viking://~/memories/note.md` 展开为 `viking://user/{user_id}/memories/note.md`，
+其中 `{user_id}` 取自请求的认证身份——同一个字符串对不同调用方指向不同目录。
+
+- 通用：所有控制面（REST API、`ov` CLI、SDK、MCP）都接受，可用于任何接受公开作用域 URI 的位置。
+- 仅识别第 0 段：`viking://resources/~/x` 和 `viking://user/alice/~/x` 中的 `~` 仍是字面路径段。
+- 接受但不宣传：`~` 不属于公开作用域列表，`Invalid scope ... Must be one of:` 错误信息中不会出现它。
+- 响应始终回显展开后的 canonical URI，不会返回 `viking://~`；持久化数据（向量记录、watch key）
+  同样保持 canonical 形式。
+- 需要认证请求身份。所有请求角色（包括 root）都使用该身份的有效 `user_id` 展开；要求 URI
+  已是 canonical 形式的场景（内部存储路径、没有请求上下文的后台任务）仍会直接拒绝该别名，
+  而不会猜测用户。
+- 取代已移除的无 uid 短写：`memories`、`resources`、`skills`、`peers`、`privacy`、`sessions`
+  的 `viking://user/<segment>/...` 写法会在 USER / ADMIN 请求入口被拒绝，错误信息中会给出
+  `viking://~/...` 的替代写法。
+
+## 初始目录
+
+摒弃传统的扁平化数据库思维，将所有上下文组织为一套文件系统。Agent 不再仅是通过向量搜索来找数据，而是可以通过确定性的路径和标准文件系统指令来定位和浏览数据。每个上下文或目录分配唯一的 URI 标识字符串，格式为 viking://{scope}/{path}，让系统能精准定位并访问存储在不同位置的资源。
+
+## 文件 ID
+
+除 URI 之外，每个文件会被自动分配一个稳定的 `id`，作为其在 VikingDB 中向量记录的主键。对于 level 2（常规文件）记录，该 id 按 `md5(f"{account_id}:{uri}")` 确定性计算，由 `stat()` 等元数据接口返回。调用方可凭此 id 直接交叉引用向量索引条目，无需额外查询。id 以 account 为作用域，当文件被移动到其他 URI 时 id 会随之改变（URI 迁移过程中向量记录会重新计算主键）。目录不返回单一 `id`，因为一个目录在多个语义层（L0 abstract、L1 overview、L2）下可能对应多条记录，每条各有自己的 id。
+
+```
+viking://
+├── user/
+│   └── {user_id}/
+│       ├── profile.md        # 用户画像
+│       ├── memories/         # 用户记忆
+│       ├── resources/        # 用户私有资源
+│       ├── skills/           # 用户技能
+│       ├── peers/
+│       │   └── {peer_id}/
+│       │       ├── memories/  # 关于某个交互对象的记忆
+│       │       └── resources/ # 归属于该 peer 的资源
+│       └── sessions/         # 用户会话
+│           └── {session_id}/
+│               ├── .abstract.md
+│               ├── .overview.md
+│               ├── .meta.json
+│               ├── messages.jsonl
+│               ├── tools/
+│               └── history/
+│
+├── agent/                     # agent 能力与配置（全局）
+│   ├── skills/                # 技能定义
+│   ├── endpoints/             # 通信端点（a2a, anp 等）（规划中）
+│   ├── tools/                 # 工具配置（mcp 等）（规划中）
+│   └── payments/              # 支付配置（ap2 等）（规划中）
+│
+└── resources/{project}/      # 资源工作区
+```
+
+## URI 示例
+
+### 资源
+
+```
+viking://resources/                           # 所有资源
+viking://resources/my-project/                # 项目根目录
+viking://resources/my-project/docs/           # 文档目录
+viking://resources/my-project/docs/api.md     # 具体文件
+```
+
+### 用户数据
+
+```
+viking://user/                                # 所有用户空间的容器（user key 只能列出自己的空间）
+viking://~/                                   # 自己的用户根目录（展开为 viking://user/{user_id}/）
+viking://~/memories/                          # 自己的所有记忆
+viking://~/memories/preferences/              # 用户偏好
+viking://~/memories/preferences/coding        # 具体偏好
+viking://~/memories/entities/                 # 实体记忆
+viking://~/memories/events/                   # 事件记忆
+viking://~/resources/                         # 自己的私有资源
+viking://~/resources/docs/                    # 自己的私有资源目录
+viking://user/{user_id}/memories/             # 显式用户路径（可写自己的 id；访问他人需 admin/root）
+```
+
+`viking://resources/...` 是当前 account 的共享区，可通过 [资源访问控制（ACL）](./15-acl.md) 细化目录或文件权限。`viking://user/{user}/resources/...` 是个人私有区；分享资源需要将其移动到共享区。
+
+### 用户技能和 peer 内容
+
+```
+viking://~/skills/                            # 自己的技能
+viking://~/skills/search-web                  # 某个技能
+viking://~/memories/                          # 自己的记忆
+viking://~/memories/cases/                    # 用于训练和评估的任务案例
+viking://~/memories/trajectories/             # 可复用的任务执行轨迹
+viking://~/memories/experiences/              # 从执行结果中提炼的经验
+viking://user/{user_id}/peers/{peer_id}/memories/
+viking://user/{user_id}/peers/{peer_id}/resources/
+```
+
+家目录别名 `viking://~/...` 会按当前请求身份解析。OpenViking 会在存储和检索前将它
+展开为显式命名空间路径 `viking://user/{user_id}/...`，响应中始终回显展开后的形式。
+
+旧的无 uid 写法——`viking://user/memories/...` 以及 `resources`、`skills`、`peers`、
+`privacy`、`sessions` 的同类写法——在请求入口不再被接受，这类请求会报错，并在错误信息中
+提示改用 `viking://~/...`。`viking://user` 本身是所有用户空间的容器，而不是自己根目录的
+快捷方式：使用 user key 列出它时只会看到自己的空间。
+
+`{user_id}` 和 `{peer_id}` 等身份路径片段必须是安全的单段标识，例如
+`alice` 或 `web-visitor-alice`。
+
+### agent 能力与配置
+
+```
+viking://agent/skills/search-web                    # 某个技能定义
+viking://agent/skills/                              # 所有技能定义
+viking://agent/endpoints/                           # 通信端点（a2a, anp 等）（规划中）
+viking://agent/tools/mcp/                           # MCP 工具配置（规划中）
+viking://agent/payments/ap2/                        # 支付配置（规划中）
+```
+
+`viking://agent/...` 是 account 内公共能力与配置目录，可包含 skills、endpoints、tools、payments 等子目录。
+目录名不表示 Agent 身份，`actor_peer_id` 不过滤该目录；共享范围限于当前账号。
+Peer 数据使用 `viking://user/<user_id>/peers/<peer_id>/...`。
+
+### 会话数据
+
+```
+viking://user/{user_id}/sessions/{session_id}/          # 会话根目录
+viking://user/{user_id}/sessions/{session_id}/messages  # 会话消息
+viking://user/{user_id}/sessions/{session_id}/tools     # 工具执行
+viking://user/{user_id}/sessions/{session_id}/history   # 归档历史
+viking://~/sessions/{session_id}/                       # 自己的会话（家目录别名写法）
+```
+
+`viking://session/{session_id}` 会作为当前用户 session 路径的向后兼容别名被接受。
+它不是新会话数据的独立存储根。
+
+## 路径变量
+
+Viking URI 支持路径变量用于动态路径生成。这对于按时间序列组织数据（如邮件、日志、日报等）特别有用。
+
+### 变量语法
+
+```
+{namespace:key}
+```
+
+- **namespace**: 变量提供者命名空间（如 `calendar`、`env`、`user`）
+- **key**: 命名空间内的变量名
+
+### 日历变量
+
+`calendar` 命名空间提供日期相关变量：
+
+| 变量 | 说明 | 示例（2026-05-07） |
+|------|------|----------------------|
+| `{calendar:today}` | 完整日期路径 | `2026/05/07` |
+| `{calendar:yesterday}` | 昨天的日期路径 | `2026/05/06` |
+| `{calendar:tomorrow}` | 明天的日期路径 | `2026/05/08` |
+| `{calendar:year}` | 年份 | `2026` |
+| `{calendar:month}` | 月份（带前导零） | `05` |
+| `{calendar:day}` | 日期（带前导零） | `07` |
+| `{calendar:ym}` | 年/月 | `2026/05` |
+| `{calendar:quarter}` | 季度（Q1-Q4） | `Q2` |
+| `{calendar:yq}` | 年/季度 | `2026/Q2` |
+| `{calendar:week}` | ISO 周数（带前导零） | `18` |
+| `{calendar:yw}` | 年/ISO 周 | `2026/w18` |
+
+### 使用示例
+
+```python
+# 按日期组织邮件
+viking://resources/emails/{calendar:today}/inbox
+# 渲染为：viking://resources/emails/2026/05/07/inbox
+
+# 查看昨天的日志
+viking://resources/logs/{calendar:yesterday}/app.log
+# 渲染为：viking://resources/logs/2026/05/06/app.log
+
+# 预上传明天的任务
+viking://resources/tasks/{calendar:tomorrow}/todo.md
+# 渲染为：viking://resources/tasks/2026/05/08/todo.md
+
+# 月度日志
+viking://resources/logs/{calendar:year}/{calendar:month}/app.log
+# 渲染为：viking://resources/logs/2026/05/app.log
+
+# 每日快照
+viking://resources/snapshots/{calendar:today}/
+# 渲染为：viking://resources/snapshots/2026/05/07/
+```
+
+### 解析过程
+
+路径变量在 API 执行时**服务器端**进行解析。CLI/SDK 原样传递 URI 模板，服务器根据当前上下文（时间、认证用户等）渲染为具体路径。
+
+### CLI 使用
+
+```bash
+# 添加今天的邮件 --parent-auto-create 可以简写为 -p
+ov add-resource --parent-auto-create "viking://resources/emails/{calendar:today}/inbox" ./emails/*.eml
+
+# 读取昨天的日志
+ov read "viking://resources/logs/{calendar:yesterday}/app.log"
+
+# 准备明天的任务
+ov write "viking://resources/tasks/{calendar:tomorrow}/todo.md" --content "规划一天"
+
+# 上传月度报告 --parent-auto-create 可以简写为 -p
+ov add-resource --parent-auto-create "viking://resources/reports/{calendar:ym}" ./report.pdf
+```
+
+## 目录结构
+
+```
+viking://
+├── resources/                    # 独立资源（客观知识，禁止存储非知识类配置）
+│   └── {project}/
+│       ├── .abstract.md          # 摘要
+│       ├── .overview.md          # 概述
+│       └── {files...}
+│
+├── agent/                        # agent 能力与配置（全局共享，account 粒度）
+│   ├── skills/                   # 技能定义
+│   ├── endpoints/                # 通信端点（a2a, anp 等）（规划中）
+│   ├── tools/                    # 工具配置（mcp 等）（规划中）
+│   └── payments/               # 支付配置（ap2 等）（规划中）
+│
+├── user/{user_id}/
+│   ├── profile.md                # 用户基本信息
+│   ├── memories/
+│   │   ├── preferences/          # 按主题
+│   │   ├── entities/             # 每条独立
+│   │   └── events/               # 每条独立
+│   ├── resources/
+│   │   └── {project}/
+│   ├── skills/                   # 用户技能（与 viking://agent/skills/ 兼容）
+│   └── peers/{peer_id}/
+│       ├── memories/
+│       └── resources/
+│
+└── user/{user_id}/sessions/{session_id}/
+    ├── messages.jsonl
+    ├── tools/
+    └── history/
+```
+
+`viking://agent/...` 是 account 内公共目录，不包含 Agent ID 身份层。
+`actor_peer_id` 只过滤当前用户的 `peers` 集合，公共目录仍按账号隔离。
+
+## URI 操作
+
+### 解析
+
+```python
+from openviking_cli.utils.uri import VikingURI
+
+uri = VikingURI("viking://resources/docs/api")
+print(uri.scope)      # "resources"
+print(uri.full_path)  # "resources/docs/api"
+```
+
+### 构建
+
+```python
+# 拼接路径
+base = "viking://resources/docs/"
+full = VikingURI(base).join("api.md").uri  # viking://resources/docs/api.md
+
+# 父目录
+uri = "viking://resources/docs/api.md"
+parent = VikingURI(uri).parent.uri  # viking://resources/docs
+```
+
+## API 使用
+
+### 指定作用域搜索
+
+```python
+# 仅在资源中搜索
+results = client.find(
+    query="认证",
+    target_uri="viking://resources/",
+)
+
+# 仅在自己的资源中搜索
+results = client.find(
+    query="私有项目笔记",
+    target_uri="viking://~/resources/"
+)
+
+# 仅在自己的记忆中搜索
+results = client.find(
+    query="编码偏好",
+    target_uri="viking://~/memories/"
+)
+
+# 仅在自己的技能中搜索
+results = client.find(
+    query="网络搜索",
+    target_uri="viking://~/skills/"
+)
+```
+
+### 文件系统操作
+
+```python
+# 列出目录
+entries = await client.ls(uri="viking://resources/")
+
+# 读取文件
+content = await client.read(uri="viking://resources/docs/api.md")
+
+# 获取摘要
+abstract = await client.abstract(uri="viking://resources/docs/")
+
+# 获取概览
+overview = await client.overview(uri="viking://resources/docs/")
+```
+
+## 特殊文件
+
+每个目录可能包含特殊文件：
+
+| 文件 | 用途 |
+|------|------|
+| `.abstract.md` | L0 摘要（~100 tokens） |
+| `.overview.md` | L1 概览（~2k tokens） |
+| `` | 相关资源 |
+| `.meta.json` | 元数据 |
+
+## 最佳实践
+
+### 目录使用尾部斜杠
+
+```python
+# 目录
+"viking://resources/docs/"
+
+# 文件
+"viking://resources/docs/api.md"
+```
+
+### 作用域特定操作
+
+```python
+# 添加到 account 共享资源作用域
+await client.add_resource(url, to="viking://resources/project/")
+
+# 添加到自己的私有资源根
+await client.add_resource(path, parent="viking://~/resources/project/")
+
+# 技能默认添加到自己的技能根
+await client.add_skill(skill)  # 默认根目录：viking://~/skills/
+
+# 通过 -p 指定写入全局 agent 技能根（公开共享）
+ov skills add xxx -p viking://agent/skills/
+```
+
+### resources 作用域约束
+
+`resources` 作用域仅用于存储客观知识类数据（文档、代码、规范、论文等）。
+禁止在 `viking://resources/` 下存储非知识类数据，包括但不限于：
+工具配置、通信端点定义、支付配置、技能定义等。
+此类数据应使用 `viking://agent/` 作用域。
+
+## 相关文档
+
+- [架构概述](./01-architecture.md) - 系统整体架构
+- [上下文类型](./02-context-types.md) - 三种上下文类型
+- [上下文层级](./03-context-layers.md) - L0/L1/L2 模型
+- [存储架构](./05-storage.md) - VikingFS 和 AGFS
+- [会话管理](./08-session.md) - 会话存储结构

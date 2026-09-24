@@ -1,0 +1,51 @@
+// Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+// SPDX-License-Identifier: AGPL-3.0
+#pragma once
+
+#include <string>
+#include <vector>
+#include <memory>
+#include <optional>
+
+#include "index/common_structs.h"
+#include "index/index_manager.h"
+
+namespace vectordb {
+
+class IndexEngine {
+ public:
+  IndexEngine(const std::string& path_or_json);
+
+  bool is_valid() const {
+    return impl_ != nullptr;
+  }
+  int add_data(const std::vector<AddDataRequest>& data_list);
+
+  int delete_data(const std::vector<DeleteDataRequest>& data_list);
+
+  int rebuild_scalar_index(
+      const std::string& scalar_index_json,
+      const std::function<bool(std::vector<AddDataRequest>&)>& read_batch);
+
+  SearchResult search(const SearchRequest& req);
+
+  std::optional<SearchResult> search_with_filter_token(
+      const SearchRequest& req, uint64_t filter_token);
+
+  int set_filter_layout(const std::vector<uint64_t>& ordered_labels);
+
+  FilterResult evaluate_filter(const std::string& dsl,
+                               uint64_t max_cached_candidates = 0);
+
+  FilterResult evaluate_filter_for_routing(const std::string& dsl,
+                                           uint64_t native_threshold);
+
+  int64_t dump(const std::string& dir);
+
+  StateResult get_state();
+
+ private:
+  std::shared_ptr<IndexManager> impl_ = nullptr;
+};
+
+}  // namespace vectordb

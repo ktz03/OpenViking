@@ -1,0 +1,583 @@
+# OVPack 导入导出
+
+OVPack 是 OpenViking 的可恢复内容包格式，用来迁移或备份 `viking://` 下的公开内容树。
+它保存文件内容、语义侧边文件、可迁移的索引标量，以及可选的 dense 向量快照。
+
+OVPack 不是裸 ZIP 拷贝，也不是可信发布格式。导入会校验 manifest、文件列表、目录列表和
+checksum，保证包内容没有偏离 manifest；如果攻击者能同时篡改文件和 manifest，仍需要依赖
+外部签名、传输安全和访问控制。
+
+存储加密不会加密导出的备份包。导出会经过透明解密层读取文件，再把明文内容写入普通 ZIP 归档。应独立保护 `.ovpack` 文件的存储和传输；拿到归档即可读取内容，无需源存储的密钥。
+
+## 支持范围
+
+普通 `export/import` 处理一个包根：
+
+- `viking://resources/...`
+- `viking://user/...`
+
+全量迁移使用单独的 `backup/restore`，它会把公开 scope root 一起打进备份包：
+
+- `viking://resources`
+- 当前账号下所有 `viking://user/{user_id}` 内容
+
+`backup/restore` 仅允许 ROOT 或 ADMIN 调用，并以账号为边界访问所有用户内容。备份包不包含
+用户账号、API Key 或其他鉴权数据。
+
+Session 通过 user 命名空间一起迁移，路径为
+`viking://user/{user_id}/sessions/{session_id}`。`viking://session/...`
+别名不属于 OVPack v3 的导入/导出 scope。
+
+`temp`、`queue`、`upload`、锁文件、watch control 文件、`.relations.json` 等内部或运行态数据
+不属于 OVPack 迁移范围。
+
+## 与多写存储配合
+
+多写存储只复制启用之后的新写入，不会自动同步启用之前已经存在的历史文件。如需同时为 primary 和副本写入存量，应在**空目标环境恢复之前**启用多写：
+
+1. 暂停业务写入，按源 account 分别导出或备份。
+2. 配置目标 primary、backup backend 及其写策略，启动目标服务并创建恢复身份。
+3. 通过该服务恢复或导入，使存量内容经过已配置的多写分发。
+4. 对每个恢复的 scope 检查同步状态，并在切流前验证各副本中的文件。恢复返回时，异步复制仍可能未完成。
+5. 验证内容和索引完整性后再恢复业务写入；验证完成前保留源数据和备份。
+
+例如，使用目标 account 的 admin key 检查：
+
+```bash
+ov system backend sync-status viking://resources
+ov system backend sync-status viking://user
+```
+
+先恢复再启用 backups 只会复制后续写入，不能把历史内容补到副本。
+
+更多说明见 [多写存储指南](./13-multi-write-storage.md)。
+
+## 快速开始
+
+### 导出和导入资源目录
+
+```bash
+ov export viking://resources/my-project ./exports/my-project.ovpack
+ov import ./exports/my-project.ovpack viking://resources/imported/
+```
+
+导入参数是目标父目录，不是最终 root。假设包根名是 `my-project`，上面的导入结果是：
+
+```text
+viking://resources/imported/my-project
+```
+
+覆盖已有 root：
+
+```bash
+ov import ./exports/my-project.ovpack viking://resources/imported/ --on-conflict overwrite
+```
+
+### 导出向量快照
+
+默认导出不保存 dense 向量，导入后由目标环境重新向量化：
+
+```bash
+ov export viking://resources/my-project ./exports/my-project.ovpack
+ov import ./exports/my-project.ovpack viking://resources/imported/
+```
+
+如果确认导出环境和导入环境使用同一 embedding 配置，可以显式导出 dense 向量快照：
+
+```bash
+ov export viking://resources/my-project ./exports/my-project.ovpack --include-vectors
+ov import ./exports/my-project.ovpack viking://resources/imported/ --vector-mode auto
+```
+
+`--vector-mode` 控制导入时如何处理包内向量：
+
+| 值 | 行为 |
+| --- | --- |
+| `auto` | 默认值。若包内有 dense 快照且 embedding 元数据兼容，则直接恢复；否则重新向量化。 |
+| `recompute` | 忽略包内 dense 快照，始终重新向量化。 |
+| `require` | 必须恢复兼容 dense 快照；没有快照、快照不完整、模型或维度不兼容都会报错。 |
+
+兼容性校验会比较包内记录的 embedding provider、model、input、query/document 参数和维度。
+当前 OVPack 向量快照只支持纯 dense 索引；如果底层向量索引的 `VectorIndex.IndexType` 是 hybrid，`--include-vectors` 会直接拒绝导出。导入到 hybrid index 环境时，`auto` 会重新向量化，`require` 会报错。
+
+导出 dense 向量快照前，OpenViking 会先做数据一致性检查。也就是检查导出范围内按系统规则
+应该进入向量索引的内容，是否已经有对应索引记录。缺失时会拒绝导出，避免生成不完整的
+迁移包。
+
+可以单独调用一致性检查来调试当前数据状态：
+
+```bash
+ov system consistency viking://resources/my-project
+```
+
+接口只返回摘要和最多 20 条缺失记录，不返回完整 expected 列表。`--include-vectors`
+导出失败时，错误 details 只携带 1 条缺失 key，避免错误日志过大。
+
+Python SDK：
+
+```python
+report = await client.check_consistency(uri="viking://resources/my-project")
+print(report["ok"], report["missing_records"])
+```
+
+Go SDK：
+
+```go
+report, err := client.CheckConsistency(ctx, "viking://resources/my-project")
+if err != nil {
+    return err
+}
+fmt.Println(report["ok"], report["missing_records"])
+```
+
+HTTP API：
+
+```bash
+curl -X POST http://localhost:1933/api/v1/system/consistency \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-admin-key" \
+  -d '{"uri":"viking://resources/my-project"}'
+```
+
+### 全量备份和恢复
+
+全量迁移不要用 `export viking://`；使用专门的备份包：
+
+```bash
+ov backup ./backups/openviking.ovpack
+ov restore ./backups/openviking.ovpack --on-conflict overwrite
+```
+
+备份包只能通过 `restore` 恢复，不能通过普通 `import` 导入到任意父目录。
+
+备份是在线逐文件读取，不是同一时刻的原子快照。备份期间仍在变化的内容可能来自不同时间点；
+需要严格一致性时，应由使用方在备份窗口暂停写入。
+
+API Key 模式下，新目标必须在恢复**之前**具备 account 和管理员身份。root key 可以创建这个身份，但不能调用租户级 pack API。先将 `OPENVIKING_ROOT_API_KEY` 设置为目标 root key，再调用目标服务创建 account，并选择一个不在备份包中的用户 ID 作为恢复操作用户：
+
+```bash
+curl -f -X POST http://localhost:1933/api/v1/admin/accounts \
+  -H "X-API-Key: $OPENVIKING_ROOT_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"account_id": "acme", "admin_user_id": "restore-operator"}'
+```
+
+把返回的 `user_key` 作为 `api_key` 写入专用的目标客户端配置，例如 `restore.ovcli.conf`：
+
+```json
+{
+  "url": "http://localhost:1933",
+  "api_key": "<target-admin-user-key>"
+}
+```
+
+创建 account 已会生成 scope 目录。因此，即使新 account 还没有业务数据，`fail` 也会拒绝恢复；使用不同的恢复操作用户不能避开这个 scope 级检查。确认目标**只有新建 account 的预置内容**后，再使用 `overwrite`：
+
+```bash
+OPENVIKING_CLI_CONFIG_FILE=./restore.ovcli.conf \
+  ov restore ./backups/openviking.ovpack --on-conflict overwrite
+```
+
+如果目标 account 已存在，使用它的 admin key，不要重复创建。如果其中已有业务数据，不要直接照抄这条恢复命令：先暂停写入、备份目标，并比对包内路径和目标内容，明确允许覆盖的内容，或使用独立的干净目标。`overwrite` 会替换同路径内容；文件与目录的类型冲突可能删除已有子树。`fail` 检查 scope 根是否存在，不是逐文件冲突预检；`skip` 在 scope 已存在时跳过整次恢复。每次备份/恢复均以 account 为边界；其他 account 需要使用对应身份分别处理。
+
+恢复内容后，再按备份中的相同 `user_id` 注册其余用户。用户目录已存在不代表用户账号已创建。目标会生成新 API Key，不会恢复源 key；切换客户端前，应使用各目标用户的 key 验证读取。
+
+## Python SDK
+
+```python
+from openviking_sdk import AsyncHTTPClient
+
+
+async def migrate_project():
+    client = AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+    await client.initialize()
+    try:
+        await client.export_ovpack(
+            uri="viking://resources/my-project",
+            to="./exports/my-project.ovpack",
+            include_vectors=False,
+        )
+
+        imported_uri = await client.import_ovpack(
+            file_path="./exports/my-project.ovpack",
+            parent="viking://resources/imported/",
+            on_conflict="overwrite",
+            vector_mode="auto",
+        )
+        print(imported_uri)
+        await client.wait_processed()
+    finally:
+        await client.close()
+```
+
+全量备份：
+
+```python
+await client.backup_ovpack(
+    to="./backups/openviking.ovpack",
+    include_vectors=True,
+)
+await client.restore_ovpack(
+    file_path="./backups/openviking.ovpack",
+    on_conflict="overwrite",
+    vector_mode="auto",
+)
+```
+
+## Go SDK
+
+```go
+outPath, err := client.ExportOVPack(
+    ctx,
+    "viking://resources/my-project",
+    "./exports/my-project.ovpack",
+    &openviking.PackOptions{IncludeVectors: false},
+)
+if err != nil {
+    return err
+}
+
+importedURI, err := client.ImportOVPack(
+    ctx,
+    outPath,
+    "viking://resources/imported/",
+    &openviking.ImportPackOptions{
+        OnConflict: "overwrite",
+        VectorMode: "auto",
+    },
+)
+if err != nil {
+    return err
+}
+fmt.Println(importedURI)
+```
+
+全量备份：
+
+```go
+backupPath, err := client.BackupOVPack(
+    ctx,
+    "./backups/openviking.ovpack",
+    &openviking.PackOptions{IncludeVectors: true},
+)
+if err != nil {
+    return err
+}
+
+restoredURI, err := client.RestoreOVPack(
+    ctx,
+    backupPath,
+    &openviking.ImportPackOptions{
+        OnConflict: "overwrite",
+        VectorMode: "auto",
+    },
+)
+if err != nil {
+    return err
+}
+fmt.Println(restoredURI)
+```
+
+## HTTP API
+
+HTTP 导出接口直接返回文件流；HTTP 导入和恢复必须先上传本地 `.ovpack`，再用
+`temp_file_id` 调用 pack 接口。
+
+导出：
+
+```bash
+curl -X POST http://localhost:1933/api/v1/pack/export \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-admin-key" \
+  -d '{"uri":"viking://resources/my-project","include_vectors":false}' \
+  --output my-project.ovpack
+```
+
+导入：
+
+```bash
+TEMP_FILE_ID=$(
+  curl -sS -X POST http://localhost:1933/api/v1/resources/temp_upload \
+    -H "X-API-Key: your-admin-key" \
+    -F "file=@./exports/my-project.ovpack" \
+  | jq -r ".result.temp_file_id"
+)
+
+curl -X POST http://localhost:1933/api/v1/pack/import \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-admin-key" \
+  -d "{
+    \"temp_file_id\": \"$TEMP_FILE_ID\",
+    \"parent\": \"viking://resources/imported/\",
+    \"on_conflict\": \"overwrite\",
+    \"vector_mode\": \"auto\"
+  }"
+```
+
+全量备份：
+
+```bash
+curl -X POST http://localhost:1933/api/v1/pack/backup \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-admin-key" \
+  -d '{"include_vectors":true}' \
+  --output openviking-backup.ovpack
+```
+
+## 冲突策略
+
+`on_conflict` 只在导入 root 已存在时生效。
+
+| 值 | 行为 |
+| --- | --- |
+| `fail` | 默认值。目标 root 已存在时返回 `409 CONFLICT`。 |
+| `overwrite` | 删除已有 root，再写入包内容和重建索引。 |
+| `skip` | 目标 root 已存在时直接返回该 URI，不写入任何包内容。 |
+
+`skip` 是 root 级跳过，不是文件级补齐导入。
+
+文件和目录类型冲突是合并覆盖的例外：如果包内文件替换目标目录（或反向替换），恢复会先删除冲突目标；该目录已有的后代也会被删除。
+
+上表描述普通 `import`。全量 `restore` 的 `overwrite` 使用合并覆盖：包内不存在的目标路径会
+创建，同路径内容会覆盖，目标环境中仅有而备份中没有的路径会保留。恢复不会删除整个
+`viking://resources` 或 `viking://user`，也不会创建或写入 `viking://user` 聚合目录本身。
+向量只恢复或重建包内新增、覆盖的内容，目标环境独有内容的向量保持不变。
+
+无论使用哪种冲突策略，都会先完整校验 manifest、文件、checksum 和向量元数据。损坏的包
+即使使用 `skip` 也会报错，不会返回成功。
+
+## 包结构
+
+OVPack v3 是标准 ZIP。ZIP 内部有一个包根目录：
+
+```text
+my-project/
+my-project/files/
+my-project/files/notes.txt
+my-project/files/.abstract.md
+my-project/files/.overview.md
+my-project/_ovpack/
+my-project/_ovpack/index_records.jsonl
+my-project/_ovpack/dense.f32                # 仅 --include-vectors 且存在可导出向量时出现
+my-project/_ovpack/manifest.json
+```
+
+`files/` 下保存用户内容，路径与 OpenViking 中的相对路径完全一致，不再对点文件做 `_._` 转义。
+`_ovpack/` 下保存 OVPack 内部文件，不参与用户内容导入。
+
+manifest 只保存包结构、文件 checksum 和内部索引文件的 checksum，不直接内嵌每个文件的索引记录：
+
+```json
+{
+  "kind": "openviking.ovpack",
+  "format_version": 3,
+  "root": {
+    "name": "my-project",
+    "uri": "viking://resources/my-project",
+    "scope": "resources"
+  },
+  "entries": [
+    {"path": "", "kind": "directory"},
+    {
+      "path": "notes.txt",
+      "kind": "file",
+      "size": 5,
+      "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    }
+  ],
+  "content_sha256": "b2a6e9582119c7510d68e3446de3e71a486934bf450d68f65596259ed1cf7997",
+  "index": {
+    "records": {
+      "path": "_ovpack/index_records.jsonl",
+      "count": 2,
+      "sha256": "..."
+    },
+    "dense": {
+      "path": "_ovpack/dense.f32",
+      "count": 1,
+      "dtype": "float32",
+      "byte_order": "little",
+      "dimensions": 1024,
+      "sha256": "...",
+      "embedding": {
+        "provider": "volcengine",
+        "model": "doubao-embedding-vision-251215",
+        "input": "multimodal",
+        "dimensions": 1024
+      }
+    }
+  }
+}
+```
+
+`entries[].path == ""` 表示包根目录本身。多层目录使用相对路径，例如：
+
+```json
+[
+  {"path": "", "kind": "directory"},
+  {"path": "docs", "kind": "directory"},
+  {"path": "docs/a.md", "kind": "file", "size": 12, "sha256": "..."}
+]
+```
+
+`index_records.jsonl` 一行一条索引记录，覆盖文件、目录、根目录：
+
+```jsonl
+{"record_id":"r000001","path":"","kind":"directory","level":0,"text":"root abstract","scalars":{"abstract":"root abstract","context_type":"resource","level":0}}
+{"record_id":"r000002","path":"notes.txt","kind":"file","level":2,"scalars":{"abstract":"note summary","tags":"demo"},"vector":{"dense":{"offset":0,"dimensions":1024}}}
+```
+
+`dense.f32` 是连续 little-endian float32 数组。`index_records.jsonl` 中的 `vector.dense.offset`
+是 float 数组偏移，不是字节偏移。示例中 `offset=0, dimensions=1024` 表示从第 0 个 float
+开始读取 1024 个 float。
+
+## 索引字段
+
+默认会导出可迁移的索引标量：
+
+```text
+type, context_type, level, name, description, tags, abstract
+```
+
+这些字段不会从包里直接恢复，而是在目标环境重新生成：
+
+```text
+id, uri, account_id, owner_user_id, owner_space,
+created_at, updated_at, active_count
+```
+
+用户归属从 `viking://user/{user_id}` 路径重建；用户账号和 API Key 不属于 OVPack 内容。
+
+如果使用 `--include-vectors`，会额外导出纯 dense 向量和 embedding 元数据。导入时即使恢复
+dense 快照，也会按目标 URI、目标账号和当前时间重建运行态字段。hybrid index 当前不支持
+向量快照导出。
+
+## 导入校验
+
+导入会先完整校验，再写入目标环境。核心校验包括：
+
+1. ZIP 成员必须都在同一个包根下，不能包含绝对路径、反斜杠、盘符或 `..`。
+2. 必须存在 `<root>/_ovpack/manifest.json`。
+3. `kind` 必须是 `openviking.ovpack`，`format_version` 必须等于当前支持版本。
+4. `root.name` 必须和 ZIP 根目录一致，`root.uri` 的末段也必须和 `root.name` 一致。
+5. manifest 声明的文件集合、目录集合必须和 ZIP 内容一致，不能缺失也不能混入额外内容。
+6. 每个文件的 `size` 和 `sha256` 必须匹配实际内容。
+7. `content_sha256` 必须匹配按路径排序后的文件清单。
+8. `_ovpack/index_records.jsonl` 和可选 `_ovpack/dense.f32` 必须匹配 manifest 中的 hash、数量和维度。
+9. source scope 和 target scope 必须一致；`user` 这类结构化 scope 还要求 root 层级一致。
+10. 校验通过前不会写入包内容；冲突策略也在写入前处理。
+
+典型拒绝示例：
+
+```text
+INVALID_ARGUMENT: Missing ovpack manifest
+INVALID_ARGUMENT: ovpack file sha256 does not match manifest
+INVALID_ARGUMENT: ovpack entries do not match manifest
+INVALID_ARGUMENT: ovpack source scope does not match target scope
+INVALID_ARGUMENT: ovpack package does not contain a dense vector snapshot
+```
+
+## 导入路径规则
+
+普通子树包导入到同 scope 的父目录，并保留包根：
+
+```bash
+ov export viking://resources/a ./exports/a.ovpack
+ov import ./exports/a.ovpack viking://resources/imported/
+```
+
+结果：
+
+```text
+viking://resources/imported/a
+```
+
+顶级 scope 包只能导入到 `viking://`：
+
+```bash
+ov export viking://resources ./exports/resources.ovpack
+ov import ./exports/resources.ovpack viking:// --on-conflict overwrite
+```
+
+以下导入会被拒绝：
+
+```bash
+# resources 包不能导入 user
+ov import ./exports/a.ovpack viking://user/alice/
+
+# user session 子树不能导入 resources
+ov import ./exports/sess_123.ovpack viking://resources/
+
+# session 子树不能把自身路径当父目录，否则会变成 sessions/sess_123/sess_123
+ov import ./exports/sess_123.ovpack viking://user/alice/sessions/sess_123/
+```
+
+## 记忆和 Session
+
+记忆目录有固定结构。导入时把包导入到对应目录的父目录，避免产生重复路径。
+
+用户记忆：
+
+```bash
+ov export viking://user/default/memories ./exports/user-memories.ovpack
+ov import ./exports/user-memories.ovpack viking://user/default/ --on-conflict overwrite
+```
+
+Session 数据：
+
+```bash
+ov export viking://user/alice/sessions/sess_123 ./exports/sess_123.ovpack
+ov import ./exports/sess_123.ovpack viking://user/alice/sessions/ --on-conflict overwrite
+```
+
+Session 只恢复文件状态，不触发向量化。
+
+结果：
+
+```text
+viking://user/alice/sessions/sess_123
+```
+
+## 旧包和未来版本
+
+当前实现只接受 OVPack v3。旧版无 manifest 包没有文件集合、目录集合和 checksum 信息，无法判断
+是否被删改或混入内容，因此默认拒绝。需要迁移旧包时，应先在可信旧环境中导入，再用当前版本
+重新导出为 OVPack v3。
+
+OVPack v2 包也会被当前 OpenViking 拒绝。导入旧包前，需要先用当前版本服务重新导出。
+
+未来版本包也不会静默兼容。处理方式是升级 OpenViking，或在支持该版本的环境中重新导出为当前
+支持格式。
+
+## 常见错误
+
+| 错误 | 常见原因 | 处理方式 |
+| --- | --- | --- |
+| `Missing ovpack manifest` | 旧版无 manifest 包 | 在可信环境重新导出为 v3。 |
+| `Unsupported ovpack format_version` | 包格式版本不是当前支持版本 | 升级 OpenViking 或重新导出。 |
+| `sha256 does not match manifest` | 文件或内部索引内容被改动 | 丢弃该包，或从可信源重新导出。 |
+| `ovpack entries do not match manifest` | ZIP 中缺文件/目录，或混入额外文件/目录 | 丢弃该包，或重新导出。 |
+| `source scope does not match target scope` | 跨 scope 导入，例如 user 导入 resources | 导入到同 scope 的父目录。 |
+| `source path is incompatible with target path` | 结构化 scope 的 root 层级会改变 | 导入到正确系统父目录。 |
+| `Top-level scope ovpack packages must be imported to viking://` | 将顶级 scope 包导入了非根父目录 | 改为导入 `viking://`。 |
+| `Backup ovpack packages must be restored` | 用普通 import 导入 backup 包 | 使用 `ov restore`。 |
+| `Resource already exists` | 目标 root 已存在 | 使用 `--on-conflict overwrite` 或 `--on-conflict skip`。 |
+| `incomplete OpenViking vector index snapshot` | 使用 `--include-vectors` 时，导出范围内应索引内容缺少索引记录 | 先执行 `ov system consistency <uri>` 定位问题，再等待处理完成或重新 reindex。 |
+| `dense vector snapshot is incompatible` | 包内 embedding 元数据和当前配置不一致 | 用 `--vector-mode recompute`，或换到兼容配置。 |
+
+## 常见问题
+
+**OVPack 可以手动解压查看吗？**
+
+可以。OVPack 是 ZIP 文件，可以用普通解压工具查看。不要手动修改后再导入，修改会破坏
+manifest 校验；如果同时修改 manifest 和内容，则需要依赖外部签名和可信来源判断。
+
+**为什么不默认导出向量？**
+
+向量只在 embedding 模型、输入模式、参数和维度完全兼容时才可直接复用。默认重新向量化更稳；
+需要冷迁移加速时，再显式使用 `--include-vectors` 和 `--vector-mode auto/require`。
+
+**大包导入很慢怎么办？**
+
+默认导入会重建目标环境的语义和向量。大包迁移可以使用 `--include-vectors` 减少重算，或按目录
+拆成多个 OVPack 分批导入。

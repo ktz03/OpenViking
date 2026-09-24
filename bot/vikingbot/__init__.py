@@ -1,0 +1,32 @@
+"""
+vikingbot - A lightweight AI agent framework
+"""
+
+import warnings
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
+
+try:
+    __version__ = _pkg_version("openviking")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
+
+__logo__ = "🐈"
+
+# Suppress RequestsDependencyWarning from requests module
+# This is safe - urllib3 2.x and chardet 7.x actually work fine with requests 2.32.5
+
+# First, add a filter that works even if requests isn't imported yet
+warnings.filterwarnings(
+    "ignore",
+    message="urllib3 (.*) or chardet (.*)/charset_normalizer (.*) doesn't match a supported version!",
+    module="requests",
+)
+
+# Then try to add a more precise filter using the actual warning class
+try:
+    from requests.exceptions import RequestsDependencyWarning
+
+    warnings.filterwarnings("ignore", category=RequestsDependencyWarning, module="requests")
+except ImportError:
+    pass

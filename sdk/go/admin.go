@@ -1,0 +1,233 @@
+package openviking
+
+import (
+	"context"
+	"net/http"
+	"net/url"
+)
+
+// AdminCreateAccount creates an account with its first admin user.
+func (c *Client) AdminCreateAccount(ctx context.Context, accountID, adminUserID string) (map[string]any, error) {
+	return c.AdminCreateAccountWithOptions(ctx, accountID, adminUserID, nil)
+}
+
+// AdminCreateAccountWithOptions creates an account with its first admin user.
+func (c *Client) AdminCreateAccountWithOptions(ctx context.Context, accountID, adminUserID string, opts *AdminCreateAccountOptions) (map[string]any, error) {
+	payload := map[string]any{
+		"account_id":    accountID,
+		"admin_user_id": adminUserID,
+	}
+	if opts != nil && opts.UserConfig != nil {
+		payload["user_config"] = opts.UserConfig
+	}
+	if opts != nil && opts.Seed != nil {
+		payload["seed"] = *opts.Seed
+	}
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/admin/accounts", nil, payload, &result)
+	return result, err
+}
+
+// AdminListAccounts lists accounts.
+func (c *Client) AdminListAccounts(ctx context.Context) ([]any, error) {
+	return c.AdminListAccountsWithOptions(ctx, nil)
+}
+
+// AdminListAccountsWithOptions lists accounts (in creation order), optionally
+// filtering by a wildcard name pattern and paging via Limit/Page.
+func (c *Client) AdminListAccountsWithOptions(ctx context.Context, opts *AdminListAccountsOptions) ([]any, error) {
+	query := url.Values{}
+	if opts != nil {
+		setQueryString(query, "name", opts.Name)
+		if opts.Limit != nil {
+			queryInt(query, "limit", *opts.Limit)
+			page := 1
+			if opts.Page != nil {
+				page = *opts.Page
+			}
+			queryInt(query, "page", page)
+		}
+	}
+	var result []any
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/admin/accounts", query, nil, &result)
+	return result, err
+}
+
+// AdminDeleteAccount deletes an account and all associated users.
+func (c *Client) AdminDeleteAccount(ctx context.Context, accountID string) (map[string]any, error) {
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodDelete, "/api/v1/admin/accounts/"+url.PathEscape(accountID), nil, nil, &result)
+	return result, err
+}
+
+// AdminRegisterUser registers a user in an account.
+func (c *Client) AdminRegisterUser(ctx context.Context, accountID, userID, role string) (map[string]any, error) {
+	return c.AdminRegisterUserWithOptions(ctx, accountID, userID, role, nil)
+}
+
+// AdminRegisterUserWithOptions registers a user in an account.
+func (c *Client) AdminRegisterUserWithOptions(ctx context.Context, accountID, userID, role string, opts *AdminRegisterUserOptions) (map[string]any, error) {
+	if role == "" {
+		role = "user"
+	}
+	payload := map[string]any{
+		"user_id": userID,
+		"role":    role,
+	}
+	if opts != nil && opts.UserConfig != nil {
+		payload["user_config"] = opts.UserConfig
+	}
+	if opts != nil && opts.Seed != nil {
+		payload["seed"] = *opts.Seed
+	}
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/admin/accounts/"+url.PathEscape(accountID)+"/users", nil, payload, &result)
+	return result, err
+}
+
+// AdminListUsers lists users in an account.
+func (c *Client) AdminListUsers(ctx context.Context, accountID string) ([]any, error) {
+	return c.AdminListUsersWithOptions(ctx, accountID, nil)
+}
+
+// AdminListUsersWithOptions lists users in an account (in creation order),
+// optionally filtering by a wildcard name pattern, role, and paging via
+// Limit/Page.
+func (c *Client) AdminListUsersWithOptions(ctx context.Context, accountID string, opts *AdminListUsersOptions) ([]any, error) {
+	query := url.Values{}
+	if opts != nil {
+		if opts.Limit != nil {
+			queryInt(query, "limit", *opts.Limit)
+			page := 1
+			if opts.Page != nil {
+				page = *opts.Page
+			}
+			queryInt(query, "page", page)
+		}
+		setQueryString(query, "name", opts.Name)
+		setQueryString(query, "role", opts.Role)
+	}
+	var result []any
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/admin/accounts/"+url.PathEscape(accountID)+"/users", query, nil, &result)
+	return result, err
+}
+
+// AdminRemoveUser removes a user from an account.
+func (c *Client) AdminRemoveUser(ctx context.Context, accountID, userID string) (map[string]any, error) {
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodDelete, "/api/v1/admin/accounts/"+url.PathEscape(accountID)+"/users/"+url.PathEscape(userID), nil, nil, &result)
+	return result, err
+}
+
+// AdminSetRole changes a user's role.
+func (c *Client) AdminSetRole(ctx context.Context, accountID, userID, role string) (map[string]any, error) {
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodPut, "/api/v1/admin/accounts/"+url.PathEscape(accountID)+"/users/"+url.PathEscape(userID)+"/role", nil, map[string]any{
+		"role": role,
+	}, &result)
+	return result, err
+}
+
+// AdminRegenerateKey regenerates a user's API key.
+func (c *Client) AdminRegenerateKey(ctx context.Context, accountID, userID string) (map[string]any, error) {
+	return c.AdminRegenerateKeyWithOptions(ctx, accountID, userID, nil)
+}
+
+// AdminRegenerateKeyWithOptions regenerates a user's API key.
+func (c *Client) AdminRegenerateKeyWithOptions(ctx context.Context, accountID, userID string, opts *AdminRegenerateKeyOptions) (map[string]any, error) {
+	var payload map[string]any
+	if opts != nil && opts.Seed != nil {
+		payload = map[string]any{"seed": *opts.Seed}
+	}
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/admin/accounts/"+url.PathEscape(accountID)+"/users/"+url.PathEscape(userID)+"/key", nil, payload, &result)
+	return result, err
+}
+
+// AdminCreateGroup creates an empty account-scoped group.
+func (c *Client) AdminCreateGroup(ctx context.Context, accountID, groupID string) (map[string]any, error) {
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/admin/accounts/"+url.PathEscape(accountID)+"/groups", nil, map[string]any{"group_id": groupID}, &result)
+	return result, err
+}
+
+// AdminListGroups lists account-scoped groups.
+func (c *Client) AdminListGroups(ctx context.Context, accountID string) ([]any, error) {
+	var result []any
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/admin/accounts/"+url.PathEscape(accountID)+"/groups", nil, nil, &result)
+	return result, err
+}
+
+// AdminDeleteGroup deletes an empty group.
+func (c *Client) AdminDeleteGroup(ctx context.Context, accountID, groupID string) (map[string]any, error) {
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodDelete, "/api/v1/admin/accounts/"+url.PathEscape(accountID)+"/groups/"+url.PathEscape(groupID), nil, nil, &result)
+	return result, err
+}
+
+// AdminListGroupMembers lists a group's user IDs.
+func (c *Client) AdminListGroupMembers(ctx context.Context, accountID, groupID string) (map[string]any, error) {
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/admin/accounts/"+url.PathEscape(accountID)+"/groups/"+url.PathEscape(groupID)+"/members", nil, nil, &result)
+	return result, err
+}
+
+// AdminAddGroupMember adds an existing account user to a group.
+func (c *Client) AdminAddGroupMember(ctx context.Context, accountID, groupID, userID string) (map[string]any, error) {
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodPut, "/api/v1/admin/accounts/"+url.PathEscape(accountID)+"/groups/"+url.PathEscape(groupID)+"/members/"+url.PathEscape(userID), nil, nil, &result)
+	return result, err
+}
+
+// AdminRemoveGroupMember removes a user from a group.
+func (c *Client) AdminRemoveGroupMember(ctx context.Context, accountID, groupID, userID string) (map[string]any, error) {
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodDelete, "/api/v1/admin/accounts/"+url.PathEscape(accountID)+"/groups/"+url.PathEscape(groupID)+"/members/"+url.PathEscape(userID), nil, nil, &result)
+	return result, err
+}
+
+// AdminMigrate starts legacy data migration or cleanup.
+func (c *Client) AdminMigrate(ctx context.Context, opts *AdminMigrateOptions) (map[string]any, error) {
+	action := "migrate"
+	if opts != nil && opts.Cleanup {
+		action = "cleanup"
+	}
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/admin/migrate", nil, map[string]any{"action": action}, &result)
+	return result, err
+}
+
+// AdminGetAgentEvolution returns the effective Agent Evolution switch for the
+// caller's account.
+func (c *Client) AdminGetAgentEvolution(ctx context.Context) (map[string]any, error) {
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/admin/agent-evolution", nil, nil, &result)
+	return result, err
+}
+
+// AdminSetAgentEvolution persists and hot-reloads Agent Evolution for the
+// caller's account.
+func (c *Client) AdminSetAgentEvolution(ctx context.Context, enabled bool) (map[string]any, error) {
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodPut, "/api/v1/admin/agent-evolution", nil, map[string]any{"enabled": enabled}, &result)
+	return result, err
+}
+
+// AdminGetAccountSettings returns the effective and explicitly overridden
+// settings for one account.
+func (c *Client) AdminGetAccountSettings(ctx context.Context, accountID string) (map[string]any, error) {
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/admin/accounts/"+url.PathEscape(accountID)+"/settings", nil, nil, &result)
+	return result, err
+}
+
+// AdminSetAccountAgentEvolution updates the allowlisted, hot-reloadable Agent
+// Evolution setting for one account via PATCH.
+func (c *Client) AdminSetAccountAgentEvolution(ctx context.Context, accountID string, enabled bool) (map[string]any, error) {
+	payload := map[string]any{
+		"agent_evolution": map[string]any{"enabled": enabled},
+	}
+	var result map[string]any
+	err := c.doJSON(ctx, http.MethodPatch, "/api/v1/admin/accounts/"+url.PathEscape(accountID)+"/settings", nil, payload, &result)
+	return result, err
+}

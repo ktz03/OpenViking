@@ -1,0 +1,160 @@
+# Default values for openviking.
+
+replicaCount: 1
+
+image:
+  # Prefer ghcr.io. If it is hard to reach, use the mirror:
+  #   repository: openviking-cn-beijing.cr.volces.com/volcengine/openviking
+  repository: ghcr.io/volcengine/openviking
+  # Use Always for the default moving tag. Pin a version and set IfNotPresent if
+  # you want Kubernetes to reuse cached immutable images.
+  pullPolicy: Always
+  # Image tag to deploy. Defaults to the latest released OpenViking image.
+  # Set to "main" for the newest image from the main branch, a version such as
+  # "v0.3.17" for a pinned release, or "" to use latest.
+  tag: latest
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created.
+  create: false
+  # Annotations to add to the service account.
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template.
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+  # fsGroup: 1000
+
+securityContext: {}
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+service:
+  type: ClusterIP
+  port: 1933
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: openviking.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: openviking-tls
+  #    hosts:
+  #      - openviking.local
+
+resources:
+  limits:
+    cpu: "2"
+    memory: 4Gi
+  requests:
+    cpu: 500m
+    memory: 1Gi
+
+persistence:
+  enabled: true
+  # Storage class for the PVC. Leave empty for the default storage class.
+  storageClass: ""
+  accessMode: ReadWriteOnce
+  size: 20Gi
+  # Existing PVC name. If set, no new PVC is created.
+  existingClaim: ""
+  # Mount path inside the container for OpenViking persistent state. The official
+  # Docker image expects ov.conf, ovcli.conf, and workspace data under this path.
+  mountPath: /app/.openviking
+
+bot:
+  # The Docker image can start vikingbot with the API server. Keep it disabled
+  # for Kubernetes by default so the chart exposes only the OpenViking API port.
+  enabled: false
+
+# OpenViking server configuration (ov.conf).
+# This is rendered into a ConfigMap and mounted at
+# ${persistence.mountPath}/ov.conf.
+config:
+  storage:
+    # Defaults to <persistence.mountPath>/openviking_workspace when empty.
+    workspace: ""
+    vectordb:
+      name: context
+      backend: local
+      project: default
+    agfs:
+      backend: local
+      timeout: 10
+  log:
+    level: INFO
+    output: stdout
+  server:
+    host: "0.0.0.0"
+    port: 1933
+    workers: 1
+    # Required when host is 0.0.0.0. Prefer setting this via an environment
+    # variable placeholder plus extraEnv/Secret, e.g. ${OPENVIKING_ROOT_API_KEY}.
+    root_api_key: null
+    cors_origins:
+      - "*"
+  embedding:
+    dense:
+      api_base: "https://ark.cn-beijing.volces.com/api/v3"
+      api_key: ""
+      provider: "volcengine"
+      dimension: 1024
+      model: "doubao-embedding-vision-251215"
+      input: "multimodal"
+    max_concurrent: 10
+  vlm:
+    api_base: "https://ark.cn-beijing.volces.com/api/v3"
+    api_key: ""
+    provider: "volcengine"
+    model: "doubao-seed-2-0-lite-260428"
+    temperature: 0.0
+    max_retries: 2
+    thinking: false
+    max_concurrent: 100
+
+# Extra environment variables to set on the container.
+# Use this for secrets or overrides that should not be in the ConfigMap.
+extraEnv: []
+  # - name: OPENVIKING_ROOT_API_KEY
+  #   valueFrom:
+  #     secretKeyRef:
+  #       name: my-secret
+  #       key: root-api-key
+
+# Liveness and readiness probes.
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 30
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: http
+  initialDelaySeconds: 15
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

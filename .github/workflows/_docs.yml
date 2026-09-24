@@ -1,0 +1,49 @@
+name: 17. _Docs Build
+
+on:
+  workflow_call:
+
+jobs:
+  build:
+    name: Build Docs
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+
+      - name: Install docs dependencies
+        run: npm ci
+        working-directory: docs
+
+      - name: Test docs theme
+        run: npm run test:theme
+        working-directory: docs
+
+      - name: Check bilingual docs and examples
+        run: npm run check:docs
+        working-directory: docs
+
+      - name: Check API reference
+        run: npm run check:api
+        working-directory: docs
+
+      - name: Build docs
+        run: npm run docs:build
+        working-directory: docs
+        env:
+          DOCS_BASE: /
+
+      - name: Check built section links
+        run: python3 scripts/check-built-anchors.py
+        working-directory: docs
+        env:
+          DOCS_BASE: /

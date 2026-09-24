@@ -1,0 +1,1088 @@
+"""Configuration schema using Pydantic."""
+
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from openviking_cli.utils.config.vlm_config import VLMCredential
+
+
+class ChannelType(str, Enum):
+    """Channel type enumeration."""
+
+    WHATSAPP = "whatsapp"
+    TELEGRAM = "telegram"
+    DISCORD = "discord"
+    FEISHU = "feishu"
+    MOCHAT = "mochat"
+    DINGTALK = "dingtalk"
+    EMAIL = "email"
+    SLACK = "slack"
+    QQ = "qq"
+    OPENAPI = "openapi"
+    BOT_API = "bot_api"
+
+
+class SandboxBackend(str, Enum):
+    """Sandbox backend type enumeration."""
+
+    SRT = "srt"
+    DOCKER = "docker"
+    OPENSANDBOX = "opensandbox"
+    DIRECT = "direct"
+    AIOSANDBOX = "aiosandbox"
+
+
+class SandboxMode(str, Enum):
+    """Sandbox mode enumeration."""
+
+    PER_SESSION = "per-session"
+    SHARED = "shared"
+    PER_CHANNEL = "per-channel"
+
+
+class AgentMemoryMode(str, Enum):
+    """Agent memory mode enumeration."""
+
+    PER_SESSION = "per-session"
+    SHARED = "shared"
+    PER_CHANNEL = "per-channel"
+
+
+class BotMode(str, Enum):
+    """Bot running mode enumeration."""
+
+    NORMAL = "normal"
+    READONLY = "readonly"
+    DEBUG = "debug"
+
+
+class BaseChannelConfig(BaseModel):
+    """Base channel configuration."""
+
+    type: Any = ChannelType.TELEGRAM  # Default for backwards compatibility
+    enabled: bool = True
+    ov_tools_enable: bool = True
+    memory_peer: list[str] | None = None
+    memory_user: list[str] | None = None  # Deprecated alias for owner-user memory lookup.
+
+    def channel_id(self) -> str:
+        return "default"
+
+    def channel_key(self):
+        return f"{getattr(self.type, 'value', self.type)}__{self.channel_id()}"
+
+
+# ========== Channel helper configs ==========
+
+
+class MochatMentionConfig(BaseModel):
+    """Mochat mention behavior configuration."""
+
+    require_in_groups: bool = False
+
+
+class MochatGroupRule(BaseModel):
+    """Mochat per-group mention requirement."""
+
+    require_mention: bool = False
+
+
+class SlackDMConfig(BaseModel):
+    """Slack DM policy configuration."""
+
+    enabled: bool = True
+    policy: str = "open"  # "open" or "allowlist"
+    allow_from: list[str] = Field(default_factory=list)  # Allowed Slack user IDs
+
+
+# ========== Multi-channel support ==========
+
+
+class TelegramChannelConfig(BaseChannelConfig):
+    """Telegram channel configuration (multi-channel support)."""
+
+    type: ChannelType = ChannelType.TELEGRAM
+    token: str = ""
+    groq_api_key: str = Field(default="", description="Groq API key for voice transcription")
+    allow_from: list[str] = Field(default_factory=list)
+    proxy: str | None = None
+
+    def channel_id(self) -> str:
+        # Use the bot ID from token (before colon)
+        return self.token.split(":")[0] if ":" in self.token else self.token
+
+
+class FeishuChannelConfig(BaseChannelConfig):
+    """Feishu/Lark channel configuration (multi-channel support)."""
+
+    type: ChannelType = ChannelType.FEISHU
+    app_id: str = ""
+    bot_name: str = ""
+    app_secret: str = ""
+    encrypt_key: str = ""
+    verification_token: str = ""
+    domain: str = Field(
+        default="https://open.feishu.cn",
+        description="开放平台域名：飞书用 https://open.feishu.cn，Lark 国际版用 https://open.larksuite.com",
+    )
+    allow_from: list[str] = Field(default_factory=list)
+    allow_cmd_from: list[str] = Field(default_factory=list)  ## 允许执行命令的Feishu用户ID列表
+    thread_require_mention: bool = Field(
+        default=True,
+        description="群聊是否需要@才响应：默认True=普通群和话题群的所有消息都必须@才响应；False=普通群无需@，话题群仅首条消息无需@，非DEBUG模式下后续回复必须@",
+    )
+
+    def channel_id(self) -> str:
+        # Use app_id directly as the ID
+        return self.app_id
+
+    def channel_key(self):
+        return f"{self.type.value}__{self.channel_id()}"
+
+
+class DiscordChannelConfig(BaseChannelConfig):
+    """Discord channel configuration (multi-channel support)."""
+
+    type: ChannelType = ChannelType.DISCORD
+    token: str = ""
+    allow_from: list[str] = Field(default_factory=list)
+    gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
+    intents: int = 37377
+
+    def channel_id(self) -> str:
+        # Use first 20 chars of token as ID
+        return self.token[:20]
+
+
+class WhatsAppChannelConfig(BaseChannelConfig):
+    """WhatsApp channel configuration (multi-channel support)."""
+
+    type: ChannelType = ChannelType.WHATSAPP
+    bridge_url: str = "ws://localhost:3001"
+    bridge_token: str = ""
+    allow_from: list[str] = Field(default_factory=list)
+
+    def channel_id(self) -> str:
+        # WhatsApp typically only has one instance
+        return "whatsapp"
+
+
+class MochatChannelConfig(BaseChannelConfig):
+    """MoChat channel configuration (multi-channel support)."""
+
+    type: ChannelType = ChannelType.MOCHAT
+    base_url: str = "https://mochat.io"
+    socket_url: str = ""
+    socket_path: str = "/socket.io"
+    socket_disable_msgpack: bool = False
+    socket_reconnect_delay_ms: int = 1000
+    socket_max_reconnect_delay_ms: int = 10000
+    socket_connect_timeout_ms: int = 10000
+    refresh_interval_ms: int = 30000
+    watch_timeout_ms: int = 25000
+    watch_limit: int = 100
+    retry_delay_ms: int = 500
+    max_retry_attempts: int = 0
+    claw_token: str = ""
+    agent_user_id: str = ""
+    sessions: list[str] = Field(default_factory=list)
+    panels: list[str] = Field(default_factory=list)
+    allow_from: list[str] = Field(default_factory=list)
+    mention: MochatMentionConfig = Field(default_factory=MochatMentionConfig)
+    groups: dict[str, MochatGroupRule] = Field(default_factory=dict)
+    reply_delay_mode: str = "non-mention"
+    reply_delay_ms: int = 120000
+
+
+class DingTalkChannelConfig(BaseChannelConfig):
+    """DingTalk channel configuration (multi-channel support)."""
+
+    type: ChannelType = ChannelType.DINGTALK
+    client_id: str = ""
+    client_secret: str = ""
+    allow_from: list[str] = Field(default_factory=list)
+
+    def channel_id(self) -> str:
+        # Use client_id directly as the ID
+        return self.client_id
+
+
+class EmailChannelConfig(BaseChannelConfig):
+    """Email channel configuration (multi-channel support)."""
+
+    type: ChannelType = ChannelType.EMAIL
+    consent_granted: bool = False
+    imap_host: str = ""
+    imap_port: int = 993
+    imap_username: str = ""
+    imap_password: str = ""
+    imap_mailbox: str = "INBOX"
+    imap_use_ssl: bool = True
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_use_tls: bool = True
+    smtp_use_ssl: bool = False
+    from_address: str = ""
+    auto_reply_enabled: bool = True
+    poll_interval_seconds: int = 30
+    mark_seen: bool = True
+    max_body_chars: int = 12000
+    subject_prefix: str = "Re: "
+    allow_from: list[str] = Field(default_factory=list)
+
+    def channel_id(self) -> str:
+        # Use from_address directly as the ID
+        return self.from_address
+
+
+class SlackChannelConfig(BaseChannelConfig):
+    """Slack channel configuration (multi-channel support)."""
+
+    type: ChannelType = ChannelType.SLACK
+    mode: str = "socket"
+    webhook_path: str = "/slack/events"
+    bot_token: str = ""
+    app_token: str = ""
+    user_token_read_only: bool = True
+    group_policy: str = "mention"
+    group_allow_from: list[str] = Field(default_factory=list)
+    dm: SlackDMConfig = Field(default_factory=SlackDMConfig)
+
+    def channel_id(self) -> str:
+        # Use first 20 chars of bot_token as ID
+        return self.bot_token[:20] if self.bot_token else "slack"
+
+
+class QQChannelConfig(BaseChannelConfig):
+    """QQ channel configuration (multi-channel support)."""
+
+    type: ChannelType = ChannelType.QQ
+    app_id: str = ""
+    secret: str = ""
+    allow_from: list[str] = Field(default_factory=list)
+
+    def channel_id(self) -> str:
+        # Use app_id directly as the ID
+        return self.app_id
+
+
+class OpenAPIChannelConfig(BaseChannelConfig):
+    """OpenAPI channel configuration for HTTP-based chat API."""
+
+    type: ChannelType = ChannelType.OPENAPI
+    enabled: bool = True
+    allow_from: list[str] = Field(default_factory=list)
+    max_concurrent_requests: int = 100
+    _channel_id: str = "default"
+
+    def channel_id(self) -> str:
+        return self._channel_id
+
+
+class BotChannelConfig(BaseChannelConfig):
+    """Bot channel configuration for multi-channel support."""
+
+    type: ChannelType = ChannelType.BOT_API
+    enabled: bool = True
+    api_key: str = ""  # Empty disables privileged HTTP routes until configured
+    allow_from: list[str] = Field(default_factory=list)
+    max_concurrent_requests: int = 100
+    need_mention: bool = False
+    profile_user_list: list[str] = Field(default_factory=list)
+    memory_peer: list[str] | str | None = None
+    memory_user: list[str] | str | None = None  # Deprecated legacy owner-user memory lookup.
+    id: str = "default"  # Channel identifier for multi-channel support
+
+    def channel_id(self) -> str:
+        return self.id
+
+
+class ChannelsConfig(BaseModel):
+    """Configuration for chat channels - array of channel configs."""
+
+    channels: list[Any] = Field(default_factory=list)
+
+    def _parse_channel_config(self, config: dict[str, Any]) -> BaseChannelConfig:
+        """Parse a single channel config dict into the appropriate type."""
+        channel_type = config.get("type")
+
+        # Handle both snake_case and camelCase for feishu
+        if "appId" in config and "app_id" not in config:
+            config["app_id"] = config.pop("appId")
+        if "appSecret" in config and "app_secret" not in config:
+            config["app_secret"] = config.pop("appSecret")
+        if "encryptKey" in config and "encrypt_key" not in config:
+            config["encrypt_key"] = config.pop("encryptKey")
+        if "verificationToken" in config and "verification_token" not in config:
+            config["verification_token"] = config.pop("verificationToken")
+
+        # Handle camelCase for other fields
+        if "allowFrom" in config and "allow_from" not in config:
+            config["allow_from"] = config.pop("allowFrom")
+        if "bridgeUrl" in config and "bridge_url" not in config:
+            config["bridge_url"] = config.pop("bridgeUrl")
+        if "bridgeToken" in config and "bridge_token" not in config:
+            config["bridge_token"] = config.pop("bridgeToken")
+        if "clientId" in config and "client_id" not in config:
+            config["client_id"] = config.pop("clientId")
+        if "clientSecret" in config and "client_secret" not in config:
+            config["client_secret"] = config.pop("clientSecret")
+        if "consentGranted" in config and "consent_granted" not in config:
+            config["consent_granted"] = config.pop("consentGranted")
+        if "imapHost" in config and "imap_host" not in config:
+            config["imap_host"] = config.pop("imapHost")
+        if "imapPort" in config and "imap_port" not in config:
+            config["imap_port"] = config.pop("imapPort")
+        if "imapUsername" in config and "imap_username" not in config:
+            config["imap_username"] = config.pop("imapUsername")
+        if "imapPassword" in config and "imap_password" not in config:
+            config["imap_password"] = config.pop("imapPassword")
+        if "imapMailbox" in config and "imap_mailbox" not in config:
+            config["imap_mailbox"] = config.pop("imapMailbox")
+        if "imapUseSsl" in config and "imap_use_ssl" not in config:
+            config["imap_use_ssl"] = config.pop("imapUseSsl")
+        if "smtpHost" in config and "smtp_host" not in config:
+            config["smtp_host"] = config.pop("smtpHost")
+        if "smtpPort" in config and "smtp_port" not in config:
+            config["smtp_port"] = config.pop("smtpPort")
+        if "smtpUsername" in config and "smtp_username" not in config:
+            config["smtp_username"] = config.pop("smtpUsername")
+        if "smtpPassword" in config and "smtp_password" not in config:
+            config["smtp_password"] = config.pop("smtpPassword")
+        if "smtpUseTls" in config and "smtp_use_tls" not in config:
+            config["smtp_use_tls"] = config.pop("smtpUseTls")
+        if "smtpUseSsl" in config and "smtp_use_ssl" not in config:
+            config["smtp_use_ssl"] = config.pop("smtpUseSsl")
+        if "fromAddress" in config and "from_address" not in config:
+            config["from_address"] = config.pop("fromAddress")
+        if "autoReplyEnabled" in config and "auto_reply_enabled" not in config:
+            config["auto_reply_enabled"] = config.pop("autoReplyEnabled")
+        if "pollIntervalSeconds" in config and "poll_interval_seconds" not in config:
+            config["poll_interval_seconds"] = config.pop("pollIntervalSeconds")
+        if "markSeen" in config and "mark_seen" not in config:
+            config["mark_seen"] = config.pop("markSeen")
+        if "maxBodyChars" in config and "max_body_chars" not in config:
+            config["max_body_chars"] = config.pop("maxBodyChars")
+        if "subjectPrefix" in config and "subject_prefix" not in config:
+            config["subject_prefix"] = config.pop("subjectPrefix")
+        if "botToken" in config and "bot_token" not in config:
+            config["bot_token"] = config.pop("botToken")
+        if "appToken" in config and "app_token" not in config:
+            config["app_token"] = config.pop("appToken")
+        if "userTokenReadOnly" in config and "user_token_read_only" not in config:
+            config["user_token_read_only"] = config.pop("userTokenReadOnly")
+        if "groupPolicy" in config and "group_policy" not in config:
+            config["group_policy"] = config.pop("groupPolicy")
+        if "groupAllowFrom" in config and "group_allow_from" not in config:
+            config["group_allow_from"] = config.pop("groupAllowFrom")
+
+        if channel_type == ChannelType.TELEGRAM:
+            return TelegramChannelConfig(**config)
+        elif channel_type == ChannelType.FEISHU:
+            return FeishuChannelConfig(**config)
+        elif channel_type == ChannelType.DISCORD:
+            return DiscordChannelConfig(**config)
+        elif channel_type == ChannelType.WHATSAPP:
+            return WhatsAppChannelConfig(**config)
+        elif channel_type == ChannelType.MOCHAT:
+            return MochatChannelConfig(**config)
+        elif channel_type == ChannelType.DINGTALK:
+            return DingTalkChannelConfig(**config)
+        elif channel_type == ChannelType.EMAIL:
+            return EmailChannelConfig(**config)
+        elif channel_type == ChannelType.SLACK:
+            return SlackChannelConfig(**config)
+        elif channel_type == ChannelType.QQ:
+            return QQChannelConfig(**config)
+        elif channel_type == ChannelType.OPENAPI:
+            return OpenAPIChannelConfig(**config)
+        elif channel_type == ChannelType.BOT_API:
+            return BotChannelConfig(**config)
+        else:
+            return BaseChannelConfig(**config)
+
+    def get_all_channels(self) -> list[BaseChannelConfig]:
+        """Get all channel configs."""
+        result = []
+        for item in self.channels:
+            if isinstance(item, dict):
+                result.append(self._parse_channel_config(item))
+            elif isinstance(item, BaseChannelConfig):
+                result.append(item)
+        return result
+
+    def get_channel_by_key(self, channel_key: str) -> BaseChannelConfig | None:
+        """Get channel config by channel key.
+
+        Args:
+            channel_key: Channel key in format "type__channel_id"
+
+        Returns:
+            Channel config if found, None otherwise
+        """
+        for channel_config in self.get_all_channels():
+            if channel_config.channel_key() == channel_key:
+                return channel_config
+        return None
+
+
+class AgentsConfig(BaseModel):
+    """Agent configuration."""
+
+    _inherits_root_vlm: bool = PrivateAttr(default=False)
+
+    model: str = "openai/doubao-seed-2-0-pro-260215"
+    temperature: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature for LLM requests.",
+    )
+    thinking: bool = Field(
+        default=True,
+        description=(
+            "Enable provider reasoning/thinking mode for bot LLM requests when the "
+            "selected provider protocol supports an explicit thinking parameter."
+        ),
+    )
+    timeout: Optional[float] = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Per-request timeout in seconds for LLM requests. When omitted, vikingbot "
+            "inherits vlm.timeout from ov.conf if present."
+        ),
+    )
+    max_tokens: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Maximum completion output tokens for VikingBot agent calls. "
+            "None leaves the limit to the model provider."
+        ),
+    )
+    max_tool_iterations: int = 50
+    memory_window: int = 50
+    subagent_enabled: bool = Field(
+        default=True,
+        description="Enable the spawn tool so the main agent can start background subagents.",
+    )
+    subagent_max_concurrency: int = Field(
+        default=4,
+        ge=1,
+        description="Maximum number of background subagents running at once.",
+    )
+    session_context_enabled: bool = True
+    session_context_token_budget: int = 3000
+    commit_token_threshold: int = 200000
+    commit_keep_recent_count: int = Field(
+        default=10,
+        description=(
+            "Deprecated physical-message retention setting. VikingBot session context "
+            "commits now use logical Turn retention."
+        ),
+    )
+    commit_keep_recent_turn_count: int = Field(
+        default=3,
+        ge=0,
+        description="Number of newest logical user Turns retained after an OpenViking commit.",
+    )
+    commit_retained_message_token_budget: int = Field(
+        default=6_000,
+        gt=0,
+        description="Token budget for retained raw OpenViking session messages and checkpoints.",
+    )
+    commit_min_raw_tail_steps: int = Field(
+        default=1,
+        ge=0,
+        description="Minimum number of latest assistant Steps retained without compaction.",
+    )
+    gen_image_model: str = "openai/doubao-seedream-4-5-251128"
+    thinking: bool = Field(
+        default=True,
+        description="Enable model thinking/reasoning mode for VikingBot agent calls.",
+    )
+    provider: str = ""
+    api_key: str = ""
+    api_base: str = ""
+    extra_headers: Optional[dict[str, str]] = Field(default_factory=dict)
+    credentials: list[VLMCredential] = Field(
+        default_factory=list,
+        description=(
+            "Ordered Bot-specific VLM credentials. A non-empty list makes VikingBot "
+            "use this Bot-owned chain even when bot.agents.model is omitted."
+        ),
+    )
+    failback_timeout_seconds: float = Field(
+        default=600.0,
+        description="Seconds before retrying a higher-priority Bot credential.",
+    )
+    failback_request_count: int = Field(
+        default=50,
+        description="Successful backup requests before retrying a higher-priority credential.",
+    )
+
+    def set_inherits_root_vlm(self, value: bool) -> None:
+        self._inherits_root_vlm = bool(value)
+
+    def inherits_root_vlm(self) -> bool:
+        return self._inherits_root_vlm
+
+
+class ProviderConfig(BaseModel):
+    """LLM provider configuration."""
+
+    api_key: str = ""
+    api_base: Optional[str] = None
+    extra_headers: Optional[dict[str, str]] = Field(
+        default_factory=dict
+    )  # Custom headers (e.g. APP-Code for AiHubMix)
+
+
+class HeartbeatConfig(BaseModel):
+    """Heartbeat service configuration."""
+
+    enabled: bool = True
+    interval_seconds: int = 10 * 60  # Default: 5 minutes
+
+
+LOCALHOST_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def is_localhost_host(host: str) -> bool:
+    return host in LOCALHOST_HOSTS
+
+
+def requires_gateway_token(host: str, token: str) -> bool:
+    return not is_localhost_host(host) and not token
+
+
+class GatewayConfig(BaseModel):
+    """Gateway/server configuration."""
+
+    host: str = "127.0.0.1"
+    port: int = 18790
+    token: str = ""
+    # 已废弃，使用token替代
+    api_key: str = ""
+
+
+class WebSearchConfig(BaseModel):
+    """Web search tool configuration."""
+
+    api_key: str = ""  # Brave Search API key
+    tavily_api_key: str = ""  # Tavily Search API key
+    max_results: int = 5
+
+
+class OpenVikingConfig(BaseModel):
+    """Viking tools configuration."""
+
+    _effective_auth_mode: str = PrivateAttr(default="")
+
+    _source: str = PrivateAttr(default="none")
+
+    _api_key_source: str = PrivateAttr(default="none")
+
+    _server_managed: bool = PrivateAttr(default=False)
+
+    # Deprecated as user config. Kept for compatibility; load_config derives it
+    # from OpenViking's effective dev auth mode.
+    mode: str = "remote"
+    api_key_type: Literal["root", "user"] | None = None
+    server_url: str = ""
+    # User API key when api_key_type=user; root API key when api_key_type=root.
+    api_key: str = ""
+    # Deprecated compatibility field. Use api_key with api_key_type=root instead.
+    root_api_key: str = ""
+    account_id: str = "default"
+    admin_user_id: str = "default"
+    exp_write_tools: list[str] = Field(default_factory=lambda: ["write_file", "edit_file"])
+    # When True, switch auto-recall mode: skip the per-turn user+agent memory retrieval
+    # entirely, and instead retrieve experience memory once per session (on the first
+    # user-turn build of _build_user_memory) and inject it into that user message.
+    # When False, keep the default behavior (user+agent memory retrieved every turn).
+    # NOTE: in True mode no memory is injected on later turns of a multi-turn session, so
+    # it suits single-turn / per-task runners (e.g. tau2) rather than long conversations.
+    recall_exp_first_round_only: bool = False
+    # Per-turn user/peer memory recall uses type-quota search by default because
+    # the lightweight profile no longer carries every stable fact.
+    memory_recall_events_limit: int = 10
+    memory_recall_entities_limit: int = 10
+    memory_recall_preferences_limit: int = 3
+    memory_recall_max_chars: int = 4000
+    # How many experience memories to fetch per call to get_viking_experience_context.
+    exp_recall_limit: int = 5
+    # Also search matching structured case memories. When enabled, VikingBot
+    # can follow deterministic case -> experience links before direct exp recall.
+    # Default off for normal user-facing deployments.
+    case_recall_limit: int = 0
+    # Deprecated/no-op: trajectory memories are not injected into VikingBot recall.
+    trajectory_recall_limit: int = 0
+    # Total character budget for the injected experience block. Memories beyond this
+    # budget are degraded to link-only (uri + score) instead of being dropped.
+    exp_recall_max_chars: int = 10000
+
+    @field_validator("api_key_type", mode="before")
+    @classmethod
+    def normalize_api_key_type(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        normalized = str(value).strip().lower()
+        return normalized or None
+
+    @model_validator(mode="after")
+    def default_api_key_type(self):
+        if not self.api_key_type:
+            self.api_key_type = "user"
+        return self
+
+    @property
+    def effective_auth_mode(self) -> str:
+        return self._effective_auth_mode
+
+    def set_effective_auth_mode(self, auth_mode: str) -> None:
+        self._effective_auth_mode = str(auth_mode or "").strip().lower()
+
+    def get_config_source(self) -> str:
+        return self._source
+
+    def set_config_source(self, source: str) -> None:
+        source = str(source or "none").strip().lower()
+        if source not in {"explicit", "inherited", "none"}:
+            source = "none"
+        self._source = source
+
+    def get_api_key_source(self) -> str:
+        return self._api_key_source
+
+    def set_api_key_source(self, source: str) -> None:
+        source = str(source or "none").strip().lower()
+        allowed = {"bot.ov_server.api_key", "server.root_api_key", "none"}
+        if source not in allowed:
+            source = "none"
+        self._api_key_source = source
+
+    def is_server_managed(self) -> bool:
+        return self._server_managed
+
+    def set_server_managed(self, value: bool) -> None:
+        self._server_managed = bool(value)
+
+    def is_available(self) -> bool:
+        return bool(str(self.server_url or "").strip())
+
+
+class WebToolsConfig(BaseModel):
+    """Web tools configuration."""
+
+    search: WebSearchConfig = Field(default_factory=WebSearchConfig)
+
+
+class CronConfig(BaseModel):
+    """Scheduled task tool and scheduler configuration."""
+
+    enabled: bool = False
+
+
+class ExecToolConfig(BaseModel):
+    """Shell exec tool configuration."""
+
+    timeout: int = 60
+
+
+class MCPServerConfig(BaseModel):
+    """MCP server connection configuration (stdio / sse / streamableHttp).
+
+    Ported from HKUDS/nanobot v0.1.5.
+    """
+
+    type: Optional[Literal["stdio", "sse", "streamableHttp"]] = None  # auto-detected if omitted
+    command: str = ""  # Stdio: command to run (e.g. "npx")
+    args: list[str] = Field(default_factory=list)  # Stdio: command arguments
+    env: dict[str, str] = Field(default_factory=dict)  # Stdio: extra env vars
+    url: str = ""  # HTTP/SSE endpoint URL
+    headers: dict[str, str] = Field(default_factory=dict)  # HTTP/SSE custom headers
+    tool_timeout: int = 30  # seconds before a tool call is cancelled
+    enabled_tools: list[str] = Field(
+        default_factory=lambda: ["*"]
+    )  # Only register these tools; accepts raw MCP names or wrapped mcp_<server>_<tool>; ["*"] = all
+
+
+class ToolsConfig(BaseModel):
+    """Tools configuration."""
+
+    web: WebToolsConfig = Field(default_factory=WebToolsConfig)
+    cron: CronConfig = Field(default_factory=CronConfig)
+    exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+
+
+class SandboxNetworkConfig(BaseModel):
+    """Sandbox network configuration.
+
+    SRT uses allow-only pattern: all network access is denied by default.
+    You must explicitly allow domains.
+
+    - allowed_domains: List of allowed domains (supports wildcards like "*.example.com")
+    - denied_domains: List of denied domains (checked first, takes precedence over allowed_domains)
+    - allow_local_binding: Allow binding to local ports
+    """
+
+    allowed_domains: list[str] = Field(default_factory=list)
+    denied_domains: list[str] = Field(default_factory=list)
+    allow_local_binding: bool = False
+
+
+class SandboxFilesystemConfig(BaseModel):
+    """Sandbox filesystem configuration."""
+
+    deny_read: list[str] = Field(default_factory=list)
+    allow_write: list[str] = Field(default_factory=list)
+    deny_write: list[str] = Field(default_factory=list)
+
+
+class SandboxRuntimeConfig(BaseModel):
+    """Sandbox runtime configuration."""
+
+    cleanup_on_exit: bool = True
+    timeout: int = 300
+
+
+class DirectBackendConfig(BaseModel):
+    """Direct backend configuration."""
+
+    restrict_to_workspace: bool = False  # If true, restrict file access to workspace directory
+    allow_compile_exec: bool = True
+
+
+class SrtBackendConfig(BaseModel):
+    """SRT backend configuration."""
+
+    node_path: str = "node"
+    network: SandboxNetworkConfig = Field(default_factory=SandboxNetworkConfig)
+    filesystem: SandboxFilesystemConfig = Field(default_factory=SandboxFilesystemConfig)
+    runtime: SandboxRuntimeConfig = Field(default_factory=SandboxRuntimeConfig)
+
+
+class DockerBackendConfig(BaseModel):
+    """Docker backend configuration."""
+
+    image: str = "python:3.11-slim"
+    network_mode: str = "bridge"
+
+
+class OpenSandboxNetworkConfig(BaseModel):
+    """OpenSandbox network configuration."""
+
+    allowed_domains: list[str] = Field(default_factory=list)
+    denied_domains: list[str] = Field(default_factory=list)
+
+
+class OpenSandboxRuntimeConfig(BaseModel):
+    """OpenSandbox runtime configuration."""
+
+    timeout: int = Field(default=300, gt=0)
+    cpu: str = "500m"
+    memory: str = "1Gi"
+
+
+class OpenSandboxBackendConfig(BaseModel):
+    """Docker-backed OpenSandbox; manage a local server or connect to an external one."""
+
+    server_url: str = "http://localhost:18792"
+    api_key: str = ""
+    managed: bool = True
+    startup_timeout: int = Field(default=600, ge=10)
+    use_server_proxy: bool = True
+    execd_image: str = "opensandbox/execd:v1.0.6"
+    egress_image: str = "opensandbox/egress:v1.0.1"
+    pids_limit: int = Field(default=256, gt=0)
+    default_image: str = "opensandbox/code-interpreter:v1.0.1"
+    network: OpenSandboxNetworkConfig = Field(default_factory=OpenSandboxNetworkConfig)
+    runtime: OpenSandboxRuntimeConfig = Field(default_factory=OpenSandboxRuntimeConfig)
+
+
+class AioSandboxBackendConfig(BaseModel):
+    """AIO Sandbox backend configuration."""
+
+    base_url: str = "http://localhost:18794"
+
+
+class SandboxBackendsConfig(BaseModel):
+    """Sandbox backends configuration."""
+
+    srt: SrtBackendConfig = Field(default_factory=SrtBackendConfig)
+    docker: DockerBackendConfig = Field(default_factory=DockerBackendConfig)
+    opensandbox: OpenSandboxBackendConfig = Field(default_factory=OpenSandboxBackendConfig)
+    direct: DirectBackendConfig = Field(default_factory=DirectBackendConfig)
+    aiosandbox: AioSandboxBackendConfig = Field(default_factory=AioSandboxBackendConfig)
+
+
+class LangfuseConfig(BaseModel):
+    """Langfuse observability configuration."""
+
+    enabled: bool = False
+    secret_key: str = "sk-lf-vikingbot-secret-key-2026"
+    public_key: str = "pk-lf-vikingbot-public-key-2026"
+    base_url: str = "http://localhost:3000"
+
+
+class SandboxConfig(BaseModel):
+    """Sandbox configuration."""
+
+    backend: SandboxBackend = SandboxBackend.DIRECT
+    mode: SandboxMode = SandboxMode.SHARED
+    backends: SandboxBackendsConfig = Field(default_factory=SandboxBackendsConfig)
+    restrict_workspaces: dict[str, str] = Field(default_factory=dict)
+
+
+class RemoteSkillsConfig(BaseModel):
+    """OpenViking-backed Skill runtime configuration."""
+
+    discovery_limit: int = Field(default=8, ge=1, le=50)
+    score_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
+    discovery_timeout_seconds: float = Field(default=2.0, gt=0.0, le=30.0)
+    max_files: int = Field(default=128, ge=1)
+    max_file_bytes: int = Field(default=8 * 1024 * 1024, ge=1)
+    max_total_bytes: int = Field(default=32 * 1024 * 1024, ge=1)
+    cache_idle_ttl_seconds: float = Field(default=10 * 60, gt=0.0)
+    cache_max_entries: int = Field(default=32, ge=1)
+    cache_max_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
+
+
+class Config(BaseSettings):
+    """Root configuration for vikingbot."""
+
+    _root_vlm_config: Any = PrivateAttr(default=None)
+
+    inherits_root_vlm_state: SkipJsonSchema[bool] = Field(default=False, repr=False)
+    agents: AgentsConfig = Field(default_factory=AgentsConfig)
+    channels: list[Any] = Field(default_factory=list)
+    gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    ov_server: OpenVikingConfig = Field(default_factory=OpenVikingConfig)
+    remote_skills: RemoteSkillsConfig = Field(default_factory=RemoteSkillsConfig)
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    langfuse: LangfuseConfig = Field(default_factory=LangfuseConfig)
+    hooks: list[str] = Field(["vikingbot.hooks.builtins.openviking_hooks.hooks"])
+    skills: list[str] = Field(
+        default_factory=lambda: [
+            "github-proxy",
+            "github",
+            "memory",
+            "cron",
+            "weather",
+            "tmux",
+            "skill-creator",
+            "summarize",
+        ]
+    )
+    storage_workspace: Optional[str] = None  # From ov.conf root level storage.workspace
+    use_local_memory: bool = False
+    mode: BotMode = BotMode.NORMAL
+
+    @model_validator(mode="after")
+    def sync_root_vlm_inheritance_state(self) -> "Config":
+        """Restore runtime inheritance state after serialization round-trips."""
+        self.agents.set_inherits_root_vlm(self.inherits_root_vlm_state)
+        return self
+
+    def set_inherits_root_vlm(self, value: bool) -> None:
+        self.inherits_root_vlm_state = bool(value)
+        self.agents.set_inherits_root_vlm(value)
+
+    def inherits_root_vlm(self) -> bool:
+        return self.inherits_root_vlm_state
+
+    def set_root_vlm_config(self, vlm_config: Any) -> None:
+        self._root_vlm_config = vlm_config
+
+    def get_root_vlm_config(self) -> Any:
+        return self._root_vlm_config
+
+    @property
+    def read_only(self) -> bool:
+        """Backward compatibility for read_only property."""
+        return self.mode == BotMode.READONLY
+
+    @property
+    def channels_config(self) -> ChannelsConfig:
+        """Get channels config wrapper."""
+        config = ChannelsConfig()
+        config.channels = self.channels
+        return config
+
+    @property
+    def bot_data_path(self) -> Path:
+        """Get expanded bot data path: {storage_workspace}/bot."""
+        workspace = self.storage_workspace or "~/.openviking/data"
+        return Path(workspace).expanduser() / "bot"
+
+    @property
+    def workspace_path(self) -> Path:
+        """Get expanded workspace path: {storage_workspace}/bot/workspace."""
+        return self.bot_data_path / "workspace"
+
+    @property
+    def opensandbox_workspaces_path(self) -> Path:
+        """Dedicated host bind mounts, separate from Server credentials and logs."""
+        return self.bot_data_path / "runtime" / "opensandbox" / "workspaces"
+
+    @property
+    def uses_managed_opensandbox(self) -> bool:
+        return self.sandbox.backend == "opensandbox" and self.sandbox.backends.opensandbox.managed
+
+    @property
+    def sandbox_workspace_path(self) -> Path:
+        if self.uses_managed_opensandbox:
+            return self.opensandbox_workspaces_path
+        return self.workspace_path
+
+    @property
+    def ov_data_path(self) -> Path:
+        return self.bot_data_path / "ov_data"
+
+    def _get_vlm_config(self) -> Optional[Dict[str, Any]]:
+        """Get vlm config from OpenVikingConfig. Returns (vlm_config_dict)."""
+        if self._root_vlm_config is not None:
+            return self._root_vlm_config.model_dump()
+
+        from openviking_cli.utils.config import get_openviking_config
+
+        ov_config = get_openviking_config()
+
+        if hasattr(ov_config, "vlm"):
+            return ov_config.vlm.model_dump()
+        return None
+
+    def _match_provider(
+        self, model: str | None = None
+    ) -> tuple["ProviderConfig | None", str | None]:
+        """Match the effective Bot provider config. Returns (config, spec_name)."""
+        del model
+
+        if not self.inherits_root_vlm():
+            if self.agents.credentials:
+                credential = self.agents.credentials[0]
+                return (
+                    ProviderConfig(
+                        api_key=credential.api_key or "",
+                        api_base=credential.api_base,
+                        extra_headers=credential.extra_headers or {},
+                    ),
+                    credential.provider,
+                )
+            if self.agents.provider:
+                return (
+                    ProviderConfig(
+                        api_key=self.agents.api_key,
+                        api_base=self.agents.api_base or None,
+                        extra_headers=self.agents.extra_headers or {},
+                    ),
+                    self.agents.provider,
+                )
+            return None, None
+
+        vlm_config = self._get_vlm_config()
+
+        if vlm_config:
+            credentials = vlm_config.get("credentials") or []
+            if credentials:
+                credential = credentials[0]
+                return (
+                    ProviderConfig(
+                        api_key=credential.get("api_key") or "",
+                        api_base=credential.get("api_base"),
+                        extra_headers=credential.get("extra_headers") or {},
+                    ),
+                    credential.get("provider"),
+                )
+
+            provider_name = vlm_config.get("provider") or vlm_config.get("default_provider")
+            if provider_name:
+                # Build provider config from vlm
+                provider_config = ProviderConfig()
+
+                # Try to get from vlm.providers first
+                if "providers" in vlm_config and provider_name in vlm_config["providers"]:
+                    p_data = vlm_config["providers"][provider_name]
+                    if "api_key" in p_data:
+                        provider_config.api_key = p_data["api_key"]
+                    if "api_base" in p_data:
+                        provider_config.api_base = p_data["api_base"]
+                    if "extra_headers" in p_data:
+                        provider_config.extra_headers = p_data["extra_headers"]
+                else:
+                    # Fall back to top-level vlm fields
+                    if vlm_config.get("api_key"):
+                        provider_config.api_key = vlm_config["api_key"]
+                    if vlm_config.get("api_base"):
+                        provider_config.api_base = vlm_config["api_base"]
+
+                return provider_config, provider_name
+
+        return None, None
+
+    def get_provider(self, model: str | None = None) -> ProviderConfig | None:
+        """Get matched provider config (api_key, api_base, extra_headers). Falls back to first available."""
+        p, _ = self._match_provider(model)
+        return p
+
+    def get_provider_name(self, model: str | None = None) -> str | None:
+        """Get the registry name of the matched provider (e.g. "deepseek", "openrouter")."""
+        _, name = self._match_provider(model)
+        return name
+
+    def get_api_key(self, model: str | None = None) -> str | None:
+        """Get API key for the given model. Falls back to first available key."""
+        p = self.get_provider(model)
+        return p.api_key if p else None
+
+    def get_api_base(self, model: str | None = None) -> str | None:
+        """Get API base URL for the given model. Applies default URLs for known gateways."""
+        from vikingbot.providers.registry import find_by_name
+
+        p, name = self._match_provider(model)
+        if p and p.api_base:
+            return p.api_base
+        if name:
+            spec = find_by_name(name)
+            if spec and spec.is_gateway and spec.default_api_base:
+                return spec.default_api_base
+        return None
+
+    model_config = SettingsConfigDict(env_prefix="NANOBOT_", env_nested_delimiter="__")
+
+
+class SessionKey(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    type: str
+    channel_id: str
+    chat_id: str
+
+    def __hash__(self):
+        return hash((self.type, self.channel_id, self.chat_id))
+
+    def safe_name(self):
+        return f"{self.type}__{self.channel_id}__{self.chat_id}"
+
+    def channel_key(self):
+        return f"{self.type}__{self.channel_id}"
+
+    @staticmethod
+    def from_safe_name(safe_name: str):
+        file_name_split = safe_name.split("__", 2)
+        if len(file_name_split) != 3:
+            raise ValueError(f"Invalid session key: {safe_name!r}")
+        return SessionKey(
+            type=file_name_split[0], channel_id=file_name_split[1], chat_id=file_name_split[2]
+        )

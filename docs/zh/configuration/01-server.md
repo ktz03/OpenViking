@@ -1,0 +1,461 @@
+# 服务端配置
+
+首次配置建议使用 `openviking-server init`，保存后运行 `openviking-server doctor`。
+
+OpenViking 服务端读取 `ov.conf`。默认路径是：
+
+```text
+~/.openviking/ov.conf
+```
+
+也可以通过环境变量或启动参数指定其他文件：
+
+```bash
+export OPENVIKING_CONFIG_FILE=/path/to/ov.conf
+openviking-server --config /path/to/ov.conf
+```
+
+服务端启动时读取配置。修改模型、检索、存储或 `server` 配置后，需要重启服务；重启后建议运行 `openviking-server doctor`。
+
+## 配置结构
+
+```json
+{
+  "embedding": {},
+  "vlm": {},
+  "query_planner": {},
+  "rerank": {},
+  "retrieval": {},
+  "storage": {},
+  "server": {},
+  "memory": {},
+  "parsers": {},
+  "encryption": {},
+  "log": {},
+  "telemetry": {}
+}
+```
+
+未配置的可选模块使用默认值。`ov.conf` 及账户配置会忽略未知字段，兼容旧版本遗留配置；已知字段仍校验类型和取值。字段名拼写错误也会被忽略，但服务端会输出 WARNING，逐项列出未被采用的字段。
+
+## 顶层配置
+
+| 配置项 | 类型 / 可选值 | 默认值 | 作用 |
+|---|---|---|---|
+| `default_account` | string | `"default"` | Service context 使用的默认账号 |
+| `default_user` | string | `"default"` | Service context 使用的默认用户 |
+| `embedding` | object | 内置本地 Dense 模型 | 向量化模型和稀疏/混合检索配置；默认使用 `local` / `bge-small-zh-v1.5-f16` |
+| `vlm` | object | 空配置 | 内容理解、摘要和记忆抽取使用的模型；使用相关能力前需要配置可用模型 |
+| `query_planner` | object / `null` | `null` | 检索意图分析模型；未配置时回退到 `vlm` |
+| `rerank` | object | disabled | 检索结果重排模型 |
+| `retrieval` | object | 见下表 | 检索排序和意图分析策略 |
+| `grep` | object | 内置默认值 | 文本搜索引擎配置 |
+| `glob` | object | 内置默认值 | 路径模式匹配引擎配置 |
+| `storage` | object | 本地存储 | 工作目录、文件系统和向量数据库 |
+| `queue_workers` | object | 见下表 | QueueFS 消费 worker 的运行时并发配置 |
+| `server` | object | 本地开发模式 | HTTP 服务、鉴权、上传和可观测性 |
+| `memory` | object | 见下表 | 会话提交后的记忆与技能抽取 |
+| `parsers` | object | 各解析器默认值 | PDF、代码、图片、音视频等解析行为 |
+| `semantic` | object | 内置默认值 | abstract 和 overview 的生成限制 |
+| `parser_api` | object | disabled | 第三方文件解析 API |
+| `compile_api` | object | disabled | 外部 Compile 任务 API |
+| `connector` | object | disabled | 外部 Connector 数据导入服务 |
+| `encryption` | object | disabled | 文件和敏感字段加密 |
+| `git` | object | local | 版本管理后端，可使用 `local` 或 `s3` |
+| `log` | object | 控制台日志 | 日志级别、格式和文件输出 |
+| `telemetry` | object | disabled | OpenTelemetry trace 上报 |
+| `oauth` | object | disabled | MCP OAuth 2.1 配置 |
+| `prompts` | object | 内置模板 | 自定义 Prompt 模板目录 |
+| `ingest` | object | 内置默认值 | 会话日志导入配置 |
+| `output_language_override` | string | `""` | 强制摘要和记忆输出语言；空值表示自动识别 |
+| `allow_private_networks` | boolean | `false` | 是否允许抓取内网或私有地址资源 |
+
+`auto_generate_l0`、`auto_generate_l1`、`default_search_mode` 和 `default_search_limit` 是已弃用的兼容字段。旧配置文件仍可加载这些字段，但它们不会影响运行时行为。
+
+## 模型配置
+
+API 型 `embedding`、`vlm`、`query_planner` 和 `rerank` 配置会复用部分字段名，但各模块使用独立 schema。请只使用下表中对应模块支持的字段。
+
+```json
+{
+  "embedding": {
+    "dense": {
+      "provider": "volcengine",
+      "model": "doubao-embedding-vision-251215",
+      "api_base": "https://ark.cn-beijing.volces.com/api/v3",
+      "api_key": "<your-ark-api-key>",
+      "dimension": 1024,
+      "input": "multimodal"
+    }
+  },
+  "vlm": {
+    "provider": "volcengine",
+    "model": "doubao-seed-2-0-code-preview-260215",
+    "api_base": "https://ark.cn-beijing.volces.com/api/v3",
+    "api_key": "<your-ark-api-key>",
+    "temperature": 0,
+    "max_retries": 3,
+    "thinking": false
+  },
+  "query_planner": {
+    "provider": "volcengine",
+    "model": "doubao-seed-2-0-code-preview-260215",
+    "api_base": "https://ark.cn-beijing.volces.com/api/v3",
+    "api_key": "<your-ark-api-key>",
+    "thinking": false
+  },
+  "rerank": {
+    "provider": "vikingdb",
+    "ak": "<your-volcengine-ak>",
+    "sk": "<your-volcengine-sk>",
+    "host": "api-vikingdb.vikingdb.cn-beijing.volces.com",
+    "model_name": "doubao-seed-rerank",
+    "model_version": "251028",
+    "threshold": 0.1,
+    "max_input_tokens": 0
+  }
+}
+```
+
+| 字段 / 路径 | 适用模块 | 作用 |
+|---|---|---|
+| `provider`、`model`、`api_base`、`api_key` | Embedding、VLM、Query Planner、Rerank | 模型服务、地址和凭证 |
+| `api_version` | Embedding、VLM、Query Planner | Azure 等服务的 API 版本 |
+| `extra_headers` | Embedding、VLM、Query Planner、Rerank | 附加请求头 |
+| `extra_request_body` | VLM、Query Planner | 附加的 Completion 请求参数 |
+| `extra_body` | `embedding.dense` / `sparse` / `hybrid` | 附加的 Embedding 请求参数 |
+| `timeout` | VLM、Query Planner、Rerank | 单次请求超时，单位为秒 |
+| `embedding.max_retries`、`vlm.max_retries`、`query_planner.max_retries` | Embedding、VLM、Query Planner | 请求失败重试次数；Rerank 没有 `max_retries` 字段 |
+
+### `embedding.dense`
+
+| 字段 | 类型 / 可选值 | 作用 |
+|---|---|---|
+| `provider` | `openai`、`volcengine`、`azure`、`ollama`、`local` 等 | Dense Embedding 服务 |
+| `dimension` | integer，`> 0` | 向量维度，必须与模型输出及已有集合一致 |
+| `input` | `"text"` / `"multimodal"` | 输入类型 |
+| `encoding_format` | `"float"` / `"base64"` | OpenAI 兼容接口的向量编码格式 |
+
+更换模型或 `dimension` 可能与已有向量集合不兼容，需要迁移或重建索引。
+
+### `rerank`
+
+| 字段 | 类型 / 可选值 | 默认值 | 作用 |
+|---|---|---|---|
+| `provider` | `vikingdb`、`cohere`、`openai`、`litellm`、`jev` / `null` | `null` | Rerank 服务类型；省略时根据凭证字段推断 |
+| `model` | string / `null` | `null` | OpenAI 兼容、LiteLLM 或 Jev Rerank 模型 |
+| `threshold` | number | `0.1` | 判定结果相关的最低分数 |
+| `max_input_tokens` | integer；`0` 或 `>= 128` | `0` | 每个 query-document pair 的最大估算 token；`0` 表示不截断 |
+| `log_payloads` | boolean | `false` | 记录完整 rerank 请求和响应；日志可能包含 query 和文档内容 |
+
+Rerank 没有单独的 `enabled` 字段；配置了对应 provider 所需的凭证后才会启用。
+
+`jev` 通过现有 `api_base` 和 `model` 字段同时支持 TypeSafe 直连（`https://api.typesafe.ai`，模型 `jev-latest`）和 Vercel AI Gateway 的 TypeSafe 兼容端点（`https://ai-gateway.vercel.sh/typesafe`，模型 `typesafe-ai/jev`），两者协议相同。它将 query 和候选文档作为结构化 `state`，为每个候选提出一个独立的相关性问题，并将各自的 yes 概率作为 rerank 分数。显式指定 `provider` 时必须提供该 provider 所需的凭证：`vikingdb` 需要 `ak` 和 `sk`，`cohere` 和 `jev` 需要 `api_key`，`openai` 需要 `api_key` 和 `api_base`，`litellm` 需要 `model`。凭证不全的配置在加载时即被拒绝。
+
+## 检索配置
+
+```json
+{
+  "retrieval": {
+    "hotness_alpha": 0,
+    "score_propagation_alpha": 1,
+    "enable_intent": true
+  }
+}
+```
+
+### `retrieval`
+
+| 字段 | 类型 / 可选值 | 默认值 | 作用 |
+|---|---|---|---|
+| `hotness_alpha` | number，`0`–`1` | `0` | 热度分数权重；`0` 表示关闭热度加权 |
+| `score_propagation_alpha` | number，`0`–`1` | `1` | 层级检索时子结果自身分数的权重 |
+| `enable_intent` | boolean | `true` | 有 `session_id` 时是否进行意图分析和查询规划 |
+
+Search 和 Find 请求的默认 `limit` 为 `10`，可以在每次 API 或 SDK 请求中覆盖。`retrieval.enable_intent` 控制带 Session 的 Search 是否执行 LLM 查询规划；只有配置了可用的 `rerank` provider 时才会执行结果重排。
+
+## 存储配置
+
+```json
+{
+  "storage": {
+    "workspace": "./data",
+    "skip_process_lock": false,
+    "agfs": {
+      "backend": "local"
+    },
+    "vectordb": {
+      "backend": "local"
+    },
+    "parse_output": {
+      "mode": "agfs"
+    }
+  }
+}
+```
+
+### `storage`
+
+| 字段 | 类型 / 常用值 | 默认值 | 作用 |
+|---|---|---|---|
+| `workspace` | path | `"./data"` | OpenViking 工作目录 |
+| `agfs.backend` | `local`、`memory`、`s3` | `local` | 文件与元数据存储后端 |
+| `vectordb.backend` | `local`、`cuvs`、`http`、`volcengine`、`vikingdb` | `local` | 向量数据库后端 |
+| `vectordb.dimension` | integer | 跟随 Embedding | 向量集合维度 |
+| `parse_output.mode` | `agfs`、`local` | `agfs` | parser 中间产物的存储后端 |
+| `parse_output.local_root` | 路径或 `null` | 系统临时目录 | local parser artifact 的根目录 |
+| `skip_process_lock` | boolean | `false` | 是否跳过 workspace 进程锁；仅在明确接受并发写风险时启用 |
+
+远程存储后端还需要配置 endpoint、bucket/collection、鉴权和超时等字段。完整后端示例见[配置指南](../guides/01-configuration.md#storage)。
+
+`parse_output.mode=local` 可避免把 parser 中间产物写入共享 AGFS。当前 worker
+必须在下游任务入队前把所需字节提交到正式资源树。产物会在内容提交后清理；
+请为 `local_root` 预留足够空间以容纳并发导入。
+
+## 队列 Worker 配置
+
+### `queue_workers.external_parse`
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `max_concurrent` | integer | `4` | 同时消费的完整 ExternalParse 作业数，必须大于 `0`；修改后需重启服务 |
+
+该配置控制队列作业并发，不等同于 `vlm.media.max_concurrent` 的音视频 VLM 调用并发，也不限制 Understanding API 的单独 HTTP 请求数。
+
+### `queue_workers.add_resource`
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `max_concurrent` | integer | `4` | 同时消费的完整 AddResource 作业数，必须大于 `0`；修改后需重启服务 |
+| `file_operation_concurrency` | integer | `16` | 单个 AddResource 作业内文件级提交和 fallback 比较操作的最大并发数，必须大于 `0`；修改后需重启服务 |
+| `file_vectorization_concurrency` | integer | `8` | 当目录 AddResource 使用 `processing_mode="vectors_only"` 时，单个作业内并发读取、准备并入队的文件数，必须大于 `0`；超过内部安全上限 `64` 的值会被截断；修改后需重启服务 |
+
+`max_concurrent` 控制相互独立的 AddResource 作业并发，`file_operation_concurrency` 控制单个 AddResource 作业内文件提交和 fallback 比较操作的并发，`file_vectorization_concurrency` 控制单个 vectors-only 目录作业内的文件并发。
+
+### `queue_workers.session_commit`
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `max_concurrent` | integer | `8` | 同时消费的 SessionCommit 作业数，必须大于 `0`；修改后需重启服务 |
+
+### `queue_workers.external_task`
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `max_concurrent` | integer | `10` | 同时消费的外部异步任务数，必须大于 `0`；修改后需重启服务 |
+
+## Compile API 配置
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `base_url` | string | `""` | 外部服务地址，必须包含 `http://` 或 `https://`；非空即启用外部 Compile |
+| `gateway_token` | string | `""` | OV 调用 Compile Gateway 使用的可选服务凭证 |
+| `http_timeout_seconds` | number | `10` | 单次 HTTP 请求超时 |
+| `poll_interval_ms` | integer | `30000` | 外部任务状态轮询间隔 |
+
+配置 `base_url` 后，OV 通过 `X-API-Key` 传递当前用户的 OV API Key；仅在配置 `gateway_token` 时发送 `X-Gateway-Token`。
+
+## Reindex 配置
+
+### `reindex`
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---:|---|
+| `file_vectorization_concurrency` | integer | `8` | 单个 `vectors_only` reindex 任务内并发读取、准备并入队的文件数，必须大于 `0`；超过内部安全上限 `64` 的值会被截断；修改后需重启服务 |
+
+## HTTP 服务配置
+
+```json
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 1933,
+    "workers": 1,
+    "executor_threads": 0,
+    "auth_mode": "dev",
+    "cors_origins": ["http://localhost:5173"],
+    "profile_enabled": false,
+    "temp_upload": {
+      "default_mode": "local"
+    }
+  }
+}
+```
+
+### `server`
+
+| 字段 | 类型 / 可选值 | 默认值 | 作用 |
+|---|---|---|---|
+| `host` | IP / hostname | `"127.0.0.1"` | HTTP 监听地址 |
+| `port` | integer | `1933` | HTTP 监听端口 |
+| `workers` | integer | `1` | 服务进程数量 |
+| `executor_threads` | 非负整数 | `0` | 每个服务进程的 asyncio 默认 executor 最大线程数；`0` 表示沿用 Python 默认策略 |
+| `timeout_keep_alive` | integer（秒） | `5` | 空闲 HTTP keep-alive 超时；应调大到超过上游空闲连接寿命 |
+| `auth_mode` | `dev`、`api_key`、`trusted` / `null` | `null` | 鉴权模式；空值根据 `root_api_key` 自动判断 |
+| `root_api_key` | string / `null` | `null` | Root API Key；配置后默认启用 `api_key` 模式 |
+| `cors_origins` | string[] | `["*"]` | 允许的跨域来源 |
+| `profile_enabled` | boolean | `false` | 是否允许请求返回性能 profile |
+| `with_bot` | boolean | `false` | 是否启用 VikingBot API 代理 |
+| `bot_api_url` | URL | `http://localhost:18790` | VikingBot OpenAPI 地址 |
+| `public_base_url` | URL / `null` | `null` | 外部访问使用的服务基准地址 |
+| `upload_signed_ttl_seconds` | integer | `600` | 签名上传 URL 有效期 |
+| `temp_upload.default_mode` | `"local"` / `"shared"` | `"local"` | 临时上传存储模式 |
+
+### 文件加密与 API Key 哈希
+
+文件加密和 API Key 哈希在顶层 `encryption` 中配置，不属于 `server`：
+
+```json
+{
+  "encryption": {
+    "enabled": false,
+    "api_key_hashing": {
+      "enabled": false
+    }
+  }
+}
+```
+
+| 字段 | 类型 / 可选值 | 默认值 | 作用 |
+|---|---|---|---|
+| `encryption.enabled` | boolean | `false` | 是否启用文件级 AES 加密 |
+| `encryption.api_key_hashing.enabled` | boolean | `false` | 是否使用 Argon2id 保存 API Key |
+
+Provider 和密钥管理配置见[加密指南](../guides/08-encryption.md)。
+
+### 鉴权模式
+
+| 值 | 使用场景 |
+|---|---|
+| `dev` | 仅监听本机地址的开发环境，不要求 API Key |
+| `api_key` | 服务端校验 root/user/admin key |
+| `trusted` | 由受信任网关注入 account/user 身份 |
+
+## 记忆配置
+
+```json
+{
+  "memory": {
+    "custom_templates_dir": "",
+    "experimental_memory_switch": false,
+    "eager_prefetch": true,
+    "prefetch_search_topn": 5,
+    "extraction_enabled": true,
+    "session_skill_extraction_enabled": false,
+    "link_enabled": false
+  }
+}
+```
+
+### `memory`
+
+| 字段 | 类型 / 可选值 | 默认值 | 作用 |
+|---|---|---|---|
+| `custom_templates_dir` | path | `""` | 附加的自定义记忆模板目录 |
+| `experimental_memory_switch` | boolean | `false` | 是否启用实验性记忆模板 |
+| `eager_prefetch` | boolean | `true` | 是否在抽取前预取并读取记忆内容 |
+| `prefetch_search_topn` | integer，`>= 1` | `5` | 预取时读取的检索结果数量 |
+| `extraction_enabled` | boolean | `true` | session commit 时是否抽取长期记忆 |
+| `session_skill_extraction_enabled` | boolean | `false` | 是否同时抽取可复用 Skill |
+| `link_enabled` | boolean | `false` | 是否生成和解析记忆链接 |
+
+## 解析器配置
+
+解析器放在 `parsers` 下：
+
+```json
+{
+  "parsers": {
+    "pdf": {},
+    "code": {
+      "code_summary_mode": "ast",
+      "extract_functions": true,
+      "extract_classes": true,
+      "max_token_limit": 50000
+    },
+    "image": {},
+    "audio": {},
+    "video": {},
+    "markdown": {},
+    "anydoc": {
+      "enabled": true
+    },
+    "html": {},
+    "text": {},
+    "directory": {
+      "preserve_structure": true,
+      "max_files": null,
+      "max_depth": 10,
+      "max_concurrent": 4
+    },
+    "feishu": {
+      "domain": "https://open.feishu.cn",
+      "max_rows_per_sheet": 1000,
+      "max_records_per_table": 1000,
+      "download_images": true
+    },
+    "webfeed": {}
+  }
+}
+```
+
+`parsers.directory.max_files` 默认是 `null`，表示不限文件数；
+设为正整数可限制单次目录导入的文件数。
+
+`parsers.directory.max_concurrent` 由服务事件循环中的所有目录导入共享。默认值为
+`4` 时，单个目录可以并发执行 4 个 Understanding 任务；多个目录同时导入时，合计仍最多
+执行 4 个。
+
+启用 Understanding 目录路由时，`max_files` 和 `max_depth` 才约束目录导入。每次
+`DirectoryParser` 扫描会在提交该层 Understanding 请求前独立应用限制；嵌套 ZIP 会启动
+新的目录扫描，不与外层共享文件数量和深度预算。关闭 Understanding 时，OpenViking
+原生目录解析不应用这两个限制。
+
+客户端导入本地目录时，完整目录 ZIP 受 `/resources/temp_upload` 上传大小限制。ZIP
+解压后，`DirectoryParser` 不再设置统一的单文件字节限制；每个入选文件遵循对应内置
+Parser 或 Understanding API 后端自身的限制和上传行为。
+
+| 配置项 | 作用 |
+|---|---|
+| `pdf` | PDF 文本、图片和版面解析 |
+| `code` | 代码仓库文件类型、忽略规则和安全限制 |
+| `image` | 图片理解和 OCR |
+| `audio`、`video` | 音视频内容解析 |
+| `markdown`、`html`、`text` | 文本文档分段 |
+| `anydoc` | Office 和 EPUB 转换；`enabled=false` 时拒绝这些格式 |
+| `directory` | 目录扫描和忽略规则 |
+| `feishu` | 飞书文档访问与解析 |
+| `webfeed` | Sitemap、RSS 和 Atom 导入 |
+
+各模型 provider、解析器、存储后端和加密后端包含较多专用字段，完整字段表和配置示例见[配置指南](../guides/01-configuration.md)。
+
+## 最小示例
+
+```json
+{
+  "embedding": {
+    "dense": {
+      "provider": "volcengine",
+      "model": "doubao-embedding-vision-251215",
+      "api_base": "https://ark.cn-beijing.volces.com/api/v3",
+      "api_key": "<your-ark-api-key>",
+      "dimension": 1024,
+      "input": "multimodal"
+    }
+  },
+  "vlm": {
+    "provider": "volcengine",
+    "model": "doubao-seed-2-0-code-preview-260215",
+    "api_base": "https://ark.cn-beijing.volces.com/api/v3",
+    "api_key": "<your-ark-api-key>",
+    "thinking": false
+  },
+  "storage": {
+    "workspace": "./data"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 1933
+  }
+}
+```

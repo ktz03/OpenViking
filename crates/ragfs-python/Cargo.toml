@@ -1,0 +1,32 @@
+[package]
+name = "ragfs-python"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.91.1"
+description = "Python bindings for RAGFS - Rust AGFS filesystem"
+publish = false
+
+[lib]
+name = "ragfs_python"
+# rlib is needed so `cargo test` can build a test binary that links against
+# this crate's symbols. cdylib is what maturin packages as the Python .so.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["extension-module", "s3"]
+extension-module = ["pyo3/extension-module"]
+s3 = ["ragfs/s3"]
+
+[dependencies]
+ragfs = { path = "../ragfs", features = ["cache"] }
+pyo3 = { version = "0.27", features = ["abi3", "abi3-py310"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+serde_json = "1.0"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+gix-hash = "0.14"
+bytes = "1.5"
+similar = "3.1"

@@ -1,0 +1,837 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""
+UnderstandingAPI: Integrate with Understanding API for parsing.
+
+Workflow:
+1. Upload local file to Files API (file_id) or submit URL directly
+2. Submit a parse request to Responses API (response_id)
+3. Poll Responses API until completed/failed
+4. Download result zip (zip_url)
+5. Materialize the result through the configured ParseOutputStore
+6. Return ParseResult for downstream TreeBuilder/SemanticQueue processing
+"""
+
+import asyncio
+import json
+import mimetypes
+import tempfile
+import zipfile
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urlparse
+
+import httpx
+
+from openviking.parse.base import NodeType, ParseResult, ResourceNode
+from openviking.parse.image_rewrite import (
+    IMAGE_MAPPINGS_FILENAME,
+    build_artifact_image_mappings,
+)
+from openviking.parse.output import (
+    ParseArtifactRef,
+    create_parse_artifact_writer,
+)
+from openviking.parse.parsers.base_parser import BaseParser
+from openviking.parse.parsers.constants import MPEG_TS_EXTENSION_ALIAS, TYPESCRIPT_MPEG_TS_EXTENSION
+from openviking.parse.parsers.media.constants import (
+    AUDIO_EXTENSIONS,
+    IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+)
+from openviking.storage.viking_fs import get_viking_fs
+from openviking.utils.zip_safe import normalize_zip_filenames, safe_extract_zip
+from openviking_cli.exceptions import InvalidArgumentError
+from openviking_cli.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+PREPARED_RESPONSE_ID_ARG = "understanding_response_id"
+PREPARED_FILE_ID_ARG = "understanding_file_id"
+
+
+class UnderstandingAPIError(RuntimeError):
+    """Parser API failure carrying the remote identifiers already observed."""
+
+    def __init__(self, message: str, meta: Optional[Dict[str, Any]] = None):
+        self.meta = dict(meta or {})
+        super().__init__(message)
+
+
+class UnderstandingAPI(BaseParser):
+    """
+    UnderstandingAPI: Third-party parse client.
+    """
+
+    def __init__(self):
+        from openviking_cli.utils.config.open_viking_config import get_openviking_config
+
+        ov_config = get_openviking_config()
+        parser_api = ov_config.parser_api
+        raw_host = (parser_api.host or "").rstrip("/")
+        self._api_host = raw_host
+        self._api_base = raw_host if raw_host.endswith("/api/v3") else f"{raw_host}/api/v3"
+        self._api_key = parser_api.api_key
+        self._enable_resumable_upload = bool(parser_api.enable_resumable_upload)
+        self._upload_simple_max_bytes = int(parser_api.upload_simple_max_bytes)
+        self._upload_part_size_bytes = int(parser_api.upload_part_size_bytes)
+
+        self._http_timeout_sec = float(getattr(parser_api, "http_timeout_seconds", 10.0))
+        self._timeout_sec = int(getattr(parser_api, "response_timeout_seconds", 1800))
+        self._default_poll_interval_ms = int(getattr(parser_api, "poll_interval_ms", 3000))
+
+        if not self._api_host:
+            raise ValueError("parser_api.host is required for UnderstandingAPI")
+        if not self._api_key:
+            raise ValueError("parser_api.api_key is required for UnderstandingAPI")
+
+        self._video_exts = {e.lstrip(".") for e in VIDEO_EXTENSIONS}
+        self._video_exts.add(MPEG_TS_EXTENSION_ALIAS)
+        self._audio_exts = {e.lstrip(".") for e in AUDIO_EXTENSIONS}
+        self._image_exts = {e.lstrip(".") for e in IMAGE_EXTENSIONS}
+
+    @property
+    def supported_extensions(self) -> List[str]:
+        return [".pdf", ".docx", ".pptx", ".xlsx", ".mp4", ".mp3", ".wav", ".mov"]
+
+    async def parse(self, source: Union[str, Path], instruction: str = "", **kwargs) -> ParseResult:
+        """
+        Parse via third-party API.
+
+        - For local files: upload to Files API (file_id).
+        - For URL: submit URL directly via Responses API.
+        """
+        source_str = str(source)
+        original_source = kwargs.get("original_source")
+        resolved_extension = str(kwargs.get("resolved_extension") or "").lower().lstrip(".")
+        display_name = kwargs.get("resource_name") or kwargs.get("source_name")
+        prepared_response_id = kwargs.get(PREPARED_RESPONSE_ID_ARG)
+        if prepared_response_id is not None:
+            if not isinstance(prepared_response_id, str) or not prepared_response_id.strip():
+                raise ValueError(f"{PREPARED_RESPONSE_ID_ARG} must be a non-empty string")
+            prepared_response_id = prepared_response_id.strip()
+        prepared_file_id = kwargs.get(PREPARED_FILE_ID_ARG)
+        if prepared_file_id is not None:
+            if not isinstance(prepared_file_id, str) or not prepared_file_id.strip():
+                raise ValueError(f"{PREPARED_FILE_ID_ARG} must be a non-empty string")
+            prepared_file_id = prepared_file_id.strip()
+        if prepared_response_id and prepared_file_id:
+            raise ValueError(
+                f"{PREPARED_RESPONSE_ID_ARG} and {PREPARED_FILE_ID_ARG} are mutually exclusive"
+            )
+
+        # Only a directly routed Feishu URL uses the Lark protocol. Accessor
+        # output is an existing local Markdown file and must stay local.
+        is_feishu_url = self._is_feishu_url(source_str)
+        lark_file = (
+            await self._resolve_lark_file(kwargs)
+            if is_feishu_url and not prepared_response_id and not prepared_file_id
+            else None
+        )
+
+        url: Optional[str] = None
+        local_path: Optional[Path] = None
+        source_path = Path(source_str)
+        if source_path.is_file():
+            local_path = source_path
+        elif source_str.startswith(("http://", "https://")):
+            url = source_str
+        elif isinstance(original_source, str) and original_source.startswith(
+            ("http://", "https://")
+        ):
+            url = original_source
+        elif prepared_file_id:
+            local_path = None
+        else:
+            local_path = source_path
+
+        if url is not None:
+            parsed = urlparse(url)
+            inferred_name = Path(parsed.path).name
+            doc_type = resolved_extension or Path(parsed.path).suffix.lower().lstrip(".")
+            if is_feishu_url:
+                path_parts = [part for part in parsed.path.split("/") if part]
+                doc_type = {
+                    "sheets": "sheet",
+                    "base": "bitable",
+                }.get(path_parts[0], path_parts[0])
+        else:
+            inferred_name = local_path.name if local_path is not None else Path(source_str).name
+            if not prepared_file_id and (local_path is None or not local_path.is_file()):
+                raise ValueError(
+                    "UnderstandingAPI supports http(s) URLs or local files. "
+                    "Got an invalid local file path."
+                )
+            doc_type = resolved_extension or (
+                local_path.suffix.lower().lstrip(".") if local_path is not None else ""
+            )
+
+        effective_name = str(display_name or inferred_name or "resource")
+        doc_name = Path(effective_name).stem or "resource"
+        doc_type = doc_type or "unknown"
+
+        task_meta: Dict[str, Any] = {"doc_name": doc_name, "doc_type": doc_type}
+        source_name = kwargs.get("source_name")
+        if isinstance(source_name, str) and source_name:
+            task_meta["source_name"] = source_name
+        if local_path is not None:
+            task_meta["file_name"] = local_path.name
+
+        try:
+            if prepared_response_id:
+                response_id = prepared_response_id
+            elif prepared_file_id:
+                task_meta["file_id"] = prepared_file_id
+                response_obj = await self._create_response_for_file(file_id=prepared_file_id)
+            elif url is None and local_path is not None:
+                file_obj = await self._create_file(
+                    local_path=local_path,
+                    source_name=source_name,
+                    resolved_extension=resolved_extension,
+                )
+                file_id_value = file_obj.get("id")
+                if not file_id_value:
+                    raise RuntimeError(
+                        f"files api missing file_id: {self._safe_error_summary(file_obj)}"
+                    )
+                file_id = str(file_id_value)
+                task_meta["file_id"] = file_id
+                response_obj = await self._create_response_for_file(file_id=file_id)
+            else:
+                if url is None:
+                    raise RuntimeError("missing url for url mode")
+                response_obj = await self._create_response_for_url(
+                    url=url,
+                    doc_type=doc_type,
+                    lark_file=lark_file,
+                )
+
+            if not prepared_response_id:
+                response_id_value = response_obj.get("id")
+                if not response_id_value:
+                    raise RuntimeError(
+                        f"responses api missing id: {self._safe_error_summary(response_obj)}"
+                    )
+                response_id = str(response_id_value)
+            task_meta["response_id"] = response_id
+            checkpoint = kwargs.get("_response_checkpoint")
+            if checkpoint is not None:
+                await checkpoint(response_id)
+
+            response_obj = await self._poll_response(response_id=response_id)
+            zip_url = self._extract_zip_url(response_obj)
+            if not zip_url:
+                raise RuntimeError(
+                    "understanding result missing zip_url: "
+                    f"{self._safe_error_summary(response_obj)}"
+                )
+
+            zip_path = await self._download_zip(zip_url)
+            try:
+                if is_feishu_url and not display_name:
+                    archive_root = self._single_zip_root_name(zip_path)
+                    if archive_root:
+                        doc_name = archive_root
+                        task_meta["doc_name"] = doc_name
+                unpack_kwargs = {
+                    "zip_path": zip_path,
+                    "resource_name": doc_name,
+                }
+                if kwargs.get("parse_output_store") is not None:
+                    unpack_kwargs["parse_output_store"] = kwargs["parse_output_store"]
+                unpacked = await self._unpack_zip_to_temp_dir(**unpack_kwargs)
+                artifact_ref = unpacked if isinstance(unpacked, ParseArtifactRef) else None
+                temp_dir_path = artifact_ref.root if artifact_ref is not None else unpacked
+            finally:
+                try:
+                    zip_path.unlink()
+                except Exception:
+                    pass
+        except UnderstandingAPIError:
+            raise
+        except Exception as exc:
+            logger.warning("[UnderstandingAPI] Parse failed: %s; meta=%s", exc, task_meta)
+            raise UnderstandingAPIError(str(exc), task_meta) from exc
+
+        content_type = (
+            "video"
+            if doc_type in self._video_exts
+            else "audio"
+            if doc_type in self._audio_exts
+            else "image"
+            if doc_type in self._image_exts
+            else "text"
+        )
+        root_node = ResourceNode(
+            type=NodeType.ROOT,
+            title=doc_name,
+            level=0,
+            detail_file=None,
+            content_path=None,
+            meta={
+                "source_title": doc_name,
+                "semantic_name": doc_name,
+                "original_filename": (
+                    f"{doc_name}.{doc_type}" if doc_type and doc_type != "unknown" else doc_name
+                ),
+            },
+            content_type=content_type,
+        )
+
+        result = ParseResult(
+            root=root_node,
+            source_path=original_source if isinstance(original_source, str) else url or source_str,
+            source_format=(
+                content_type if content_type in {"image", "audio", "video"} else doc_type
+            ),
+            temp_dir_path=temp_dir_path,
+            artifact_ref=artifact_ref,
+            parser_name="UnderstandingAPI",
+            meta={key: task_meta[key] for key in ("file_id", "response_id") if task_meta.get(key)},
+        )
+
+        logger.info("[UnderstandingAPI] done")
+        return result
+
+    async def upload_file(
+        self,
+        source: Union[str, Path],
+        *,
+        source_name: Optional[str] = None,
+        resolved_extension: str = "",
+    ) -> str:
+        """Upload a local file and return a durable Files API file_id."""
+        local_path = Path(source)
+        if not local_path.is_file():
+            raise ValueError("UnderstandingAPI file upload requires an existing local file")
+
+        file_obj = await self._create_file(
+            local_path=local_path, source_name=source_name, resolved_extension=resolved_extension
+        )
+        file_id = file_obj.get("id")
+        if not file_id:
+            raise RuntimeError(f"files api missing file_id: {self._safe_error_summary(file_obj)}")
+        return str(file_id)
+
+    async def submit_file(
+        self,
+        source: Union[str, Path],
+        *,
+        source_name: Optional[str] = None,
+        resolved_extension: str = "",
+    ) -> str:
+        """Upload a local file and submit it without retaining the local artifact."""
+        file_id = await self.upload_file(
+            source, source_name=source_name, resolved_extension=resolved_extension
+        )
+        response_obj = await self._create_response_for_file(file_id=str(file_id))
+        response_id = response_obj.get("id")
+        if not response_id:
+            raise RuntimeError(
+                f"responses api missing id: {self._safe_error_summary(response_obj)}"
+            )
+        return str(response_id)
+
+    async def submit_url(self, source: str, **kwargs) -> str:
+        """Submit a URL without persisting its credentials in a queue payload."""
+        if not isinstance(source, str) or not source.startswith(("http://", "https://")):
+            raise ValueError("UnderstandingAPI URL submission requires an http(s) URL")
+
+        is_feishu_url = self._is_feishu_url(source)
+        lark_file = await self._resolve_lark_file(kwargs) if is_feishu_url else None
+
+        parsed = urlparse(source)
+        doc_type = Path(parsed.path).suffix.lower().lstrip(".") or "unknown"
+        if is_feishu_url:
+            path_parts = [part for part in parsed.path.split("/") if part]
+            doc_type = {
+                "sheets": "sheet",
+                "base": "bitable",
+            }.get(path_parts[0], path_parts[0])
+
+        response_obj = await self._create_response_for_url(
+            url=source,
+            doc_type=doc_type,
+            lark_file=lark_file if is_feishu_url else None,
+        )
+        response_id = response_obj.get("id")
+        if not response_id:
+            raise RuntimeError(
+                f"responses api missing id: {self._safe_error_summary(response_obj)}"
+            )
+        return str(response_id)
+
+    def can_submit_url_directly(self, source: str, **kwargs) -> bool:
+        """Return whether this URL can bypass source materialization."""
+        if not source.startswith(("http://", "https://")) or not self._is_feishu_url(source):
+            return False
+        from openviking.parse.accessors.feishu_accessor import FeishuAccessor
+        from openviking.parse.feishu_import import recursive_wiki
+
+        doc_type, _ = FeishuAccessor._parse_feishu_url(source)
+        if doc_type in {"folder", "file"} or (doc_type == "wiki" and recursive_wiki(kwargs)):
+            return False
+        if self._normalize_lark_file(kwargs):
+            return True
+        try:
+            from openviking.resource.feishu_watch_auth import load_feishu_app_credentials
+
+            load_feishu_app_credentials(config=kwargs.get("feishu_config"))
+            return True
+        except (FileNotFoundError, ValueError):
+            return False
+
+    async def parse_content(
+        self, content: str, source_path: Optional[str] = None, instruction: str = "", **kwargs
+    ) -> ParseResult:
+        raise NotImplementedError("UnderstandingAPI.parse_content is not supported")
+
+    def _json_bytes(self, obj: Any) -> bytes:
+        return json.dumps(obj, ensure_ascii=False).encode("utf-8")
+
+    def _auth_headers(self, extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "x-kb-env": "snake",
+        }
+        if extra:
+            headers.update(extra)
+        return headers
+
+    def _safe_error_summary(self, obj: Any) -> Dict[str, Any]:
+        if not isinstance(obj, dict):
+            return {"kind": type(obj).__name__}
+        summary: Dict[str, Any] = {}
+        for key in ("id", "status", "message"):
+            if key in obj:
+                summary[key] = obj.get(key)
+        err = obj.get("error")
+        if isinstance(err, dict):
+            summary["error"] = {
+                k: err.get(k) for k in ("type", "code", "message", "param") if k in err
+            }
+        # Failed Responses tasks carry the reason in output_text, not error.
+        output = obj.get("output")
+        if obj.get("status") == "failed" and isinstance(output, list):
+            texts = []
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if not isinstance(part, dict) or part.get("type") != "output_text":
+                        continue
+                    text = part.get("text")
+                    if isinstance(text, str) and text.strip():
+                        texts.append(text)
+            if texts:
+                summary["output_text"] = texts
+        return summary
+
+    def _error_message(self, obj: Any) -> str:
+        """Extract the failure reason without adding remote identifiers."""
+        summary = self._safe_error_summary(obj)
+        error = summary.get("error") or {}
+        for message in (error.get("message"), summary.get("message")):
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+        if summary.get("output_text"):
+            return "; ".join(summary["output_text"])
+        return str(error.get("code") or "request failed")
+
+    def _raise_if_error(self, obj: Any, *, context: str) -> None:
+        if not isinstance(obj, dict):
+            return
+        err = obj.get("error")
+        if isinstance(err, dict) and err.get("code"):
+            raise RuntimeError(f"{context}: {self._error_message(obj)}")
+
+    def _read_api_response(self, rsp: httpx.Response, *, context: str) -> Dict[str, Any]:
+        """Preserve business error details and the HTTP exception's status metadata."""
+        try:
+            rsp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            try:
+                summary = self._safe_error_summary(rsp.json())
+            except ValueError:
+                summary = None
+            if summary is not None:
+                raise httpx.HTTPStatusError(
+                    f"{context}: HTTP {rsp.status_code}: {summary}",
+                    request=exc.request,
+                    response=exc.response,
+                ) from exc
+            raise
+        body = rsp.json()
+        self._raise_if_error(body, context=context)
+        return body
+
+    async def _create_file(
+        self,
+        *,
+        local_path: Path,
+        source_name: Optional[str] = None,
+        resolved_extension: str = "",
+    ) -> Dict[str, Any]:
+        file_size = local_path.stat().st_size
+        if file_size == 0:
+            raise InvalidArgumentError("Understanding parser does not support empty files.")
+        # The local path locates bytes; its temporary basename is not the source identity.
+        file_name = Path(source_name).name if source_name else local_path.name
+        extension = (resolved_extension or local_path.suffix).lower().lstrip(".")
+        if extension == MPEG_TS_EXTENSION_ALIAS:
+            extension = TYPESCRIPT_MPEG_TS_EXTENSION.lstrip(".")
+        # Preserve dotted identifiers (e.g. 2601.00014) and existing suffix casing.
+        if extension and not file_name.lower().endswith(f".{extension}"):
+            file_name = f"{file_name}.{extension}"
+        if file_size > self._upload_simple_max_bytes:
+            if not self._enable_resumable_upload:
+                raise ValueError(
+                    f"file too large: size={file_size}, "
+                    f"upload_simple_max_bytes={self._upload_simple_max_bytes}; "
+                    "enable parser_api.enable_resumable_upload to continue"
+                )
+            return await self._multipart_create_file(local_path, file_name=file_name)
+
+        data: Dict[str, Any] = {"purpose": "user_data"}
+
+        content_type = mimetypes.guess_type(file_name)[0] or "application/octet-stream"
+        with open(local_path, "rb") as f:
+            files = {"file": (file_name, f, content_type)}
+            async with httpx.AsyncClient(timeout=1200.0, follow_redirects=True) as client:
+                rsp = await client.post(
+                    f"{self._api_base}/files",
+                    headers=self._auth_headers(),
+                    data=data,
+                    files=files,
+                )
+        return self._read_api_response(rsp, context="files api error")
+
+    async def _create_response_for_file(self, *, file_id: str) -> Dict[str, Any]:
+        content: Dict[str, Any] = {"type": "file", "file": {"file_id": file_id}}
+        payload = {
+            "input": [{"role": "user", "content": [content]}],
+            "tools": [{"type": "understanding"}],
+            "store": True,
+        }
+        async with httpx.AsyncClient(
+            timeout=self._http_timeout_sec, follow_redirects=True
+        ) as client:
+            rsp = await client.post(
+                f"{self._api_base}/responses",
+                content=self._json_bytes(payload),
+                headers=self._auth_headers({"Content-Type": "application/json;charset=UTF-8"}),
+            )
+        return self._read_api_response(rsp, context="responses api error")
+
+    async def _create_response_for_url(
+        self,
+        *,
+        url: str,
+        doc_type: str,
+        lark_file: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        if doc_type in self._video_exts:
+            content: Dict[str, Any] = {"type": "input_video", "video_url": url}
+        elif doc_type in self._image_exts:
+            content = {"type": "input_image", "image_url": url}
+        elif doc_type in self._audio_exts:
+            content = {"type": "input_audio", "audio_url": url}
+        else:
+            content = {"type": "input_file", "file_url": url}
+        if lark_file:
+            content["lark_file"] = dict(lark_file)
+        payload = {
+            "input": [{"role": "user", "content": [content]}],
+            "tools": [{"type": "understanding"}],
+            "store": True,
+        }
+        async with httpx.AsyncClient(
+            timeout=self._http_timeout_sec, follow_redirects=True
+        ) as client:
+            rsp = await client.post(
+                f"{self._api_base}/responses",
+                content=self._json_bytes(payload),
+                headers=self._auth_headers({"Content-Type": "application/json;charset=UTF-8"}),
+            )
+        return self._read_api_response(rsp, context="responses api error")
+
+    @staticmethod
+    def _is_feishu_url(source: str) -> bool:
+        try:
+            from openviking.parse.accessors.feishu_accessor import FeishuAccessor
+
+            return FeishuAccessor._is_feishu_url(source)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _normalize_lark_file(kwargs: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        raw_lark_file = kwargs.get("lark_file")
+        if raw_lark_file is None:
+            raw_lark_file = {"user_access_token": kwargs.get("feishu_access_token")}
+        if not isinstance(raw_lark_file, dict):
+            raise ValueError("lark_file must be an object")
+
+        auth = {}
+        for key in ("user_access_token", "tenant_access_token"):
+            value = raw_lark_file.get(key)
+            if isinstance(value, str) and value.strip():
+                auth[key] = value.strip()
+        if len(auth) > 1:
+            raise ValueError(
+                "lark_file must contain exactly one of user_access_token or tenant_access_token"
+            )
+        return auth or None
+
+    async def _resolve_lark_file(self, kwargs: Dict[str, Any]) -> Dict[str, str]:
+        from openviking.connector.auth import current_feishu_token
+
+        token_provider = current_feishu_token.get()
+        if token_provider is not None:
+            return {"user_access_token": await asyncio.to_thread(token_provider.get_token)}
+        auth = self._normalize_lark_file(kwargs)
+        if auth:
+            return auth
+        try:
+            from openviking.resource.feishu_watch_auth import FeishuOAuthClient
+
+            token = await FeishuOAuthClient.from_config(
+                config=kwargs.get("feishu_config")
+            ).get_tenant_access_token()
+        except (FileNotFoundError, ValueError) as exc:
+            raise ValueError(
+                "exactly one Feishu user or tenant access token is required for parser API imports"
+            ) from exc
+        return {"tenant_access_token": token}
+
+    @staticmethod
+    def _single_zip_root_name(zip_path: Path) -> Optional[str]:
+        roots = set()
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            normalize_zip_filenames(zf)
+            for info in zf.infolist():
+                raw_name = info.filename.rstrip("/")
+                if not raw_name:
+                    continue
+                path = PurePosixPath(raw_name)
+                if path.is_absolute() or not path.parts or path.parts[0] in {".", ".."}:
+                    return None
+                roots.add(path.parts[0])
+                if len(path.parts) == 1 and not info.is_dir():
+                    return None
+        if len(roots) != 1:
+            return None
+        return next(iter(roots))
+
+    async def _poll_response(self, *, response_id: str) -> Dict[str, Any]:
+        deadline = asyncio.get_running_loop().time() + float(self._timeout_sec)
+        last_status = None
+        async with httpx.AsyncClient(
+            timeout=self._http_timeout_sec, follow_redirects=True
+        ) as client:
+            while True:
+                rsp = await client.get(
+                    f"{self._api_base}/responses/{response_id}",
+                    headers=self._auth_headers(),
+                )
+                body = self._read_api_response(rsp, context="responses api error")
+                status = body.get("status")
+                if status != last_status:
+                    logger.info(f"[UnderstandingAPI] response_id={response_id} status={status}")
+                    last_status = status
+                if status == "completed":
+                    return body
+                if status == "failed":
+                    raise RuntimeError(f"understanding failed: {self._error_message(body)}")
+                if asyncio.get_running_loop().time() > deadline:
+                    raise TimeoutError(f"understanding timeout: last_status={last_status}")
+                await asyncio.sleep(max(self._default_poll_interval_ms, 200) / 1000.0)
+
+    def _extract_zip_url(self, response_obj: Dict[str, Any]) -> Optional[str]:
+        result_obj = response_obj.get("result") or {}
+        if isinstance(result_obj, dict) and result_obj.get("zip_url"):
+            return str(result_obj["zip_url"])
+        for output_item in response_obj.get("output") or []:
+            if not isinstance(output_item, dict):
+                continue
+            for content_item in output_item.get("content") or []:
+                if not isinstance(content_item, dict):
+                    continue
+                if content_item.get("type") != "zip_url":
+                    continue
+                zip_obj = content_item.get("zip_url")
+                if isinstance(zip_obj, dict) and zip_obj.get("url"):
+                    return str(zip_obj["url"])
+        return None
+
+    async def _uploads_init(self, *, file_path: Path, file_name: str) -> Dict[str, Any]:
+        payload = {
+            "file_name": file_name,
+            "file_size": file_path.stat().st_size,
+            "content_type": mimetypes.guess_type(file_name)[0] or "application/octet-stream",
+            "part_size": int(self._upload_part_size_bytes),
+        }
+        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+            rsp = await client.post(
+                f"{self._api_base}/files?uploads",
+                content=self._json_bytes(payload),
+                headers=self._auth_headers({"Content-Type": "application/json;charset=UTF-8"}),
+            )
+        return self._read_api_response(rsp, context="uploads init error")
+
+    async def _uploads_status(self, *, upload_id: str, object_key: str) -> Dict[str, Any]:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            rsp = await client.get(
+                f"{self._api_base}/files?upload_id={upload_id}&object_key={object_key}",
+                headers=self._auth_headers(),
+            )
+        return self._read_api_response(rsp, context="uploads status error")
+
+    async def _uploads_put_part(
+        self, *, upload_id: str, object_key: str, part_number: int, data: bytes
+    ) -> Dict[str, Any]:
+        headers = self._auth_headers({"Content-Type": "application/octet-stream"})
+        async with httpx.AsyncClient(timeout=1200.0, follow_redirects=True) as client:
+            rsp = await client.put(
+                f"{self._api_base}/files?upload_id={upload_id}&object_key={object_key}&part_number={part_number}",
+                headers=headers,
+                content=data,
+            )
+        return self._read_api_response(rsp, context="uploads part error")
+
+    async def _uploads_complete(
+        self, *, upload_id: str, object_key: str, parts: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        payload = {"parts": parts}
+        async with httpx.AsyncClient(timeout=600.0, follow_redirects=True) as client:
+            rsp = await client.post(
+                f"{self._api_base}/files?upload_id={upload_id}&object_key={object_key}",
+                content=self._json_bytes(payload),
+                headers=self._auth_headers({"Content-Type": "application/json;charset=UTF-8"}),
+            )
+        return self._read_api_response(rsp, context="uploads complete error")
+
+    async def _multipart_create_file(self, file_path: Path, *, file_name: str) -> Dict[str, Any]:
+        init_obj = await self._uploads_init(file_path=file_path, file_name=file_name)
+        upload_id = init_obj.get("upload_id") or init_obj.get("uploadId")
+        object_key = init_obj.get("object_key") or init_obj.get("objectKey")
+        part_size = int(
+            init_obj.get("part_size") or init_obj.get("partSize") or self._upload_part_size_bytes
+        )
+        if not upload_id:
+            raise RuntimeError(
+                f"uploads init missing upload_id: {self._safe_error_summary(init_obj)}"
+            )
+        if not object_key:
+            raise RuntimeError(
+                f"uploads init missing object_key: {self._safe_error_summary(init_obj)}"
+            )
+
+        status_obj = await self._uploads_status(upload_id=upload_id, object_key=object_key)
+        uploaded_parts = status_obj.get("parts") or []
+        uploaded_map: Dict[int, str] = {}
+        for p in uploaded_parts:
+            try:
+                pn = int(p.get("part_number") or p.get("partNumber"))
+            except Exception:
+                continue
+            etag = p.get("etag")
+            if isinstance(etag, str) and etag:
+                uploaded_map[pn] = etag
+
+        parts: Dict[int, str] = dict(uploaded_map)
+        file_size = file_path.stat().st_size
+        total_parts = (file_size + part_size - 1) // part_size
+
+        with open(file_path, "rb") as f:
+            for n in range(1, total_parts + 1):
+                if n in parts:
+                    continue
+                f.seek((n - 1) * part_size)
+                chunk = f.read(part_size)
+                part_obj = await self._uploads_put_part(
+                    upload_id=upload_id, object_key=object_key, part_number=n, data=chunk
+                )
+                etag = part_obj.get("etag")
+                if not etag:
+                    raise RuntimeError(
+                        f"uploads part missing etag: part={n} resp={self._safe_error_summary(part_obj)}"
+                    )
+                parts[n] = etag
+
+        complete_obj = await self._uploads_complete(
+            upload_id=upload_id,
+            object_key=object_key,
+            parts=[{"part_number": n, "etag": e} for n, e in sorted(parts.items())],
+        )
+        if complete_obj.get("status") != "active" or not complete_obj.get("id"):
+            raise RuntimeError(f"uploads complete did not return file object: {complete_obj}")
+        return complete_obj
+
+    async def _download_zip(self, zip_url: str) -> Path:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            rsp = await client.get(zip_url)
+        rsp.raise_for_status()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as f:
+            f.write(rsp.content)
+            return Path(f.name)
+
+    async def _unpack_zip_to_temp_dir(
+        self,
+        zip_path: Path,
+        resource_name: str,
+        *,
+        parse_output_store: Any = None,
+    ) -> ParseArtifactRef:
+        writer = await create_parse_artifact_writer(
+            parse_output_store,
+            viking_fs=get_viking_fs() if parse_output_store is None else None,
+        )
+        resource_rel = str(resource_name).strip("/")
+        try:
+            await writer.mkdir(resource_rel)
+
+            with tempfile.TemporaryDirectory() as extract_dir:
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    safe_extract_zip(zf, extract_dir)
+                extract_path = Path(extract_dir)
+                items = [p for p in extract_path.iterdir() if p.name not in {".", ".."}]
+                if len(items) == 1 and items[0].is_dir():
+                    root_dir = items[0]
+                else:
+                    root_dir = extract_path
+
+                image_mappings = await asyncio.to_thread(build_artifact_image_mappings, root_dir)
+
+                for child in root_dir.rglob("*"):
+                    rel = child.relative_to(root_dir).as_posix()
+                    if child.name in {".", "..", IMAGE_MAPPINGS_FILENAME}:
+                        continue
+                    if child.is_dir():
+                        await writer.mkdir(f"{resource_rel}/{rel}")
+                    else:
+                        await writer.write_bytes(
+                            f"{resource_rel}/{rel}",
+                            await asyncio.to_thread(child.read_bytes),
+                        )
+
+                if image_mappings:
+                    await writer.write_text(
+                        f"{resource_rel}/{IMAGE_MAPPINGS_FILENAME}",
+                        json.dumps(image_mappings, ensure_ascii=False),
+                    )
+        except BaseException:
+            try:
+                await writer.cleanup()
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "[UnderstandingAPI] Failed to clean temporary artifact %s: %s",
+                    writer.ref.root,
+                    cleanup_exc,
+                )
+            raise
+
+        return await writer.finalize(resource_rel=resource_rel)

@@ -1,0 +1,186 @@
+# Makefile for OpenViking
+
+# Variables
+PYTHON ?= python3
+SETUP_PY := setup.py
+OV_CLI_DIR := crates/ov_cli
+
+# Dependency Versions
+MIN_PYTHON_VERSION := 3.10
+MIN_CMAKE_VERSION := 3.15
+MIN_RUST_VERSION := 1.91.1
+MIN_GCC_VERSION := 9
+MIN_CLANG_VERSION := 11
+
+# Output directories to clean
+CLEAN_DIRS := \
+	build/ \
+	dist/ \
+	*.egg-info/ \
+	openviking/bin/ \
+	openviking/lib/ \
+	openviking/web_studio/dist/ \
+	$(OV_CLI_DIR)/target/ \
+	src/cmake_build/ \
+	.pytest_cache/ \
+	.coverage \
+	htmlcov/ \
+	**/__pycache__/
+
+.PHONY: all build clean help check-pip check-deps
+.PHONY: build-cli build-studio
+
+all: build
+
+help:
+	@echo "Available targets:"
+	@echo "  build           - Build ragfs-python and C++ extensions using setup.py"
+	@echo "  build-cli       - Build Rust CLI (ov) in development mode (fast) and copy to openviking/bin/"
+	@echo "  build-studio    - Build web-studio SPA and copy into openviking/web_studio/dist/"
+	@echo "  clean           - Remove build artifacts and temporary files"
+	@echo "  check-deps      - Check if required dependencies (Rust, CMake, etc.) are installed"
+	@echo "  help            - Show this help message"
+
+check-pip:
+	@if command -v uv > /dev/null 2>&1 && uv pip --help > /dev/null 2>&1; then \
+		echo "  [OK] uv pip found"; \
+	elif $(PYTHON) -m pip --version > /dev/null 2>&1; then \
+		echo "  [OK] pip found"; \
+	else \
+		echo "Error: Neither uv pip nor pip found for $(PYTHON)."; \
+		echo "Try fixing your environment by running:"; \
+		echo "  uv sync          # if using uv"; \
+		echo "  or"; \
+		echo "  $(PYTHON) -m ensurepip --upgrade"; \
+		exit 1; \
+	fi
+
+check-deps:
+	@echo "Checking dependencies..."
+	@# Python check
+	@$(PYTHON) -c "import sys; v=sys.version_info; exit(0 if v.major > 3 or (v.major == 3 and v.minor >= 10) else 1)" || (echo "Error: Python >= $(MIN_PYTHON_VERSION) is required."; exit 1)
+	@echo "  [OK] Python $$( $(PYTHON) -V | cut -d' ' -f2 )"
+	@# CMake check
+	@command -v cmake > /dev/null 2>&1 || (echo "Error: CMake is not installed."; exit 1)
+	@CMAKE_VER=$$(cmake --version | head -n1 | awk '{print $$3}'); \
+	if ! $(PYTHON) -c "import re, sys; parse=lambda v: tuple(int(x) for x in re.match(r'^[0-9]+(?:\.[0-9]+)*', v).group().split('.')); raise SystemExit(0 if parse(sys.argv[1]) >= parse(sys.argv[2]) else 1)" "$$CMAKE_VER" "$(MIN_CMAKE_VERSION)"; then \
+		echo "Error: CMake >= $(MIN_CMAKE_VERSION) is required. Found $$CMAKE_VER"; exit 1; \
+	fi; \
+	echo "  [OK] CMake $$CMAKE_VER"
+	@# Rust check
+	@command -v rustc > /dev/null 2>&1 || (echo "Error: Rust is not installed."; exit 1)
+	@RUST_VER=$$(rustc --version | awk '{print $$2}'); \
+	$(PYTHON) -c "import sys; parse=lambda v: tuple(int(x) for x in v.split('.')); raise SystemExit(0 if parse(sys.argv[1]) >= parse(sys.argv[2]) else 1)" "$$RUST_VER" "$(MIN_RUST_VERSION)" || (echo "Error: Rust >= $(MIN_RUST_VERSION) is required. Found $$RUST_VER"; exit 1); \
+	echo "  [OK] Rust $$RUST_VER"
+	@# C++ Compiler check
+	@if command -v clang++ > /dev/null 2>&1; then \
+		CLANG_VER_FULL=$$(clang++ --version | head -n1 | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -n1); \
+		CLANG_VER=$$(echo $$CLANG_VER_FULL | cut -d. -f1); \
+		if [ $$CLANG_VER -lt $(MIN_CLANG_VERSION) ]; then echo "Error: Clang >= $(MIN_CLANG_VERSION) is required. Found $$CLANG_VER_FULL"; exit 1; fi; \
+		echo "  [OK] Clang $$CLANG_VER_FULL"; \
+	elif command -v g++ > /dev/null 2>&1; then \
+		GCC_VER_FULL=$$(g++ -dumpversion); \
+		GCC_VER=$$(echo $$GCC_VER_FULL | cut -d. -f1); \
+		if [ $$GCC_VER -lt $(MIN_GCC_VERSION) ]; then echo "Error: GCC >= $(MIN_GCC_VERSION) is required. Found $$GCC_VER_FULL"; exit 1; fi; \
+		echo "  [OK] GCC $$GCC_VER_FULL"; \
+	else \
+		echo "Error: C++ compiler (GCC or Clang) is required."; exit 1; \
+	fi
+
+build: check-deps check-pip build-studio
+	@echo "Cleaning stale ragfs-python native artifacts from project .venv..."
+	@if [ -x .venv/bin/python ]; then \
+		.venv/bin/python -c 'import sysconfig; from pathlib import Path; roots = {Path(sysconfig.get_path("platlib")), Path(sysconfig.get_path("purelib"))}; removed = []; [removed.append(path) or path.unlink() for root in roots if root.exists() for path in root.rglob("*") if path.is_file() and path.name.startswith("ragfs_python") and path.suffix in {".so", ".pyd", ".dylib"}]; print("  [OK] removed stale ragfs artifacts from .venv" if removed else "  [OK] no stale ragfs artifacts found in .venv")'; \
+	else \
+		echo "  [SKIP] project .venv not found; skip ragfs native cleanup"; \
+	fi
+	@echo "Starting build process via setup.py..."
+	$(PYTHON) $(SETUP_PY) build_ext --inplace
+	@if command -v uv > /dev/null 2>&1 && uv pip --help > /dev/null 2>&1; then \
+		echo "  [OK] uv pip found, use uv pip to install..."; \
+		uv pip install -e .; \
+	else \
+		echo "  [OK] pip found, use pip to install..."; \
+		$(PYTHON) -m pip install -e .; \
+	fi
+	@echo "Building ragfs-python (Rust RAGFS binding) into openviking/lib/..."
+	@set -e; \
+	MATURIN_CMD=""; \
+	if command -v maturin > /dev/null 2>&1; then \
+		MATURIN_CMD=maturin; \
+	elif command -v uv > /dev/null 2>&1 && uv pip --help > /dev/null 2>&1; then \
+		uv pip install maturin; \
+		MATURIN_CMD=maturin; \
+	fi; \
+	if [ -n "$$MATURIN_CMD" ]; then \
+		RAGFS_TMPDIR=$$(mktemp -d); \
+		EXTRACT_SCRIPT=$$(mktemp); \
+		trap 'rm -f "$$EXTRACT_SCRIPT"; rm -rf "$$RAGFS_TMPDIR"' 0; \
+		(cd crates/ragfs-python && $$MATURIN_CMD build --release --out "$$RAGFS_TMPDIR" 2>&1); \
+		mkdir -p openviking/lib; \
+		rm -f openviking/lib/ragfs_python*.so openviking/lib/ragfs_python*.pyd openviking/lib/ragfs_python*.dylib; \
+		echo "import zipfile, glob, shutil, os, sys" > "$$EXTRACT_SCRIPT"; \
+		echo "whls = glob.glob(os.path.join('$$RAGFS_TMPDIR', 'ragfs_python-*.whl'))" >> "$$EXTRACT_SCRIPT"; \
+		echo "assert whls, 'maturin produced no wheel'" >> "$$EXTRACT_SCRIPT"; \
+		echo "with zipfile.ZipFile(whls[0]) as zf:" >> "$$EXTRACT_SCRIPT"; \
+		echo "    for name in zf.namelist():" >> "$$EXTRACT_SCRIPT"; \
+		echo "        bn = os.path.basename(name)" >> "$$EXTRACT_SCRIPT"; \
+		echo "        if bn.startswith('ragfs_python.abi3.') and (bn.endswith('.so') or bn.endswith('.pyd')):" >> "$$EXTRACT_SCRIPT"; \
+		echo "            dst = os.path.join('openviking', 'lib', bn)" >> "$$EXTRACT_SCRIPT"; \
+		echo "            with zf.open(name) as src, open(dst, 'wb') as f: f.write(src.read())" >> "$$EXTRACT_SCRIPT"; \
+		echo "            os.chmod(dst, 0o755)" >> "$$EXTRACT_SCRIPT"; \
+		echo "            print(f'  [OK] ragfs-python: extracted {bn} -> {dst}')" >> "$$EXTRACT_SCRIPT"; \
+		echo "            sys.exit(0)" >> "$$EXTRACT_SCRIPT"; \
+		echo "print('[Warning] No ragfs_python abi3 .so/.pyd found in wheel')" >> "$$EXTRACT_SCRIPT"; \
+		echo "sys.exit(1)" >> "$$EXTRACT_SCRIPT"; \
+		$(PYTHON) "$$EXTRACT_SCRIPT"; \
+		rm -f "$$EXTRACT_SCRIPT"; \
+		rm -rf "$$RAGFS_TMPDIR"; \
+		trap - 0; \
+	else \
+		echo "  [SKIP] maturin not found, ragfs-python (Rust binding) will not be built."; \
+		echo "         Install maturin to enable: uv pip install maturin"; \
+	fi
+	@echo "Build completed successfully."
+
+clean:
+	@echo "Cleaning up build artifacts..."
+	@for dir in $(CLEAN_DIRS); do \
+		if [ -d "$$dir" ] || [ -f "$$dir" ]; then \
+			echo "Removing $$dir"; \
+			rm -rf $$dir; \
+		fi \
+	done
+	@find . -name "*.pyc" -delete
+	@find . -name "__pycache__" -type d -exec rm -rf {} +
+	@echo "Cleanup completed."
+
+# Web Studio target
+build-studio:
+	@set -e; \
+	if [ "$$OV_SKIP_STUDIO_BUILD" = "1" ]; then \
+		echo "  [SKIP] web-studio build disabled by OV_SKIP_STUDIO_BUILD=1"; \
+	elif [ -f openviking/web_studio/dist/index.html ]; then \
+		echo "  [OK] web-studio bundle already present"; \
+	elif ! command -v npm > /dev/null 2>&1; then \
+		echo "  [SKIP] npm not found; install Node.js to enable /studio"; \
+	elif [ ! -f web-studio/package.json ]; then \
+		echo "  [SKIP] web-studio source not found"; \
+	else \
+		echo "Building web-studio (Vite SPA)..."; \
+		(cd web-studio && npm ci && npm run build -- --base="/studio/"); \
+		mkdir -p openviking/web_studio; \
+		rm -rf openviking/web_studio/dist; \
+		cp -r web-studio/dist openviking/web_studio/dist; \
+		echo "  [OK] web-studio bundle copied to openviking/web_studio/dist/"; \
+	fi
+
+# Rust CLI targets
+build-cli:
+	@echo "Building Rust CLI (ov) in development mode..."
+	@cd $(OV_CLI_DIR) && cargo build
+	@mkdir -p openviking/bin
+	@cp target/debug/ov openviking/bin/ov
+	@chmod +x openviking/bin/ov
+	@echo "  [OK] CLI built at target/debug/ov"
+	@echo "  [OK] CLI copied to openviking/bin/ov"

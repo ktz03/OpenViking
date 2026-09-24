@@ -1,0 +1,144 @@
+{
+  "version": 1,
+  "updatedAt": "2026-09-04",
+  "cdnBaseUrl": "https://docs.openviking.net/",
+  "accessMethods": [
+    {
+      "id": "mcp",
+      "name": "MCP 接入",
+      "icon": "link",
+      "summary": "与任意支持 MCP 的客户端接入",
+      "detailPath": "https://docs.openviking.net/agents/zh/mcp.md"
+    },
+    {
+      "id": "cli",
+      "name": "CLI 接入",
+      "icon": "terminal",
+      "summary": "面向开发者在终端直接安装、配置和使用 OpenViking CLI",
+      "detailPath": "https://docs.openviking.net/agents/zh/cli.md"
+    },
+    {
+      "id": "agent-cli",
+      "name": "Agent CLI 接入",
+      "icon": "paperclip",
+      "summary": "把安装配置指令交给 AI Agent，让它像 skill 一样学会并记住 CLI 用法",
+      "detailPath": "https://docs.openviking.net/agents/zh/agent-cli.md"
+    },
+    {
+      "id": "api",
+      "name": "API 接入",
+      "icon": "code",
+      "summary": "标准 REST API，灵活调用所有能力",
+      "detailPath": "https://docs.openviking.net/agents/zh/api.md"
+    },
+    {
+      "id": "sdk",
+      "name": "SDK 接入",
+      "icon": "paperclip",
+      "summary": "多语言 SDK 封装，集成更便捷、高效",
+      "detailPath": "https://docs.openviking.net/agents/zh/sdk.md"
+    }
+  ],
+  "agents": [
+    {
+      "id": "claude-code",
+      "name": "Claude Code",
+      "tags": ["Plugin"],
+      "logo": "https://docs.openviking.net/agents/image/claude-code/logo.png",
+      "summary": "为 Claude Code 添加跨项目、跨会话（session）的长期记忆功能。安装完成后，每轮对话均会自动召回相关记忆并捕获新内容，无需模型主动调用任何工具",
+      "detailPath": "https://docs.openviking.net/agents/zh/claude-code.md"
+    },
+    {
+      "id": "codex",
+      "name": "Codex",
+      "tags": ["Plugin"],
+      "logo": "https://lf3-static.bytednsdoc.com/obj/eden-cn/lm_sth/ljhwZthlaukjlkulzlp/agent_logo/codex.png",
+      "summary": "为 Codex 提供持久化的跨会话（session）记忆。一次安装，即可实现：在用户每次输入前自动召回记忆，每轮对话结束后进行增量捕获，并在上下文压缩（compaction）前将记忆提交给抽取器",
+      "detailPath": "https://docs.openviking.net/agents/zh/codex.md"
+    },
+    {
+      "id": "doubao-work",
+      "name": "豆包工作",
+      "tags": ["MCP"],
+      "logo": "https://docs.openviking.net/agents/image/doubao-work/logo.png",
+      "summary": "通过连接器接入，为豆包工作提供持久化上下文记忆，接入后可在对话中自动召回相关记忆并存储新内容。",
+      "detailPath": "https://docs.openviking.net/agents/zh/doubao-work.md"
+    },
+    {
+      "id": "workbuddy",
+      "name": "WorkBuddy",
+      "tags": ["MCP"],
+      "logo": "https://docs.openviking.net/agents/image/workbuddy/logo.png",
+      "summary": "通过 MCP 工具，为 WorkBuddy 提供记忆召回与存储、知识资源管理、代码上下文检索等能力。",
+      "detailPath": "https://docs.openviking.net/agents/zh/workbuddy.md"
+    },
+    {
+      "id": "trae",
+      "name": "TRAE",
+      "tags": ["Hook", "MCP"],
+      "logo": "https://docs.openviking.net/agents/image/trae/logo.png",
+      "summary": "通过原生 Hook 与 MCP 工具，为 TRAE 和 TRAE CN 提供 prompt 自动召回与回合捕获",
+      "detailPath": "https://docs.openviking.net/agents/zh/trae.md"
+    },
+    {
+      "id": "cursor",
+      "name": "Cursor",
+      "tags": ["Plugin", "Memory"],
+      "logo": "https://docs.openviking.net/agents/image/cursor/logo.png",
+      "summary": "一条命令安装 Cursor 生命周期 Hook、MCP 工具、Rules 与 Skills，实现自动记忆召回和会话捕获",
+      "detailPath": "https://docs.openviking.net/agents/zh/cursor.md"
+    },
+    {
+      "id": "openclaw",
+      "name": "OpenClaw",
+      "tags": ["Plugin"],
+      "logo": "https://lf3-static.bytednsdoc.com/obj/eden-cn/lm_sth/ljhwZthlaukjlkulzlp/agent_logo/OpenClaw.png",
+      "summary": "Plugin 接入，作为 OpenClaw 的 context engine，支持多 Agent 跨会话记忆与自迭代，通过 npm 安装助手工具一键完成配置",
+      "detailPath": "https://docs.openviking.net/agents/zh/openclaw.md"
+    },
+    {
+      "id": "hermes",
+      "name": "Hermes Agent",
+      "tags": ["Provider"],
+      "logo": "https://lf3-static.bytednsdoc.com/obj/eden-cn/lm_sth/ljhwZthlaukjlkulzlp/agent_logo/Hermes-Agent.png",
+      "summary": "Hermes 官方内置 OpenViking。跑 hermes memory setup openviking，默认选火山云，再贴上 API Key 即可",
+      "detailPath": "https://docs.openviking.net/agents/zh/hermes.md"
+    },
+    {
+      "id": "opencode",
+      "name": "OpenCode",
+      "tags": ["Plugin"],
+      "logo": "https://docs.openviking.net/agents/image/opencode/logo.png",
+      "summary": "提供一个统一 OpenCode 插件，支持仓库上下文、记忆工具、session 同步与自动 recall",
+      "detailPath": "https://docs.openviking.net/agents/zh/opencode.md"
+    },
+    {
+      "id": "deepseek-harness",
+      "name": "DeepSeek Harness",
+      "tags": ["Plugin"],
+      "logo": "https://docs.openviking.net/agents/image/deepseek-harness/logo.png",
+      "summary": "为 DeepSeek Harness 提供跨项目、跨会话的长期记忆；安装后可自动召回相关记忆、捕获新内容，并直接使用 OpenViking 工具与 openviking-memory 技能，无需额外配置。",
+      "detailPath": "https://docs.openviking.net/agents/zh/deepseek-harness.md"
+    },
+    {
+      "id": "deerflow",
+      "name": "DeerFlow",
+      "tags": ["MemoryManager", "MCP"],
+      "logo": "https://docs.openviking.net/agents/image/deerflow/logo.png",
+      "summary": "DeerFlow 支持通过 MemoryManager 和 MCP 接入，实现记忆的自动写入、召回、注入及管理。建议同时启用两种方式，以获得完整的记忆体验。",
+      "detailPath": "https://docs.openviking.net/agents/zh/deerflow-memory-manager.md",
+      "tabs": [
+        {
+          "id": "memory-manager",
+          "label": "MemoryManager 接入",
+          "detailPath": "https://docs.openviking.net/agents/zh/deerflow-memory-manager.md"
+        },
+        {
+          "id": "mcp",
+          "label": "MCP 接入",
+          "detailPath": "https://docs.openviking.net/agents/zh/deerflow-mcp.md"
+        }
+      ]
+    }
+  ]
+}

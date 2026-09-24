@@ -1,0 +1,405 @@
+# 常见问题
+
+## 基础概念
+
+### OpenViking 是什么？解决什么问题？
+
+OpenViking 是一个专为 AI Agent 设计的开源上下文数据库。它解决了构建 AI Agent 时的核心痛点：
+
+- **上下文碎片化**：记忆、资源、技能散落各处，难以统一管理
+- **检索效果不佳**：传统 RAG 平铺式存储缺乏全局视野，难以理解完整语境
+- **上下文不可观测**：隐式检索链路如同黑箱，出错时难以调试
+- **记忆迭代有限**：缺乏 Agent 相关的任务记忆和自我进化能力
+
+OpenViking 通过文件系统范式统一管理所有上下文，实现分层供给与自我迭代。
+
+### OpenViking 和传统向量数据库有什么本质区别？
+
+| 维度 | 传统向量数据库 | OpenViking |
+|------|---------------|------------|
+| **存储模型** | 扁平化向量存储 | 层级化文件系统（AGFS） |
+| **检索方式** | 单一向量相似度搜索 | 目录递归检索 + 意图分析 + Rerank |
+| **输出形式** | 原始分块 | 结构化上下文（L0 摘要/L1 概览/L2 详情） |
+| **记忆能力** | 不支持 | 内置多种可扩展的记忆类型，支持自动提取和持续迭代 |
+| **可观测性** | 黑箱 | 检索轨迹完整可追溯 |
+| **上下文类型** | 仅文档 | Resource + Memory + Skill 三种类型 |
+
+### 什么是 L0/L1/L2 分层模型？为什么需要它？
+
+L0/L1/L2 是 OpenViking 的渐进式内容加载机制，解决了"海量上下文一次性塞入提示词"的问题：
+
+| 层级 | 名称 | Token 限制 | 用途 |
+|------|------|-----------|------|
+| **L0** | 摘要 | ~100 tokens | 向量搜索召回、快速过滤、列表展示 |
+| **L1** | 概览 | ~2000 tokens | Rerank 精排、内容导航、决策参考 |
+| **L2** | 详情 | 无限制 | 完整原始内容、按需深度加载 |
+
+这种设计让 Agent 可以先浏览摘要快速定位，再按需加载详情，显著节省 Token 消耗。
+
+### Viking URI 是什么？有什么作用？
+
+Viking URI 是 OpenViking 的统一资源标识符，格式为 `viking://{scope}/{path}`。它让系统能精准定位任何上下文：
+
+```
+viking://
+├── resources/              # 知识库：文档、代码、网页等
+│   └── my_project/
+├── user/
+│   └── {user_id}/          # 用户私有上下文
+│       ├── memories/       # 用户记忆
+│       ├── resources/      # 用户私有资源
+│       ├── skills/         # 用户私有技能（默认）
+│       ├── peers/{peer_id}/
+│       │   ├── memories/   # Peer 记忆
+│       │   └── resources/  # Peer 资源
+│       └── sessions/       # 会话与历史归档
+└── agent/                  # 可选的 account 全局能力
+    └── skills/             # 共享技能
+```
+
+## 安装与配置
+
+### 环境要求是什么？
+
+- **Python 版本**：3.10 或更高
+- **编译工具**（如果从源码安装或在不支持的平台上）：Rust/Cargo, GCC 9+ 或 Clang 11+
+- **必需依赖**：Embedding 模型（推荐火山引擎 Doubao）
+- **可选依赖**：
+  - VLM（视觉语言模型）：用于多模态内容处理和语义提取
+  - Rerank 模型：用于提升检索精度
+
+### OpenViking 是如何访问 AGFS 文件系统的？
+
+OpenViking 通过 Rust 绑定（`ragfs_python` / `RAGFSBindingClient`）在 Python 进程内直接运行 RAGFS 文件系统逻辑。优点是性能极高、无网络延迟；前提是本地需要有编译好的 RAGFS 共享库（预编译 Wheel 包内置，或从源码编译）。
+
+> [!WARNING]
+> OpenViking 已不再支持 AGFS HTTP client 模式。当前 AGFS / RAGFS 文件系统访问仅通过 Rust binding（`RAGFSBindingClient`）在进程内完成。这不影响 OpenViking server 的 HTTP API、`ov` CLI，或 `AsyncHTTPClient` / `SyncHTTPClient` 访问 OpenViking 服务端的能力。
+
+### 遇到 "AGFS binding library not found" 错误怎么办？
+
+这通常是因为本地没有可用的 RAGFS 共享库。在项目根目录运行 `pip install -e . --force-reinstall` 重新编译安装即可（需要 Rust 工具链）。
+
+### 如何安装 OpenViking？
+
+```bash
+pip install openviking --upgrade --force-reinstall
+```
+
+### 如何配置 OpenViking？
+
+在项目目录创建 `~/.openviking/ov.conf` 配置文件：
+
+```json
+{
+  "embedding": {
+    "dense": {
+      "provider": "volcengine",
+      "api_key": "your-api-key",
+      "model": "doubao-embedding-vision-251215",
+      "dimension": 1024,
+      "input": "multimodal"
+    }
+  },
+  "vlm": {
+    "provider": "volcengine",
+    "api_key": "your-api-key",
+    "model": "doubao-seed-2-0-lite-260428",
+    "api_base": "https://ark.cn-beijing.volces.com/api/v3"
+  },
+  "rerank": {
+    "provider": "volcengine",
+    "api_key": "your-api-key",
+    "model": "doubao-rerank-250615"
+  },
+  "storage": {
+    "workspace": "./data",
+    "agfs": { "backend": "local" },
+    "vectordb": { "backend": "local" }
+  }
+}
+```
+
+配置文件放在默认路径 `~/.openviking/ov.conf` 时自动加载；也可通过环境变量 `OPENVIKING_CONFIG_FILE` 或命令行 `--config` 指定其他路径。详见 [配置指南](../guides/01-configuration.md)。
+
+### 支持哪些 Embedding Provider？
+
+| Provider | 说明 |
+|------|------|
+| `volcengine` | 火山引擎 Embedding API（推荐） |
+| `openai` | OpenAI Embedding API |
+| `vikingdb` | VikingDB Embedding API |
+| `jina` | Jina AI Embedding API |
+| `ollama` | Ollama（本地 OpenAI 兼容服务器，无需 API Key） |
+
+支持 Dense、Sparse 和 Hybrid 三种 Embedding 模式。
+
+## 使用指南
+
+### 如何初始化客户端？
+
+```python
+from openviking_sdk import AsyncHTTPClient
+
+client = AsyncHTTPClient(url="http://localhost:1933", api_key="your-key")
+await client.initialize()
+```
+
+Embedding、VLM、存储等服务配置由 OpenViking Server 通过 `ov.conf` 管理。
+
+### 支持哪些文件格式？
+
+| 类型 | 支持格式 |
+|------|----------|
+| **文本** | `.txt`、`.md`、`.json`、`.yaml` |
+| **代码** | `.py`、`.js`、`.ts`、`.go`、`.java`、`.cpp` 等 |
+| **文档** | `.pdf`、`.docx` |
+| **图片** | `.png`、`.jpg`、`.jpeg`、`.gif`、`.webp` |
+| **视频** | `.mp4`、`.mov`、`.avi` |
+| **音频** | `.mp3`、`.wav`、`.m4a` |
+
+### 如何添加资源？
+
+```python
+# 添加单个文件
+await client.add_resource(
+    path="./document.pdf",
+    parent="viking://resources/docs",  # 存到这个目录下面，文件名由来源决定
+    options={"reason": "项目技术文档"},  # 描述资源用途，提升检索质量
+)
+
+# 添加网页
+await client.add_resource(
+    path="https://example.com/api-docs",
+    options={"reason": "API 参考文档"},
+)
+
+# 等待处理完成
+await client.wait_processed()
+```
+
+### `to` 和 `parent` 有什么区别？该用哪个？
+
+|  | `to` | `parent` |
+|---|---|---|
+| 传什么 | 完整最终 URI，**含叶子名** | 一个**已存在的目录**，叶子名由来源决定 |
+| 撞名怎么办 | 不改名。目标已存在时按新来源同步，来源里没有的可见条目会被删除 | 不覆盖。退到 `name_1`、`name_2`……并返回一条 warning |
+| 什么时候用 | 名字已知且必须逐字生效；或者要原地更新一个已有资源 | 叶子名由服务端派生（URL / 仓库导入、大文件切分），或者目标下已有的内容一点都不能动 |
+
+两个都留空 = 目录和叶子名都从来源推导，撞名行为同 `parent`。
+
+`to` 和 `parent` 不能同时传，会直接报错。
+
+### `to` 指到一个已存在的目录会发生什么？
+
+内容被同步成新来源的样子，metadata 保留。具体是：
+
+- **点号开头的条目原样保留** —— `.abstract.md`、`.overview.md`、`.search_tags.json`、`.image_mappings.json` 等；同步时两侧都不枚举它们，所以既不会被删也不会被覆盖。
+- **其余可见内容和新来源对齐** —— 来源里没有的删掉，变了的覆盖，没变的留在原地（URI 不变，挂在上面的向量和 tags 都还在）。
+
+所以这是「保留 metadata、替换内容本身」，不是把目录删掉重建。不想动目标里已有的东西就用 `parent`。
+
+注意：`processing_mode="vectors_only"` 不跑语义处理，保留下来的 `.abstract.md` / `.overview.md` **不会重算**，会继续描述已经被替换掉的旧内容。需要摘要跟着更新，就用默认的 `semantic_and_vectors`。
+
+### `find()` 和 `search()` 有什么区别？应该用哪个？
+
+| 特性 | `find()` | `search()` |
+|------|----------|------------|
+| **会话上下文** | 不需要 | 需要 |
+| **意图分析** | 不使用 | 使用 LLM 分析生成 0-5 个查询 |
+| **延迟** | 低 | 较高 |
+| **适用场景** | 简单语义搜索 | 复杂任务、需要理解上下文 |
+
+```python
+# find(): 简单直接的语义搜索
+results = await client.find(
+    query="OAuth 认证流程",
+    target_uri="viking://resources/",
+)
+
+# search(): 复杂任务，需要意图分析
+results = await client.search(
+    query="帮我实现用户登录功能",
+    session_id=session.session_id,
+)
+```
+
+**选择建议**：
+- 明确知道要找什么 → 用 `find()`
+- 复杂任务需要多种上下文 → 用 `search()`
+
+### 如何使用会话管理？
+
+会话管理是 OpenViking 的核心能力，支持对话追踪和记忆提取：
+
+```python
+from openviking_sdk import TextPart
+
+# 创建会话
+session_info = await client.create_session()
+session = client.session(session_id=session_info["session_id"])
+
+# 添加对话消息
+await session.add_message(
+    role="user",
+    parts=[TextPart(text="帮我分析这段代码的性能问题")],
+)
+await session.add_message(
+    role="assistant",
+    parts=[TextPart(text="我来分析一下...")],
+)
+
+# 提交会话，触发记忆提取
+await session.commit()
+```
+
+### OpenViking 支持哪些记忆类型？
+
+OpenViking 内置 `profile`、`preferences`、`entities`、`events`、`identity`、`soul`、`cases`、`trajectories`、`experiences`、`tools` 和 `skills` 等记忆类型。提交会话后，系统会按当前记忆策略提取适用内容；也可以根据业务需要扩展或调整记忆类型。
+
+记忆存储在当前用户或 Peer 命名空间，不存在当前可写的 `viking://agent/memories` 目录。完整类型与路径见 [上下文类型](../concepts/02-context-types.md)。
+
+### 如何使用类 Unix 的文件系统 API？
+
+```python
+# 列出目录内容
+items = await client.ls(uri="viking://resources/")
+
+# 读取完整内容（L2）
+content = await client.read(uri="viking://resources/doc.md")
+
+# 获取摘要（L0）
+abstract = await client.abstract(uri="viking://resources")
+
+# 获取概览（L1）
+overview = await client.overview(uri="viking://resources")
+```
+
+## 检索优化
+
+### 如何提升检索质量？
+
+1. **使用 Rerank 模型**：配置 Rerank 可显著提升精排效果
+2. **提供有意义的 `reason`**：添加资源时描述用途，帮助系统理解资源价值
+3. **合理组织目录结构**：使用 `target` 参数将相关资源放在一起
+4. **使用会话上下文**：`search()` 会利用会话历史进行意图分析
+5. **选择合适的 Embedding 模式**：多模态内容使用 `multimodal` 输入
+
+### 检索结果的分数是如何计算的？
+
+OpenViking 使用分数传播机制：
+
+```
+最终分数 = 0.5 × Embedding 相似度 + 0.5 × 父目录分数
+```
+
+这种设计让高分目录下的内容获得加成，体现了"上下文语境"的重要性。
+
+### 什么是目录递归检索？
+
+目录递归检索是 OpenViking 的创新检索策略：
+
+1. **意图分析**：分析查询生成多个检索条件
+2. **初始定位**：向量检索定位高分目录
+3. **精细探索**：在高分目录下进行二次检索
+4. **递归下探**：逐层递归直到收敛
+5. **结果汇总**：返回最相关的上下文
+
+这种策略能找到语义匹配的片段，同时理解信息的完整语境。
+
+## 故障排除
+
+### 资源添加后没有被索引
+
+**可能原因及解决方案**：
+
+1. **未等待处理完成**
+   ```python
+   await client.add_resource(path="./doc.pdf")
+   await client.wait_processed()  # 必须等待
+   ```
+
+2. **Embedding 模型配置错误**
+   - 检查 `~/.openviking/ov.conf` 中的 `api_key` 是否正确
+   - 确认模型名称和 endpoint 配置正确
+
+3. **文件格式不支持**
+   - 检查文件扩展名是否在支持列表中
+   - 确认文件内容有效且未损坏
+
+4. **查看处理日志**
+   ```python
+   import logging
+   logging.basicConfig(level=logging.DEBUG)
+   ```
+
+### 搜索没有返回预期结果
+
+**排查步骤**：
+
+1. **确认资源已处理完成**
+   ```python
+   # 检查资源是否存在
+   items = await client.ls(uri="viking://resources/")
+   ```
+
+2. **检查 `target_uri` 过滤条件**
+   - 确保搜索范围包含目标资源
+   - 尝试扩大搜索范围
+
+3. **尝试不同的查询方式**
+   - 使用更具体或更宽泛的关键词
+   - 尝试 `find()` 和 `search()` 对比效果
+
+4. **检查 L0 摘要质量**
+   ```python
+   abstract = await client.abstract(uri="viking://resources/your-doc")
+   print(abstract)  # 确认摘要是否准确反映内容
+   ```
+
+### 记忆提取不工作
+
+**排查步骤**：
+
+1. **确保调用了 `commit()`**
+   ```python
+   await session.commit()  # 触发记忆提取
+   ```
+
+2. **检查 VLM 配置**
+   - 记忆提取需要 VLM 模型
+   - 确认 `vlm` 配置正确
+
+3. **确认对话内容有意义**
+   - 闲聊内容可能不会产生记忆
+   - 需要包含可提取的信息（偏好、实体、事件等）
+
+4. **查看提取的记忆**
+   ```python
+   memories = await client.find(
+       query="",
+       target_uri="viking://~/memories/",
+   )
+   ```
+
+### 性能问题
+
+**优化建议**：
+
+1. **批量处理**：一次添加多个资源比逐个添加更高效
+2. **合理设置 `batch_size`**：Embedding 配置中调整批处理大小
+3. **使用本地存储**：开发阶段使用 `local` 后端减少网络延迟
+4. **异步操作**：充分利用 `AsyncHTTPClient` 的异步特性
+
+## 部署相关
+
+### OpenViking 是开源的吗？
+
+是的，OpenViking 完全开源，主体采用 AGPLv3 许可证，详见 README.md 说明。
+
+## 相关文档
+
+- [简介](../getting-started/01-introduction.md) - 了解 OpenViking 的设计理念
+- [快速开始](../getting-started/02-quickstart.md) - 5 分钟上手教程
+- [架构概述](../concepts/01-architecture.md) - 深入理解系统设计
+- [检索机制](../concepts/07-retrieval.md) - 检索流程详解
+- [配置指南](../guides/01-configuration.md) - 完整配置参考

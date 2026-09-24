@@ -1,0 +1,1165 @@
+use reqwest::{Client as ReqwestClient, StatusCode};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+use std::any::TypeId;
+use std::fs::File;
+use std::path::Path;
+use std::str::FromStr;
+use tempfile::{Builder, NamedTempFile};
+use zip::CompressionMethod;
+use zip::write::FileOptions;
+
+use indicatif::{ProgressBar, ProgressStyle};
+
+use crate::error::{Error, Result};
+
+const GATEWAY_MARKER_HEADER: &str = "X-VikingBot-Gateway";
+const GATEWAY_TOKEN_HEADER: &str = "X-Gateway-Token";
+
+fn parse_ignore_dirs(ignore_dirs: Option<&str>) -> Vec<String> {
+    ignore_dirs
+        .map(|s| {
+            s.split(',')
+                .map(|d| d.trim().to_string())
+                .filter(|d| !d.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn ignore_dirs_filter<'a>(
+    root: &'a Path,
+    ignore_list: &'a [String],
+) -> impl Fn(&walkdir::DirEntry) -> bool + 'a {
+    move |e: &walkdir::DirEntry| {
+        if e.path() == root {
+            return true;
+        }
+        if e.file_type().is_dir() && !ignore_list.is_empty() {
+            let name = e.file_name().to_str().unwrap_or("");
+            for pattern in ignore_list.iter() {
+                if pattern.contains('/') {
+                    let normalized = pattern.trim_start_matches("./").trim_end_matches('/');
+                    if let Ok(rel) = e.path().strip_prefix(root) {
+                        let rel_str = rel.to_str().unwrap_or("").replace('\\', "/");
+                        if rel_str == normalized {
+                            return false;
+                        }
+                    }
+                } else if pattern == name {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+fn normalize_zip_entry_name(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+fn zip_entry_name(relative_path: &Path) -> Result<String> {
+    let name = relative_path.to_str().ok_or_else(|| {
+        Error::InvalidPath(format!(
+            "Non-UTF-8 path: {}",
+            relative_path.to_string_lossy()
+        ))
+    })?;
+    Ok(normalize_zip_entry_name(name))
+}
+
+pub fn api_error_from_envelope(json: &Value, status: StatusCode) -> Error {
+    let error_code = json
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_str());
+    let error = json.get("error");
+    let error_msg = error
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            json.get("detail")
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| {
+            if json.is_null() {
+                format!("HTTP error {}", status)
+            } else {
+                json.to_string()
+            }
+        });
+    let details = error.and_then(|e| e.get("details")).cloned();
+
+    Error::api_response(
+        error_code.map(str::to_string),
+        error_msg,
+        details,
+        status.as_u16(),
+    )
+}
+
+pub(crate) fn api_error_from_body(body: &[u8], status: StatusCode) -> Error {
+    match serde_json::from_slice(body) {
+        Ok(json) => api_error_from_envelope(&json, status),
+        Err(_) => Error::api_with_status(
+            format!(
+                "HTTP error {}\n\nRaw response body:\n{}",
+                status,
+                String::from_utf8_lossy(body)
+            ),
+            status.as_u16(),
+        ),
+    }
+}
+
+pub fn unwrap_success_envelope(json: Value, preserve_profile: bool) -> Value {
+    let Some(result) = json.get("result") else {
+        return json;
+    };
+
+    if !preserve_profile {
+        return result.clone();
+    }
+
+    let Some(profile) = json.get("profile").filter(|profile| !profile.is_null()) else {
+        return result.clone();
+    };
+
+    if let Some(result_obj) = result.as_object() {
+        let mut merged = result_obj.clone();
+        merged.insert("profile".to_string(), profile.clone());
+        return Value::Object(merged);
+    }
+
+    let mut wrapped = serde_json::Map::new();
+    wrapped.insert("result".to_string(), result.clone());
+    wrapped.insert("profile".to_string(), profile.clone());
+    Value::Object(wrapped)
+}
+
+// ============ TimeoutConfig ============
+
+/// Dynamic timeout calculator based on file size
+#[derive(Debug, Clone, Copy)]
+pub struct TimeoutConfig {
+    min_timeout_secs: u64,
+    seconds_per_mb: f64,
+}
+
+impl TimeoutConfig {
+    pub const fn new(min_timeout_secs: u64, seconds_per_mb: f64) -> Self {
+        Self {
+            min_timeout_secs,
+            seconds_per_mb,
+        }
+    }
+
+    pub fn for_resource_processing() -> Self {
+        Self::new(60, 5.0)
+    }
+
+    pub fn for_upload() -> Self {
+        Self::new(60, 10.0)
+    }
+
+    pub fn calculate(&self, file_path: &Path) -> Result<std::time::Duration> {
+        let file_size = std::fs::metadata(file_path)?.len();
+        let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
+        let calculated_timeout = (file_size_mb * self.seconds_per_mb).ceil() as u64;
+        let timeout_secs = std::cmp::max(self.min_timeout_secs, calculated_timeout);
+
+        Ok(std::time::Duration::from_secs(timeout_secs))
+    }
+}
+
+// ============ BaseClient ============
+
+/// Low-level HTTP client with timeout control and header management
+#[derive(Clone)]
+pub struct BaseClient {
+    pub(crate) http: ReqwestClient,
+    pub(crate) base_url: String,
+    pub(crate) api_key: Option<String>,
+    pub(crate) account: Option<String>,
+    pub(crate) user: Option<String>,
+    pub(crate) actor_peer_id: Option<String>,
+    pub(crate) profile_enabled: bool,
+    pub(crate) extra_headers: Option<std::collections::HashMap<String, String>>,
+    gateway_token: Option<String>,
+    auth_mode: Option<String>,
+    ldap_username: Option<String>,
+    ldap_password: Option<String>,
+    oidc_token: Option<String>,
+}
+
+impl BaseClient {
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: Option<String>,
+        account: Option<String>,
+        user: Option<String>,
+        actor_peer_id: Option<String>,
+        timeout_secs: f64,
+        profile_enabled: bool,
+        extra_headers: Option<std::collections::HashMap<String, String>>,
+    ) -> Self {
+        let http = ReqwestClient::builder()
+            .timeout(std::time::Duration::from_secs_f64(timeout_secs))
+            .build()
+            .expect("Failed to build HTTP client");
+
+        Self {
+            http,
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            api_key,
+            account,
+            user,
+            actor_peer_id,
+            profile_enabled,
+            extra_headers,
+            gateway_token: None,
+            auth_mode: None,
+            ldap_username: None,
+            ldap_password: None,
+            oidc_token: None,
+        }
+    }
+
+    pub fn with_auth_mode(mut self, auth_mode: Option<String>) -> Self {
+        self.auth_mode = auth_mode;
+        self
+    }
+
+    pub fn with_ldap_username(mut self, username: Option<String>) -> Self {
+        self.ldap_username = username;
+        self
+    }
+
+    pub fn with_ldap_password(mut self, password: Option<String>) -> Self {
+        self.ldap_password = password;
+        self
+    }
+
+    pub fn with_oidc_token(mut self, token: Option<String>) -> Self {
+        self.oidc_token = token
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        self
+    }
+
+    pub fn with_gateway_token(mut self, gateway_token: Option<String>) -> Self {
+        self.gateway_token = gateway_token
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty());
+        self
+    }
+
+    fn append_profile_query<'a>(&self, params: &'a [(String, String)]) -> Vec<(String, String)> {
+        let mut merged = params.to_vec();
+        if self.profile_enabled && !merged.iter().any(|(k, _)| k == "profile") {
+            merged.push(("profile".to_string(), "1".to_string()));
+        }
+        merged
+    }
+
+    pub fn user_id(&self) -> Option<&str> {
+        self.user.as_deref()
+    }
+
+    pub fn actor_peer_id(&self) -> Option<&str> {
+        self.actor_peer_id.as_deref()
+    }
+
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    pub fn build_headers(&self) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        if let Some(api_key) = &self.api_key {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(api_key) {
+                headers.insert("X-API-Key", value);
+            }
+        }
+        if let Some(account) = &self.account {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(account) {
+                headers.insert("X-OpenViking-Account", value);
+            }
+        }
+        if let Some(user) = &self.user {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(user) {
+                headers.insert("X-OpenViking-User", value);
+            }
+        }
+        if let Some(actor_peer_id) = &self.actor_peer_id {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(actor_peer_id) {
+                headers.insert("X-OpenViking-Actor-Peer", value);
+            }
+        }
+
+        // LDAP Basic Auth support
+        if let (Some(auth_mode), Some(username), Some(password)) =
+            (&self.auth_mode, &self.ldap_username, &self.ldap_password)
+        {
+            if auth_mode == "ldap" {
+                let credentials = format!("{}:{}", username, password);
+                use base64::engine::Engine;
+                use base64::engine::general_purpose;
+                let encoded = general_purpose::STANDARD.encode(credentials);
+                if let Ok(value) =
+                    reqwest::header::HeaderValue::from_str(&format!("Basic {}", encoded))
+                {
+                    headers.insert(reqwest::header::AUTHORIZATION, value);
+                }
+            }
+        }
+
+        // OIDC Bearer Token support
+        if let (Some(auth_mode), Some(token)) = (&self.auth_mode, &self.oidc_token) {
+            if auth_mode == "oidc" {
+                if let Ok(value) =
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
+                {
+                    headers.insert(reqwest::header::AUTHORIZATION, value);
+                }
+            }
+        }
+
+        // Also support OIDC token when api_key looks like a JWT (for backwards compatibility)
+        if self
+            .api_key
+            .as_ref()
+            .map_or(false, |k| k.contains('.') && k.matches('.').count() >= 2)
+        {
+            if let Some(token) = &self.api_key {
+                if let Ok(value) =
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
+                {
+                    // Only insert if not already set by explicit OIDC
+                    if !headers.contains_key(reqwest::header::AUTHORIZATION) {
+                        headers.insert(reqwest::header::AUTHORIZATION, value);
+                    }
+                }
+            }
+        }
+
+        if let Some(extra_headers) = &self.extra_headers {
+            for (key, value) in extra_headers {
+                if let Ok(header_name) = reqwest::header::HeaderName::from_str(key) {
+                    if let Ok(header_value) = reqwest::header::HeaderValue::from_str(value) {
+                        headers.insert(header_name, header_value);
+                    }
+                }
+            }
+        }
+        headers
+    }
+
+    fn is_gateway_token_challenge(response: &reqwest::Response) -> bool {
+        response.status() == StatusCode::UNAUTHORIZED
+            && response
+                .headers()
+                .get(GATEWAY_MARKER_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    }
+
+    pub(crate) async fn send_request(
+        &self,
+        request: reqwest::RequestBuilder,
+        error_context: &str,
+    ) -> Result<reqwest::Response> {
+        let retry = request.try_clone();
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Error::from_reqwest(error_context, e))?;
+        if !Self::is_gateway_token_challenge(&response) {
+            return Ok(response);
+        }
+
+        let Some(gateway_token) = self.gateway_token.as_deref() else {
+            return Ok(response);
+        };
+        let Some(retry) = retry else {
+            return Ok(response);
+        };
+        retry
+            .header(GATEWAY_TOKEN_HEADER, gateway_token)
+            .send()
+            .await
+            .map_err(|e| Error::from_reqwest(error_context, e))
+    }
+
+    async fn headers_for_uncloneable_request(&self) -> Result<reqwest::header::HeaderMap> {
+        let mut headers = self.build_headers();
+        let Some(gateway_token) = self.gateway_token.as_deref() else {
+            return Ok(headers);
+        };
+        let health_url = format!("{}/health", self.base_url);
+        let response = self
+            .http
+            .get(health_url)
+            .headers(headers.clone())
+            .send()
+            .await
+            .map_err(|e| Error::from_reqwest("Gateway detection request failed", e))?;
+        if Self::is_gateway_token_challenge(&response) {
+            if let Ok(value) = reqwest::header::HeaderValue::from_str(gateway_token) {
+                headers.insert(GATEWAY_TOKEN_HEADER, value);
+            }
+        }
+        Ok(headers)
+    }
+
+    pub(crate) async fn handle_response<T: DeserializeOwned + 'static>(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<T> {
+        let status = response.status();
+
+        if status == StatusCode::NO_CONTENT {
+            return serde_json::from_value(Value::Null)
+                .map_err(|e| Error::Parse(format!("Failed to parse empty response: {}", e)));
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| Error::from_reqwest("Failed to read response body", e))?;
+
+        if !status.is_success() {
+            return Err(api_error_from_body(&bytes, status));
+        }
+
+        let json: Value = match serde_json::from_slice(&bytes) {
+            Ok(json) => json,
+            Err(e) => {
+                let body_str = String::from_utf8_lossy(&bytes);
+                return Err(Error::Parse(format!(
+                    "Failed to parse JSON response: {}\n\nRaw response body:\n{}",
+                    e, body_str
+                )));
+            }
+        };
+
+        if let Some(error) = json.get("error") {
+            if !error.is_null() {
+                return Err(api_error_from_envelope(&json, status));
+            }
+        }
+
+        let preserve_profile = TypeId::of::<T>() == TypeId::of::<Value>();
+        let result = unwrap_success_envelope(json.clone(), preserve_profile);
+
+        serde_json::from_value(result).map_err(|e| {
+            Error::Parse(format!(
+                "Failed to deserialize response: {}\n\nJSON that failed to parse:\n{}",
+                e, json
+            ))
+        })
+    }
+
+    pub(crate) fn create_client_with_connect_timeout(
+        &self,
+        connect_timeout: std::time::Duration,
+        timeout: std::time::Duration,
+    ) -> Result<ReqwestClient> {
+        ReqwestClient::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(timeout)
+            .build()
+            .map_err(|e| Error::from_reqwest("Failed to build HTTP client", e))
+    }
+
+    pub async fn get<T: DeserializeOwned + 'static>(
+        &self,
+        path: &str,
+        params: &[(String, String)],
+    ) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let params = self.append_profile_query(params);
+        let request = self
+            .http
+            .get(&url)
+            .headers(self.build_headers())
+            .query(&params);
+        let response = self.send_request(request, "HTTP request failed").await?;
+
+        self.handle_response(response).await
+    }
+
+    pub async fn post<B: serde::Serialize, T: DeserializeOwned + 'static>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let request = self
+            .http
+            .post(&url)
+            .headers(self.build_headers())
+            .json(body);
+        let request = if self.profile_enabled {
+            request.query(&[("profile", "1")])
+        } else {
+            request
+        };
+        let response = self.send_request(request, "HTTP request failed").await?;
+
+        self.handle_response(response).await
+    }
+
+    pub async fn post_with_timeout<B: serde::Serialize, T: DeserializeOwned + 'static>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: std::time::Duration,
+    ) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+
+        let request = self
+            .http
+            .post(&url)
+            .headers(self.build_headers())
+            .timeout(timeout)
+            .json(body);
+        let request = if self.profile_enabled {
+            request.query(&[("profile", "1")])
+        } else {
+            request
+        };
+        let response = self.send_request(request, "HTTP request failed").await?;
+
+        self.handle_response(response).await
+    }
+
+    pub async fn put<B: serde::Serialize, T: DeserializeOwned + 'static>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let request = self.http.put(&url).headers(self.build_headers()).json(body);
+        let request = if self.profile_enabled {
+            request.query(&[("profile", "1")])
+        } else {
+            request
+        };
+        let response = self.send_request(request, "HTTP request failed").await?;
+
+        self.handle_response(response).await
+    }
+
+    pub async fn delete<T: DeserializeOwned + 'static>(
+        &self,
+        path: &str,
+        params: &[(String, String)],
+    ) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let params = self.append_profile_query(params);
+        let request = self
+            .http
+            .delete(&url)
+            .headers(self.build_headers())
+            .query(&params);
+        let response = self.send_request(request, "HTTP request failed").await?;
+
+        self.handle_response(response).await
+    }
+
+    pub async fn delete_with_body<B: serde::Serialize, T: DeserializeOwned + 'static>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let request = self
+            .http
+            .delete(&url)
+            .headers(self.build_headers())
+            .json(body);
+        let request = if self.profile_enabled {
+            request.query(&[("profile", "1")])
+        } else {
+            request
+        };
+        let response = self.send_request(request, "HTTP request failed").await?;
+
+        self.handle_response(response).await
+    }
+
+    pub async fn patch<B: serde::Serialize, T: DeserializeOwned + 'static>(
+        &self,
+        path: &str,
+        body: &B,
+        params: &[(String, String)],
+    ) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let params = self.append_profile_query(params);
+        let request = self
+            .http
+            .patch(&url)
+            .headers(self.build_headers())
+            .query(&params)
+            .json(body);
+        let response = self.send_request(request, "HTTP request failed").await?;
+
+        self.handle_response(response).await
+    }
+
+    pub async fn post_with_query<B: serde::Serialize, T: DeserializeOwned + 'static>(
+        &self,
+        path: &str,
+        body: &B,
+        params: &[(String, String)],
+    ) -> Result<T> {
+        let url = format!("{}{}", self.base_url, path);
+        let params = self.append_profile_query(params);
+        let request = self
+            .http
+            .post(&url)
+            .headers(self.build_headers())
+            .query(&params)
+            .json(body);
+        let response = self.send_request(request, "HTTP request failed").await?;
+
+        self.handle_response(response).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn unwrap_success_envelope_preserves_profile_for_value_results() {
+        let body = json!({
+            "status": "ok",
+            "result": [
+                {"id": "1"}
+            ],
+            "profile": [
+                "line one",
+                "line two"
+            ]
+        });
+
+        let result = unwrap_success_envelope(body, true);
+
+        assert_eq!(
+            result,
+            json!({
+                "result": [
+                    {"id": "1"}
+                ],
+                "profile": [
+                    "line one",
+                    "line two"
+                ]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn request_timeout_is_not_reported_as_network_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _connection = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let client = BaseClient::new(
+            format!("http://{address}"),
+            None,
+            None,
+            None,
+            None,
+            0.02,
+            false,
+            None,
+        );
+        let error = client
+            .get::<Value>("/slow", &[])
+            .await
+            .expect_err("slow response should time out");
+
+        assert!(matches!(error, Error::Timeout(_)));
+    }
+
+    #[tokio::test]
+    async fn post_with_timeout_overrides_client_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _connection = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let client = BaseClient::new(
+            format!("http://{address}"),
+            None,
+            None,
+            None,
+            None,
+            5.0,
+            false,
+            None,
+        );
+        let started = std::time::Instant::now();
+        let error = client
+            .post_with_timeout::<_, Value>("/slow", &json!({}), Duration::from_millis(20))
+            .await
+            .expect_err("slow response should time out");
+
+        assert!(matches!(error, Error::Timeout(_)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "request-level timeout should fire before the 5s client timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_text_http_error_preserves_status() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.unwrap();
+            connection
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 20\r\n\r\nupstream unavailable",
+                )
+                .await
+                .unwrap();
+        });
+
+        let client = BaseClient::new(
+            format!("http://{address}"),
+            None,
+            None,
+            None,
+            None,
+            1.0,
+            false,
+            None,
+        );
+        let error = client.get::<Value>("/", &[]).await.unwrap_err();
+
+        assert_eq!(error.code(), "UNAVAILABLE");
+        assert!(matches!(
+            error,
+            Error::Api {
+                status: Some(503),
+                message,
+                ..
+            } if message.contains("upstream unavailable")
+        ));
+    }
+
+    #[test]
+    fn unwrap_success_envelope_drops_null_profile_for_value_results() {
+        let body = json!({
+            "status": "ok",
+            "result": [
+                {"id": "1"}
+            ],
+            "profile": null
+        });
+
+        let result = unwrap_success_envelope(body, true);
+
+        assert_eq!(
+            result,
+            json!([
+                {"id": "1"}
+            ])
+        );
+    }
+
+    #[test]
+    fn unwrap_success_envelope_wraps_scalar_results_when_profile_is_preserved() {
+        let body = json!({
+            "status": "ok",
+            "result": "content",
+            "profile": [
+                "line one"
+            ]
+        });
+
+        let result = unwrap_success_envelope(body, true);
+
+        assert_eq!(
+            result,
+            json!({
+                "result": "content",
+                "profile": [
+                    "line one"
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn unwrap_success_envelope_drops_profile_for_scalar_results() {
+        let body = json!({
+            "status": "ok",
+            "result": "content",
+            "profile": [
+                "line one"
+            ]
+        });
+
+        let result = unwrap_success_envelope(body, false);
+
+        assert_eq!(result, json!("content"));
+    }
+
+    #[test]
+    fn append_profile_query_adds_flag_when_enabled() {
+        let client = BaseClient::new(
+            "http://localhost:1933",
+            None,
+            None,
+            None,
+            None,
+            5.0,
+            true,
+            None,
+        );
+
+        let params =
+            client.append_profile_query(&[("to_uri".to_string(), "viking://x".to_string())]);
+
+        assert_eq!(
+            params,
+            vec![
+                ("to_uri".to_string(), "viking://x".to_string()),
+                ("profile".to_string(), "1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn append_profile_query_keeps_existing_profile_flag() {
+        let client = BaseClient::new(
+            "http://localhost:1933",
+            None,
+            None,
+            None,
+            None,
+            5.0,
+            true,
+            None,
+        );
+
+        let params = client.append_profile_query(&[("profile".to_string(), "1".to_string())]);
+
+        assert_eq!(params, vec![("profile".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn zip_entry_name_normalizes_windows_separators() {
+        let entry = zip_entry_name(Path::new("scripts\\check_bounding_boxes.py"))
+            .expect("path should be utf-8");
+
+        assert_eq!(entry, "scripts/check_bounding_boxes.py");
+    }
+
+    #[test]
+    fn zip_entry_name_preserves_posix_separators() {
+        let entry = zip_entry_name(Path::new("scripts/check_bounding_boxes.py"))
+            .expect("path should be utf-8");
+
+        assert_eq!(entry, "scripts/check_bounding_boxes.py");
+    }
+}
+
+// ============ FileUploader ============
+
+/// Handles file compression and upload logic
+pub struct FileUploader<'a> {
+    client: &'a BaseClient,
+    upload_mode: Option<String>,
+}
+
+impl<'a> FileUploader<'a> {
+    pub fn new(client: &'a BaseClient) -> Self {
+        Self {
+            client,
+            upload_mode: None,
+        }
+    }
+
+    pub fn with_upload_mode(mut self, upload_mode: Option<String>) -> Self {
+        self.upload_mode = upload_mode;
+        self
+    }
+
+    pub fn zip_directory(
+        &self,
+        dir_path: &Path,
+        ignore_dirs: Option<&str>,
+    ) -> Result<NamedTempFile> {
+        if !dir_path.is_dir() {
+            return Err(Error::InvalidPath(format!(
+                "Path {} is not a directory",
+                dir_path.display()
+            )));
+        }
+
+        let ignore_list = parse_ignore_dirs(ignore_dirs);
+        let temp_file = Builder::new().suffix(".zip").tempfile()?;
+        let file = File::create(temp_file.path())?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(CompressionMethod::Deflated);
+
+        let walkdir = walkdir::WalkDir::new(dir_path);
+        for entry in walkdir
+            .into_iter()
+            .filter_entry(ignore_dirs_filter(dir_path, &ignore_list))
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if path.is_file() {
+                let name = path.strip_prefix(dir_path).unwrap_or(path);
+                let name_str = zip_entry_name(name)?;
+                zip.start_file(name_str, options)?;
+                let mut file = File::open(path)?;
+                std::io::copy(&mut file, &mut zip)?;
+            }
+        }
+
+        zip.finish()?;
+        Ok(temp_file)
+    }
+
+    pub fn zip_directory_with_progress(
+        &self,
+        dir_path: &Path,
+        verbose: bool,
+        ignore_dirs: Option<&str>,
+    ) -> Result<NamedTempFile> {
+        if !dir_path.is_dir() {
+            return Err(Error::InvalidPath(format!(
+                "Path {} is not a directory",
+                dir_path.display()
+            )));
+        }
+
+        let ignore_list = parse_ignore_dirs(ignore_dirs);
+        let temp_file = Builder::new().suffix(".zip").tempfile()?;
+        let file = File::create(temp_file.path())?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(CompressionMethod::Deflated);
+
+        let mut total_size = 0u64;
+        let mut total_files = 0u64;
+        let walkdir = walkdir::WalkDir::new(dir_path);
+        for entry in walkdir
+            .into_iter()
+            .filter_entry(ignore_dirs_filter(dir_path, &ignore_list))
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if path.is_file() {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    total_size += meta.len();
+                    total_files += 1;
+                }
+            }
+        }
+
+        let pb = if total_size > 0 {
+            let pb = ProgressBar::new(total_size);
+            pb.set_style(
+                ProgressStyle::default_bar()
+                    .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}")
+                    .unwrap_or_else(|_| ProgressStyle::default_bar())
+                    .progress_chars("#>-"),
+            );
+            pb.set_message(format!("Compressing {} files", total_files));
+            Some(pb)
+        } else {
+            let pb = ProgressBar::new_spinner();
+            pb.set_message("Compressing files...");
+            Some(pb)
+        };
+
+        let walkdir = walkdir::WalkDir::new(dir_path);
+        for entry in walkdir
+            .into_iter()
+            .filter_entry(ignore_dirs_filter(dir_path, &ignore_list))
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if path.is_file() {
+                let name = path.strip_prefix(dir_path).unwrap_or(path);
+                let name_str = zip_entry_name(name)?;
+                if verbose {
+                    eprintln!("  Adding: {}", name_str);
+                }
+                zip.start_file(name_str, options)?;
+                let mut file = File::open(path)?;
+                let file_size = std::io::copy(&mut file, &mut zip)?;
+
+                if let Some(pb) = &pb {
+                    if pb.length().is_some() {
+                        pb.inc(file_size);
+                    }
+                }
+            }
+        }
+
+        zip.finish()?;
+
+        let zip_size = std::fs::metadata(temp_file.path())?.len();
+        let zip_size_mb = zip_size as f64 / 1024.0 / 1024.0;
+        let original_size_mb = if total_size > 0 {
+            total_size as f64 / 1024.0 / 1024.0
+        } else {
+            0.0
+        };
+
+        if let Some(pb) = pb {
+            if total_size > 0 {
+                pb.finish_with_message(format!(
+                    "Compression complete: {:.2} MiB → {:.2} MiB",
+                    original_size_mb, zip_size_mb
+                ));
+            } else {
+                pb.finish_with_message(format!("Compression complete: {:.2} MiB", zip_size_mb));
+            }
+        }
+
+        Ok(temp_file)
+    }
+
+    pub async fn upload_temp_file(&self, file_path: &Path) -> Result<String> {
+        let url = format!("{}/api/v1/resources/temp_upload", self.client.base_url);
+        let file_name = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("temp_upload.zip");
+
+        let file_content = tokio::fs::read(file_path).await?;
+
+        let part = reqwest::multipart::Part::bytes(file_content).file_name(file_name.to_string());
+
+        let part = part
+            .mime_str("application/octet-stream")
+            .map_err(|e| Error::from_reqwest("Failed to set mime type", e))?;
+
+        let mut form = reqwest::multipart::Form::new().part("file", part);
+        if let Some(upload_mode) = &self.upload_mode {
+            form = form.text("upload_mode", upload_mode.clone());
+        }
+
+        let mut headers = self.client.headers_for_uncloneable_request().await?;
+        headers.remove(reqwest::header::CONTENT_TYPE);
+
+        let upload_timeout = TimeoutConfig::for_upload().calculate(file_path)?;
+        let long_timeout_client = self.client.create_client_with_connect_timeout(
+            std::time::Duration::from_secs(30),
+            upload_timeout,
+        )?;
+
+        let response = long_timeout_client
+            .post(&url)
+            .headers(headers)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| Error::from_reqwest("File upload failed", e))?;
+
+        let result: Value = self.client.handle_response(response).await?;
+        result
+            .get("temp_file_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| Error::Parse("Missing temp_file_id in response".to_string()))
+    }
+
+    pub async fn upload_temp_file_with_progress(
+        &self,
+        file_path: &Path,
+        verbose: bool,
+    ) -> Result<String> {
+        use indicatif::ProgressBar;
+
+        let url = format!("{}/api/v1/resources/temp_upload", self.client.base_url);
+        let file_name = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("temp_upload.zip");
+
+        let file_content = tokio::fs::read(file_path).await?;
+        let file_size = file_content.len() as u64;
+
+        if verbose {
+            eprintln!(
+                "Uploading: {} ({:.2} MB)",
+                file_name,
+                file_size as f64 / 1024.0 / 1024.0
+            );
+        }
+
+        let pb = ProgressBar::new_spinner();
+        pb.set_message(format!(
+            "Uploading {} ({:.2} MB)...",
+            file_name,
+            file_size as f64 / 1024.0 / 1024.0
+        ));
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+        let part = reqwest::multipart::Part::bytes(file_content).file_name(file_name.to_string());
+
+        let part = part
+            .mime_str("application/octet-stream")
+            .map_err(|e| Error::from_reqwest("Failed to set mime type", e))?;
+
+        let mut form = reqwest::multipart::Form::new().part("file", part);
+        if let Some(upload_mode) = &self.upload_mode {
+            form = form.text("upload_mode", upload_mode.clone());
+        }
+
+        let mut headers = self.client.headers_for_uncloneable_request().await?;
+        headers.remove(reqwest::header::CONTENT_TYPE);
+
+        let upload_timeout = TimeoutConfig::for_upload().calculate(file_path)?;
+        let long_timeout_client = self.client.create_client_with_connect_timeout(
+            std::time::Duration::from_secs(30),
+            upload_timeout,
+        )?;
+
+        let response = long_timeout_client
+            .post(&url)
+            .headers(headers)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| Error::from_reqwest("File upload failed", e))?;
+
+        pb.finish_with_message("Upload complete");
+
+        let result: Value = self.client.handle_response(response).await?;
+        result
+            .get("temp_file_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .ok_or_else(|| Error::Parse("Missing temp_file_id in response".to_string()))
+    }
+}

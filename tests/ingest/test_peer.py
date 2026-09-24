@@ -1,0 +1,68 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""peer_id resolution: assistant model peers, human/git peers, group usernames."""
+
+import json
+from pathlib import Path
+
+from openviking.ingest.peer import (
+    assistant_peer_id,
+    resolve_git_human_peer,
+    safe_external_peer,
+)
+
+
+def test_assistant_peer_with_and_without_provider():
+    assert assistant_peer_id("claude_code", "claude-opus-4-8") == "claude_code__claude-opus-4-8"
+    assert assistant_peer_id("opencode", "glm-4.7", "tiktok") == "opencode__tiktok__glm-4.7"
+    assert assistant_peer_id("codex", None) == "codex__unknown"
+
+
+def test_external_peer_readable_and_sanitized():
+    assert safe_external_peer("alice") == "alice"
+    assert safe_external_peer("zhengxiao.wu@bytedance.com") == "zhengxiao.wu@bytedance.com"
+    assert safe_external_peer("foo/bar baz") == "foo-bar-baz"
+    assert safe_external_peer("") is None
+
+
+def test_external_peer_non_ascii_falls_back_to_ext():
+    pid = safe_external_peer("杨冠姝")
+    assert pid is not None and pid.startswith("ext-")
+
+
+def test_external_peer_mixed_unicode_encodes_full_value_without_collisions():
+    first = safe_external_peer("张三 Alice")
+    second = safe_external_peer("李四 Alice")
+
+    assert first != second
+    assert first is not None and first.startswith("ext-")
+    assert second is not None and second.startswith("ext-")
+
+
+def test_external_peer_encoded_namespace_cannot_be_impersonated_by_ascii_name():
+    mixed_script = safe_external_peer("张三 Alice")
+    ascii_lookalike = safe_external_peer("ext-5byg5LiJIEFsaWNl")
+    sanitized_lookalike = safe_external_peer("ext 5byg5LiJIEFsaWNl")
+
+    assert mixed_script == "ext-5byg5LiJIEFsaWNl"
+    assert ascii_lookalike == "ext-ZXh0LTVieWc1TGlKSUVGc2FXTmw"
+    assert sanitized_lookalike == "ext-ZXh0IDVieWc1TGlKSUVGc2FXTmw"
+    assert len({mixed_script, ascii_lookalike, sanitized_lookalike}) == 3
+
+
+def test_external_peer_compatibility_fixture():
+    fixture_path = Path(__file__).parent / "fixtures" / "peer_id_compat.json"
+    cases = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    for case in cases:
+        canonical = safe_external_peer(case["raw"])
+        assert canonical == case["canonical"]
+
+    canonical_ids = [safe_external_peer(case["raw"]) for case in cases]
+    assert len(canonical_ids) == len(set(canonical_ids))
+
+
+def test_git_human_peer_falls_back_without_repo(tmp_path):
+    # tmp_path is not a git repo -> configured fallback is used
+    assert resolve_git_human_peer(str(tmp_path), "me") == "me"
+    assert resolve_git_human_peer(None, "me") == "me"

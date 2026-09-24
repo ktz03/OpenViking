@@ -1,0 +1,197 @@
+memory_type: session_skills
+description: |
+  # Task
+  Your task is to record session skills that the user explicitly asks to remember based on the conversation history. Follow these rules:
+  1. Recognition rules for extracted content
+  1.1 Explicit instruction recognition
+  1. Trigger word recognition: Recognize time-related trigger words such as "from now on", "in the future", and "every time", and treat them as long-term memory instructions.
+  2. Normative expression recognition: Recognize expressions such as "follow..." and "according to...", and extract the normative requirements as memory rules.
+  3. Direct request recognition: Recognize direct memory requests such as "remember" and "don't forget", and identify the core content that needs to be remembered.
+  1.2 Implicit instruction recognition
+  1. Correction intent recognition: Extract user preferences from corrections to previous responses and determine whether they are memorable rules.
+  2. Repeated pattern recognition: When the user repeats the same requirement multiple times at different times, such as on different dates, and the count is at least 3, automatically recognize it as an implicit memory instruction.
+  1.3 Memorability judgment
+  1. Time and scope limitation judgment: Requirements with one-time time limits such as "today" or "this time" are temporary and should not be remembered. Requirements with no time limit or broad scope such as "all" or "every time" are long-term norms and should be remembered.
+  2. Content type judgment: Specific content such as answers to individual questions or one-off task results should not be remembered. General rules such as marking answers for multiple-choice questions or analyzing each option should be remembered.
+  3. Applicability judgment: For vague expressions such as "make it more detailed" or unclear applicability scope, ask the user for confirmation before deciding whether to remember the rule.
+  1.4 Incremental update recognition
+  1. Addition intent recognition: Use keywords such as "by the way" to identify the user's intent to add rules. Check compatibility with existing rules before merging.
+  2. Revision intent recognition: Use keywords such as "that's not right" or "change it" to identify rule revision intent and precisely locate the original rule being modified.
+  3. Deletion intent recognition: Use keywords such as "no need" or "cancel" to identify rule deletion intent, and also check whether the deleted rule has dependent rules.
+  1.5 Conflict recognition
+  1. Direct contradiction recognition: If a new rule and an existing rule contain clearly opposing requirements, such as "concise" vs "detailed", treat it as a direct conflict.
+  2. Logical conflict recognition: If requirements become contradictory after considering the scenario, such as 100 words per option plus a 300-word limit for the overall analysis, treat it as a logical conflict.
+  3. Scope conflict recognition: If a global rule conflicts with a specific task rule in format or requirements, such as a global Markdown format requirement vs a PPTX format requirement for slide creation, treat it as a scope conflict.
+  1.6 Task matching recognition
+  1. Task type recognition: Identify the core type of the current task, such as question analysis or weekly report writing, and its domain, such as medicine or finance, then match the corresponding memory rule.
+  2. Similarity tier judgment: If the task type exactly matches the memory rule, such as medical question analysis matching medical question rules, treat it as high similarity, 95% or above, and apply it directly. If the task types are similar, such as monthly summaries matching weekly report rules, treat it as medium similarity, 60-80%, and ask the user for confirmation before applying it. If the task types are unrelated, such as writing an email matching medical question rules, treat it as low similarity, below 30%, and do not apply it.
+  2. Formatting rules for extracted content
+  2.1 Instruction extraction format
+  1. Constraint format: Clearly state "constraint type + specific requirement", such as "tone constraint: formal and professional" or "expression constraint: concise, avoid redundancy".
+  2. Format requirement format: Extract as "format type + specific specification", such as "Markdown format: use three-line tables and highlight code".
+  3. Processing step format: Extract as "step number + step content", preserve the original order, and mark it as a process flow type. For example: "Step 1: identify the question type; Step 2: list knowledge points; Step 3: analyze step by step; Step 4: provide similar questions".
+  4. Quality standard format: Extract as "standard type + specific requirement", mark it as a quality standard type. For example: "clarity standard: easy to understand and suitable for students; accuracy standard: no errors".
+  2.2 Instruction normalization format
+  1. Convert colloquial phrasing to standard phrasing: Convert "make it feel formal" to "formal and professional tone", and "don't be too wordy" to "concise expression, avoid redundancy". Remove colloquial expressions.
+  2. Quantify vague expressions: For vague words such as "detailed" or "several", ask the user for confirmation before quantifying them, such as "detailed -> analysis length: 80-150 words" or "several -> 2-3".
+  3. Make implicit information explicit: Recognize vague references such as "last time", find the specific content from history, complete the rule, and do not keep vague expressions.
+  4. Handle redundancy: Merge repeated expressions, such as converting "analyze every option, don't mix the options together, analyze them one by one" into "analyze each option separately", while preserving the core meaning.
+  2.3 Instruction classification format
+  1. Functional classification format: Classify as "category name: rule content", such as "input handling: 2 rules; core logic: 4 rules; output format: 3 rules; constraints and prohibitions: 1 rule".
+  2. Conditional branch format: Express as "condition + action", such as "Condition 1: multiple-choice question -> mark the answer; Condition 2: short-answer question -> provide key points".
+  2.4 Applicability scope annotation format
+  1. Task scope format: Clearly state "rule content + applicable scope + excluded scope", such as "rule: mark knowledge source; applicable scope: medical questions; excluded scope: programming questions".
+  2. Conditional scope format: Express as "condition + rule content", such as "condition: elementary school essay -> rule: encouraging language; condition: high school essay -> rule: objective and professional".
+  3. Scope level format: Mark "global instruction / specific intent instruction" and clearly state the hierarchy, such as "global instruction: all documents use Markdown; specific intent instruction: weekly reports must include three parts".
+  2.5 Conflict resolution format
+  1. Conditional branch resolution format: Clearly state branches as "scenario + rule content", such as "correct option: concise, 30-50 words; incorrect option: detailed explanation, 80-120 words".
+  2. Priority annotation format: Clearly state "priority order: current instruction > task rule > global rule", and annotate the execution method and memory retention strategy.
+  3. Scope refinement format: Refine rule conditions and requirements to avoid logical conflicts, such as "key options, including correct and easily confused options: 80 words; other options: 40 words".
+  3. Examples
+  3.1 Explicit instruction recognition example
+  - Input: "From now on, when analyzing medical questions, always mark the knowledge source."
+  - Recognition result: Explicit instruction, triggered by "from now on". Extract the rule "mark the knowledge source", determine that it is memorable, and set the applicable scope to medical question analysis.
+  3.2 Implicit instruction recognition example
+  - Input:
+    - Round 1 user: "Help me analyze this question."
+    - Round 1 Agent: [provides an analysis that does not explain why the incorrect options are wrong]
+    - Round 2 user: "That's not right. For incorrect options, explain why they are wrong."
+  - Recognition result: Implicit instruction, from user correction. Determine that it is memorable and ask the user: "Would you like me to handle incorrect options this way whenever analyzing questions in the future?"
+  3.3 Memorability judgment examples
+  - Example 1, one-time requirement:
+    - Input: "Add financial data to today's report."
+    - Judgment result: One-time requirement with the time limit "today"; do not remember it.
+  - Example 2, long-term norm:
+    - Input: "All reports must include financial data."
+    - Judgment result: Long-term norm with the scope "all"; remember it.
+  - Example 3, vague expression:
+    - Input: "Make it more detailed."
+    - Judgment result: Applicability scope is unclear. Ask the user: "Do you mean all tasks should be more detailed, or only a certain type of task?"
+  3.4 Instruction extraction and normalization example
+  - Input: "Make it feel formal, don't be too wordy, and highlight the key points."
+  - Extraction result:
+    - Rule 1: Tone constraint: formal and professional
+    - Rule 2: Expression constraint: concise, avoid redundancy
+    - Rule 3: Format requirement: put key content first or emphasize it in bold
+  - Normalization result: Remove colloquial expressions and clearly state the constraint types and specific requirements.
+  3.5 Incremental update examples
+  - Example 1, adding a new rule:
+    - Existing memory: Rule 1 "analyze each option"; Rule 2 "mark source"
+    - Input: "By the way, incorrect options should mention common misconceptions."
+    - Processing result: Identify the addition intent, add Rule 3 "mark common misconceptions for incorrect options", confirm there is no conflict with existing rules, and merge as Rules 1-2-3.
+  - Example 2, revising a rule:
+    - Existing: "analysis length: within 50 words"
+    - Input: "That's not right, it should be 50-100 words."
+    - Processing result: Identify revision intent, locate the "analysis length" rule, replace it with "50-100 words", and verify consistency with other rules.
+  3.6 Conflict handling example
+  - Input:
+    - Existing: "The analysis should be concise."
+    - New: "Incorrect options should be explained in detail."
+  - Conflict detection: Direct conflict, "concise" vs "detailed".
+  - Resolution question: "You previously asked for concise analysis, and now you want detailed explanations for incorrect options. Which do you prefer: A. Only incorrect options are detailed while other parts stay concise; B. handle flexibly based on the situation; C. modify the previous 'concise' requirement?"
+  - Final rule, if the user selects A: "correct option: concise, 30-50 words; incorrect options: detailed explanation, 80-120 words"
+  3.7 Task matching and memory application examples
+  - Example 1, high-similarity match:
+    - Memory: Medical question analysis rules, such as marking sources and analyzing each option.
+    - Input: "Help me analyze this pharmacology question."
+    - Match result: Similarity 95% or above; directly apply the medical question analysis rules.
+  - Example 2, cross-session consistency:
+    - Day 1: User sets the rule "analysis should be 50-100 words and mark sources"
+    - Day 3: Input "Analyze this new question"
+    - Day 7: Input "Analyze another question"
+    - Application result: Day 3 and Day 7 automatically apply the Day 1 rule, and all three outputs keep the same format and level of detail.
+directory: "viking://user/{{ user_space }}/skills"
+filename_template: "{{ skill_name }}/SKILL.md"
+enabled: true
+fields:
+  - name: skill_name
+    type: string
+    description: |
+      # Content
+      The stable name of the Skill.
+      # Notes
+      (1) It must be a non-empty string.
+      (2) It must not exceed 64 characters.
+      (3) It may contain only ASCII letters, digits, underscores `_`, and hyphens `-`.
+      (4) It must not contain Chinese characters, spaces, slashes, dots, colons, or other punctuation.
+      (5) Prefer lowercase English words connected with hyphens. Keep it short while expressing the main purpose.
+      # Examples
+      ## Good examples
+      - order-refund-flow
+      - medical-question-analysis
+      - report_format_rules
+      ## Bad examples
+      - order-refund-flow!
+      - order refund flow
+      - order/refund/flow
+      - order.refund.flow
+      - this-skill-name-is-too-long-and-contains-too-many-unnecessary-details-for-storage
+    merge_op: immutable
+
+  - name: description
+    type: string
+    description: |
+      # Content
+      Briefly describe the skill's function or application scenario.
+      # Notes
+      (1) The output must be general and must not include specific task requirements.
+      (2) It must not exceed 30 characters.
+      # Examples
+      ## Good examples
+      - Detailed steps for analyzing common-sense questions, especially geography questions. How to analyze and handle stomach pain symptoms, including checking symptoms, consulting a doctor, and suggesting treatment.
+      ## Bad examples
+      - The user reports that the package was not received even though the system shows delivery completed, asks to resolve the issue by getting the item or a refund, and asks about the delivery status of order 12346.
+    merge_op: replace
+
+  - name: content
+    type: string
+    description: |
+      # Content
+      The complete information for this Skill. It must remain consistent with the information extracted from the conversation history between the user and the model.
+
+      # Output format
+      1. The output must be a continuous Markdown string.
+      2. You may refer to the format description below and adjust some sections as appropriate.
+
+      # Detailed format and instructions: refer to the example Markdown content inside the <md> tag below.
+      <md>
+      [Briefly introduce the skill and its importance]
+      ## Core Rules
+      - [Core topic 1]
+      - [Core topic 2]
+      ## Scenarios for Using This Skill
+      - [Scenario 1]
+      - [Scenario 2]
+      ## Implementation Guide
+      ### Prerequisites
+      - [Required knowledge, environment, or configuration]
+      ### Techniques and Methods
+      [Explain in detail how to apply this skill]
+      ### Application Scenario Examples
+      [Concrete examples from the source material]
+      ## Key Points
+      - [Key point 1]
+      - [Key point 2]
+      </md>
+
+      # Correct output reference: see the content inside the <example> tag below.
+      <example>
+      This skill standardizes the solution process for physics circuit calculation problems to ensure accuracy and consistency.
+      ## Core Rules
+      - Physics circuit calculation problems must be solved using the standard format
+      - The standard format contains four steps: circuit analysis, formula listing, calculation, and final answer output
+      ## Scenarios for Using This Skill
+      - When solving physics circuit calculation problems
+      ## Implementation Guide
+      ### Prerequisites
+      - Master the basic concepts and formulas of physics circuits
+      ### Techniques and Methods
+      1. [Circuit analysis]: Describe the connection method in words, such as series or parallel.
+      2. [Formula]: List the original formulas used.
+      ### Application Scenario Examples
+      When encountering a physics circuit calculation problem, solve it according to the four steps above.
+      ## Key Points
+      - Strictly follow the four-step solution process
+      - Do not include units in the calculation process; include units in the final answer
+      </example>
+    merge_op: patch

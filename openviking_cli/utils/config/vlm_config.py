@@ -1,0 +1,881 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+import asyncio
+import importlib
+import threading
+import weakref
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+
+from pydantic import BaseModel, Field, PrivateAttr, ValidationInfo, model_validator
+
+
+def _load_codex_auth_module():
+    importlib.import_module("openviking.models.vlm")
+    return importlib.import_module("openviking.models.vlm.backends.codex_auth")
+
+
+def _normalize_provider_name(name: Optional[str]) -> Optional[str]:
+    if not isinstance(name, str):
+        return name
+    cleaned = name.strip().lower()
+    return cleaned or None
+
+
+def _reject_stream_config(data: Any, location: str) -> None:
+    if not isinstance(data, dict):
+        return
+    if "stream" in data:
+        raise ValueError(
+            f"{location}.stream is not supported; OpenViking VLM calls return complete responses"
+        )
+    extra_request_body = data.get("extra_request_body")
+    if isinstance(extra_request_body, dict) and "stream" in extra_request_body:
+        raise ValueError(
+            f"{location}.extra_request_body.stream is not supported; "
+            "OpenViking VLM calls return complete responses"
+        )
+
+
+class VLMCredential(BaseModel):
+    """Single VLM credential configuration for multi-credential failover."""
+
+    id: Optional[str] = Field(default=None, description="Unique identifier for this credential")
+    provider: Optional[str] = Field(default=None, description="Provider type")
+    model: Optional[str] = Field(
+        default=None,
+        description=(
+            "Model name (or endpoint id) for this credential. "
+            "Overrides the parent VLMConfig.model when set, allowing each credential "
+            "to point to a different deployment / endpoint."
+        ),
+    )
+    api_key: Optional[str] = Field(default=None, description="API key")
+    api_base: Optional[str] = Field(default=None, description="API base URL")
+    api_version: Optional[str] = Field(default=None, description="API version")
+    forward_api_key: Optional[bool] = Field(
+        default=None, description="Whether to pass api_key through to LiteLLM"
+    )
+    extra_headers: Optional[Dict[str, str]] = Field(default=None, description="Extra HTTP headers")
+    extra_request_body: Optional[Dict[str, Any]] = Field(
+        default=None, description="Extra JSON body fields"
+    )
+    reasoning_effort: Optional[str] = Field(
+        default=None,
+        description="Reasoning effort for OpenAI-compatible reasoning models",
+    )
+    keepalive_expiry: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Idle HTTP connection lifetime for OpenAI-compatible providers",
+    )
+    max_tokens: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Maximum completion output tokens for this credential. "
+            "Overrides the parent max_tokens when set."
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_stream_config(cls, data: Any) -> Any:
+        _reject_stream_config(data, "vlm.credentials[]")
+        return data
+
+
+class VLMMediaConfig(BaseModel):
+    """Runtime controls for audio and video inputs handled by the configured VLM."""
+
+    enabled: bool = Field(default=False, description="Enable VLM audio/video understanding")
+    max_concurrent: int = Field(
+        default=2,
+        ge=1,
+        description="Maximum concurrent audio/video VLM calls",
+    )
+    file_processing_timeout: float = Field(
+        default=1800.0,
+        gt=0.0,
+        description="Maximum provider-side media preprocessing wait in seconds",
+    )
+    file_poll_interval: float = Field(
+        default=3.0,
+        gt=0.0,
+        description="Provider-side media preprocessing poll interval in seconds",
+    )
+    video_fps: float = Field(
+        default=1.0,
+        ge=0.2,
+        le=5.0,
+        description="Video frame sampling rate for providers that support preprocessing",
+    )
+
+
+class VLMConfig(BaseModel):
+    """VLM configuration, supports multiple provider backends and multi-credential failover."""
+
+    backup: Optional["VLMConfig"] = Field(
+        default=None, description="Backup VLM configuration for failover (legacy)"
+    )
+    model: Optional[str] = Field(default=None, description="Model name")
+    api_key: Optional[str] = Field(default=None, description="API key")
+    forward_api_key: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Whether to pass api_key through to LiteLLM. None uses provider-aware defaults."
+        ),
+    )
+    api_base: Optional[str] = Field(default=None, description="API base URL")
+    temperature: float = Field(default=0.0, description="Generation temperature")
+    max_retries: int = Field(default=3, description="Maximum retry attempts")
+    timeout: float = Field(
+        default=600.0,
+        gt=0.0,
+        description=(
+            "Per-request HTTP timeout in seconds for VLM API calls. Applied to "
+            "the underlying OpenAI/Azure/LiteLLM clients. Increase for slow or "
+            "high-latency endpoints (e.g., DashScope, local inference servers)."
+        ),
+    )
+    keepalive_expiry: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Idle HTTP connection lifetime in seconds for OpenAI-compatible VLM clients. "
+            "Set to 0 to disable connection reuse; None uses the provider SDK default."
+        ),
+    )
+
+    provider: Optional[str] = Field(default=None, description="Provider type")
+    backend: Optional[str] = Field(
+        default=None, description="Backend provider (Deprecated, use 'provider' instead)"
+    )
+
+    providers: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict,
+        description="Multi-provider configuration, e.g. {'openai': {'api_key': 'xxx', 'api_base': 'xxx'}}",
+    )
+
+    default_provider: Optional[str] = Field(default=None, description="Default provider name")
+
+    max_tokens: Optional[int] = Field(
+        default=None,
+        description="Maximum tokens for VLM completion output (None = provider default)",
+    )
+
+    thinking: bool = Field(default=False, description="Enable thinking mode for VolcEngine models")
+
+    max_concurrent: int = Field(
+        default=32, description="Maximum number of concurrent LLM calls for semantic processing"
+    )
+
+    media: VLMMediaConfig = Field(
+        default_factory=VLMMediaConfig,
+        description="Audio/video runtime controls for the configured VLM",
+    )
+
+    api_version: Optional[str] = Field(
+        default=None,
+        description="API version for Azure OpenAI (e.g., '2025-01-01-preview').",
+    )
+
+    extra_headers: Optional[Dict[str, str]] = Field(
+        default=None, description="Extra HTTP headers for OpenAI-compatible providers"
+    )
+
+    extra_request_body: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Extra JSON body fields passed to OpenAI-compatible VLM completion requests. "
+            "Useful for provider-specific options such as Ollama's {'think': false}."
+        ),
+    )
+
+    reasoning_effort: Optional[str] = Field(
+        default=None,
+        description="Reasoning effort for OpenAI-compatible reasoning models",
+    )
+
+    # New multi-credential configuration
+    credentials: List[VLMCredential] = Field(
+        default_factory=list,
+        description="Ordered list of credentials for failover. Call order matches array index (0 is highest priority).",
+    )
+
+    failback_timeout_seconds: float = Field(
+        default=600.0, description="Time in seconds after which to attempt failback to primary"
+    )
+    failback_request_count: int = Field(
+        default=50, description="Number of backup requests after which to attempt failback"
+    )
+
+    _vlm_instance: Optional[Any] = None
+    _media_semaphores: weakref.WeakKeyDictionary[
+        asyncio.AbstractEventLoop,
+        weakref.ReferenceType[asyncio.Semaphore],
+    ] = PrivateAttr(default_factory=weakref.WeakKeyDictionary)
+    _media_semaphore_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_provider_backend(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            _reject_stream_config(data, "vlm")
+            provider = data.get("provider")
+            backend = data.get("backend")
+
+            if backend is not None and provider is None:
+                data["provider"] = backend
+            data["provider"] = _normalize_provider_name(data.get("provider"))
+            data["backend"] = _normalize_provider_name(data.get("backend"))
+            data["default_provider"] = _normalize_provider_name(data.get("default_provider"))
+            providers = data.get("providers")
+            if isinstance(providers, dict):
+                normalized: Dict[str, Dict[str, Any]] = {}
+                provider_sources: Dict[str, str] = {}
+                for name, config in providers.items():
+                    normalized_name = _normalize_provider_name(name) or str(name)
+                    _reject_stream_config(config, f"vlm.providers.{normalized_name}")
+                    existing_name = provider_sources.get(normalized_name)
+                    if existing_name is not None and existing_name != str(name):
+                        raise ValueError(
+                            "Duplicate VLM provider config after normalization: "
+                            f"{existing_name} and {name}"
+                        )
+                    normalized[normalized_name] = config
+                    provider_sources[normalized_name] = str(name)
+                data["providers"] = normalized
+        return data
+
+    @model_validator(mode="after")
+    def validate_config(self, info: ValidationInfo):
+        """Validate configuration completeness and consistency"""
+        # Validate recursive backup BEFORE normalizing credentials (which clears backup)
+        self._validate_no_recursive_backup()
+
+        self._migrate_legacy_config()
+        self._normalize_credentials()
+
+        skip_codex_auth_availability = bool(
+            info.context and info.context.get("skip_codex_auth_availability")
+        )
+
+        if self._has_any_config():
+            if not self.model:
+                raise ValueError("VLM configuration requires 'model' to be set")
+            # When credentials are configured, validate each credential
+            if self.credentials:
+                for i, cred in enumerate(self.credentials):
+                    provider_name = cred.provider or self.provider
+                    if provider_name == "openai-codex":
+                        has_codex_auth_available = (
+                            _load_codex_auth_module().has_codex_auth_available
+                        )
+                        if (
+                            not cred.api_key
+                            and not skip_codex_auth_availability
+                            and not has_codex_auth_available()
+                        ):
+                            raise ValueError(
+                                f"Credential {i} ({cred.id or 'unnamed'}): requires Codex OAuth credentials in ~/.openviking/codex_auth.json"
+                            )
+                    elif provider_name not in ("litellm", None) and not cred.api_key:
+                        # Also check providers dict for fallback
+                        if not self._get_credential_api_key(cred):
+                            raise ValueError(
+                                f"Credential {i} ({cred.id or 'unnamed'}): requires 'api_key' to be set"
+                            )
+            else:
+                # Legacy validation
+                provider_name = self._resolve_provider_name()
+                if provider_name == "openai-codex":
+                    has_codex_auth_available = _load_codex_auth_module().has_codex_auth_available
+                    if (
+                        not self._get_effective_api_key()
+                        and not skip_codex_auth_availability
+                        and not has_codex_auth_available()
+                    ):
+                        raise ValueError(
+                            "VLM configuration requires Codex OAuth credentials in ~/.openviking/codex_auth.json or an importable Codex CLI auth file"
+                        )
+                elif provider_name != "litellm" and not self._get_effective_api_key():
+                    raise ValueError("VLM configuration requires 'api_key' to be set")
+        return self
+
+    def _validate_no_recursive_backup(self):
+        """Prevent recursive backup configurations"""
+        if self.backup is not None:
+            if self.backup.backup is not None:
+                raise ValueError(
+                    "Backup VLM configuration cannot have its own backup (recursive backups are not allowed)"
+                )
+
+    def _migrate_legacy_config(self):
+        """Migrate legacy config to providers structure."""
+        if self.provider and (
+            self.api_key
+            or self.api_base
+            or self.extra_headers
+            or self.extra_request_body
+            or self.reasoning_effort
+            or self.keepalive_expiry is not None
+            or self.forward_api_key is not None
+        ):
+            if self.provider not in self.providers:
+                self.providers[self.provider] = {}
+            if self.api_key and "api_key" not in self.providers[self.provider]:
+                self.providers[self.provider]["api_key"] = self.api_key
+            if (
+                self.forward_api_key is not None
+                and "forward_api_key" not in self.providers[self.provider]
+            ):
+                self.providers[self.provider]["forward_api_key"] = self.forward_api_key
+            if self.api_base and "api_base" not in self.providers[self.provider]:
+                self.providers[self.provider]["api_base"] = self.api_base
+            if self.extra_headers and "extra_headers" not in self.providers[self.provider]:
+                self.providers[self.provider]["extra_headers"] = self.extra_headers
+            if (
+                self.extra_request_body
+                and "extra_request_body" not in self.providers[self.provider]
+            ):
+                self.providers[self.provider]["extra_request_body"] = self.extra_request_body
+            if self.reasoning_effort and "reasoning_effort" not in self.providers[self.provider]:
+                self.providers[self.provider]["reasoning_effort"] = self.reasoning_effort
+            if (
+                self.keepalive_expiry is not None
+                and "keepalive_expiry" not in self.providers[self.provider]
+            ):
+                self.providers[self.provider]["keepalive_expiry"] = self.keepalive_expiry
+
+    def _normalize_credentials(self):
+        """Normalize credentials configuration:
+        1. Migrate legacy backup config to credentials
+        2. Migrate top-level credentials to credentials list
+        3. Assign default IDs to credentials without IDs
+        4. Apply top-level defaults to credentials
+        """
+        migrated_credentials = []
+
+        # Step 1: Migrate legacy backup config
+        if self.backup is not None and self.backup._has_any_config():
+            # Primary credential: resolve via _match_provider() so legacy
+            # ``providers: {openai: {...}}`` configs (without top-level
+            # provider/api_key) are migrated correctly.
+            primary_cfg, primary_provider = self._match_provider()
+            primary_cfg = primary_cfg or {}
+            primary_cred = VLMCredential(
+                id="legacy-primary",
+                provider=primary_provider or self.provider,
+                model=self.model,
+                api_key=primary_cfg.get("api_key") or self.api_key,
+                api_base=primary_cfg.get("api_base") or self.api_base,
+                api_version=primary_cfg.get("api_version") or self.api_version,
+                forward_api_key=(
+                    primary_cfg.get("forward_api_key")
+                    if primary_cfg.get("forward_api_key") is not None
+                    else self.forward_api_key
+                ),
+                extra_headers=primary_cfg.get("extra_headers") or self.extra_headers,
+                extra_request_body=(
+                    primary_cfg.get("extra_request_body") or self.extra_request_body
+                ),
+                reasoning_effort=(primary_cfg.get("reasoning_effort") or self.reasoning_effort),
+                keepalive_expiry=(
+                    primary_cfg.get("keepalive_expiry")
+                    if primary_cfg.get("keepalive_expiry") is not None
+                    else self.keepalive_expiry
+                ),
+                max_tokens=self.max_tokens,
+            )
+            migrated_credentials.append(primary_cred)
+
+            # Backup credential: same resolution rules so backup using
+            # providers/default_provider also gets a usable api_key/provider.
+            backup_cfg, backup_provider = self.backup._match_provider()
+            backup_cfg = backup_cfg or {}
+            backup_cred = VLMCredential(
+                id="legacy-backup",
+                provider=backup_provider or self.backup.provider,
+                model=self.backup.model,
+                api_key=backup_cfg.get("api_key") or self.backup.api_key,
+                api_base=backup_cfg.get("api_base") or self.backup.api_base,
+                api_version=backup_cfg.get("api_version") or self.backup.api_version,
+                forward_api_key=(
+                    backup_cfg.get("forward_api_key")
+                    if backup_cfg.get("forward_api_key") is not None
+                    else self.backup.forward_api_key
+                ),
+                extra_headers=backup_cfg.get("extra_headers") or self.backup.extra_headers,
+                extra_request_body=(
+                    backup_cfg.get("extra_request_body") or self.backup.extra_request_body
+                ),
+                reasoning_effort=(
+                    backup_cfg.get("reasoning_effort") or self.backup.reasoning_effort
+                ),
+                keepalive_expiry=(
+                    backup_cfg.get("keepalive_expiry")
+                    if backup_cfg.get("keepalive_expiry") is not None
+                    else self.backup.keepalive_expiry
+                ),
+                max_tokens=self.backup.max_tokens,
+            )
+            migrated_credentials.append(backup_cred)
+
+            # Clear backup to avoid double processing
+            self.backup = None
+
+        # Step 2: If no credentials from backup migration and no explicit credentials,
+        # create credentials from top-level config. We resolve the effective provider
+        # config first (via _match_provider) so legacy ``providers: {openai: {...}}``
+        # configurations - where the api_key/api_base live inside the providers dict
+        # rather than at the top level - are migrated correctly. Otherwise the
+        # generated credential would be missing provider/api_key and is_available()
+        # would return False.
+        if not migrated_credentials and not self.credentials:
+            if self._has_legacy_provider_config():
+                provider_cfg, provider_name = self._match_provider()
+                provider_cfg = provider_cfg or {}
+                migrated_credentials.append(
+                    VLMCredential(
+                        id="default",
+                        provider=provider_name or self.provider,
+                        model=self.model,
+                        api_key=provider_cfg.get("api_key") or self.api_key,
+                        api_base=provider_cfg.get("api_base") or self.api_base,
+                        api_version=provider_cfg.get("api_version") or self.api_version,
+                        forward_api_key=(
+                            provider_cfg.get("forward_api_key")
+                            if provider_cfg.get("forward_api_key") is not None
+                            else self.forward_api_key
+                        ),
+                        extra_headers=provider_cfg.get("extra_headers") or self.extra_headers,
+                        extra_request_body=(
+                            provider_cfg.get("extra_request_body") or self.extra_request_body
+                        ),
+                        reasoning_effort=(
+                            provider_cfg.get("reasoning_effort") or self.reasoning_effort
+                        ),
+                        keepalive_expiry=(
+                            provider_cfg.get("keepalive_expiry")
+                            if provider_cfg.get("keepalive_expiry") is not None
+                            else self.keepalive_expiry
+                        ),
+                    )
+                )
+
+        # Step 3: Merge migrated credentials with existing credentials
+        if migrated_credentials:
+            # Only use migrated if no explicit credentials exist
+            if not self.credentials:
+                self.credentials = migrated_credentials
+
+        # Step 4: Assign default IDs and apply top-level defaults
+        for i, cred in enumerate(self.credentials):
+            if not cred.id:
+                cred.id = f"credential-{i}"
+            # Apply top-level defaults where credential doesn't specify
+            if not cred.provider:
+                cred.provider = self.provider
+            if not cred.api_key:
+                cred.api_key = self._get_credential_api_key(cred)
+            if not cred.api_base:
+                cred.api_base = self.api_base
+            if not cred.api_version:
+                cred.api_version = self.api_version
+            if cred.forward_api_key is None:
+                cred.forward_api_key = self.forward_api_key
+            if not cred.extra_headers:
+                cred.extra_headers = self.extra_headers
+            if not cred.extra_request_body:
+                cred.extra_request_body = self.extra_request_body
+            if not cred.reasoning_effort:
+                cred.reasoning_effort = self.reasoning_effort
+            if cred.keepalive_expiry is None:
+                cred.keepalive_expiry = self.keepalive_expiry
+
+    def _has_legacy_provider_config(self) -> bool:
+        """Check if there's legacy provider config (not credentials-based)."""
+        return (
+            self.provider is not None
+            or self.api_key is not None
+            or self.api_base is not None
+            or self.providers
+        )
+
+    def _get_credential_api_key(self, cred: VLMCredential) -> str | None:
+        """Get effective API key for a credential, checking providers dict."""
+        if cred.api_key:
+            return cred.api_key
+        if cred.provider and cred.provider in self.providers:
+            return self.providers[cred.provider].get("api_key")
+        return None
+
+    def _has_any_config(self) -> bool:
+        """Check if any config is provided."""
+        if self.credentials:
+            return True
+        if self.api_key or self.model or self.api_base or self.provider or self.default_provider:
+            return True
+        if self.providers:
+            return True
+        return False
+
+    def _get_effective_api_key(self) -> str | None:
+        """Get effective API key."""
+        if self.credentials:
+            return self.credentials[0].api_key or self._get_credential_api_key(self.credentials[0])
+        if self.api_key:
+            return self.api_key
+        config, _ = self._match_provider()
+        if config and config.get("api_key"):
+            return config["api_key"]
+        return None
+
+    def _get_provider_config_by_name(self, provider_name: str) -> Dict[str, Any]:
+        config = dict(self.providers.get(provider_name) or {})
+        if self.api_key and "api_key" not in config:
+            config["api_key"] = self.api_key
+        if self.forward_api_key is not None and "forward_api_key" not in config:
+            config["forward_api_key"] = self.forward_api_key
+        if self.api_base and "api_base" not in config:
+            config["api_base"] = self.api_base
+        if self.extra_headers and "extra_headers" not in config:
+            config["extra_headers"] = self.extra_headers
+        if self.extra_request_body and "extra_request_body" not in config:
+            config["extra_request_body"] = self.extra_request_body
+        if self.reasoning_effort and "reasoning_effort" not in config:
+            config["reasoning_effort"] = self.reasoning_effort
+        if self.keepalive_expiry is not None and "keepalive_expiry" not in config:
+            config["keepalive_expiry"] = self.keepalive_expiry
+        return config
+
+    def _provider_has_usable_credentials(self, provider_name: str, config: Dict[str, Any]) -> bool:
+        if config.get("api_key"):
+            return True
+        if provider_name == "litellm":
+            return True
+        if provider_name == "openai-codex":
+            has_codex_auth_available = _load_codex_auth_module().has_codex_auth_available
+
+            return has_codex_auth_available()
+        return False
+
+    def _get_provider_config_from_credential(self, cred: VLMCredential) -> Dict[str, Any]:
+        config: Dict[str, Any] = {}
+        if cred.api_key:
+            config["api_key"] = cred.api_key
+        if cred.api_base:
+            config["api_base"] = cred.api_base
+        if cred.api_version:
+            config["api_version"] = cred.api_version
+        if cred.forward_api_key is not None:
+            config["forward_api_key"] = cred.forward_api_key
+        if cred.extra_headers:
+            config["extra_headers"] = cred.extra_headers
+        if cred.extra_request_body:
+            config["extra_request_body"] = cred.extra_request_body
+        if cred.reasoning_effort:
+            config["reasoning_effort"] = cred.reasoning_effort
+        if cred.keepalive_expiry is not None:
+            config["keepalive_expiry"] = cred.keepalive_expiry
+        return config
+
+    def _match_provider(self, model: str | None = None) -> tuple[Dict[str, Any] | None, str | None]:
+        """Match provider config.
+
+        Returns:
+            (provider_config_dict, provider_name)
+        """
+        del model
+        # If credentials are configured, use the first one
+        if self.credentials:
+            cred = self.credentials[0]
+            return self._get_provider_config_from_credential(cred), cred.provider
+
+        if self.provider:
+            return self._get_provider_config_by_name(self.provider) or {}, self.provider
+
+        if self.default_provider:
+            return (
+                self._get_provider_config_by_name(self.default_provider) or {},
+                self.default_provider,
+            )
+
+        if len(self.providers) == 1:
+            provider_name = next(iter(self.providers))
+            return self._get_provider_config_by_name(provider_name), provider_name
+
+        for provider_name in self.providers:
+            config = self._get_provider_config_by_name(provider_name)
+            if self._provider_has_usable_credentials(provider_name, config):
+                return config, provider_name
+
+        return None, None
+
+    def _resolve_provider_name(self) -> str | None:
+        """Resolve provider name from credentials or legacy config."""
+        if self.credentials:
+            return self.credentials[0].provider
+        _, name = self._match_provider()
+        return name
+
+    def get_provider_config(
+        self, model: str | None = None
+    ) -> tuple[Dict[str, Any] | None, str | None]:
+        """Get provider config.
+
+        Returns:
+            (provider_config_dict, provider_name)
+        """
+        return self._match_provider(model)
+
+    def get_vlm_instance(self) -> Any:
+        """Get VLM instance with multi-credential failover support."""
+        if self._vlm_instance is None:
+            from openviking.models.vlm import FailoverVLM, MultiCredentialVLM, VLMFactory
+
+            if self.credentials:
+                # Build VLM instances for each credential
+                vlm_instances = []
+                for cred in self.credentials:
+                    config_dict = self._build_vlm_config_dict_for_credential(cred)
+                    vlm_instances.append(VLMFactory.create(config_dict))
+
+                if len(vlm_instances) == 1:
+                    self._vlm_instance = vlm_instances[0]
+                else:
+                    self._vlm_instance = MultiCredentialVLM(
+                        vlm_instances,
+                        credential_ids=[c.id for c in self.credentials],
+                        failback_timeout_seconds=self.failback_timeout_seconds,
+                        failback_request_count=self.failback_request_count,
+                    )
+            else:
+                # Legacy mode: single VLM with optional backup
+                config_dict = self._build_vlm_config_dict()
+                primary = VLMFactory.create(config_dict)
+
+                if self.backup is not None and self.backup._has_any_config():
+                    backup_config_dict = self.backup._build_vlm_config_dict()
+                    backup = VLMFactory.create(backup_config_dict)
+                    self._vlm_instance = FailoverVLM(primary, backup)
+                else:
+                    self._vlm_instance = primary
+
+        return self._vlm_instance
+
+    def close(self) -> None:
+        """Close and clear the cached VLM instance."""
+        instance = self._vlm_instance
+        self._vlm_instance = None
+        if instance is not None:
+            instance.close()
+
+    def _build_vlm_config_dict_for_credential(self, credential: VLMCredential) -> Dict[str, Any]:
+        """Build VLM instance config dict for a specific credential."""
+        result = {
+            "model": credential.model or self.model,
+            "temperature": self.temperature,
+            "max_retries": self.max_retries,
+            "timeout": self.timeout,
+            "keepalive_expiry": credential.keepalive_expiry,
+            "provider": credential.provider,
+            "thinking": self.thinking,
+            "max_tokens": (
+                credential.max_tokens if credential.max_tokens is not None else self.max_tokens
+            ),
+            "api_version": credential.api_version,
+            "media": self.media.model_dump(),
+        }
+
+        if credential.api_key:
+            result["api_key"] = credential.api_key
+        if credential.forward_api_key is not None:
+            result["forward_api_key"] = credential.forward_api_key
+        if credential.api_base:
+            result["api_base"] = credential.api_base
+        if credential.extra_headers:
+            result["extra_headers"] = credential.extra_headers
+        if credential.extra_request_body:
+            result["extra_request_body"] = credential.extra_request_body
+        if credential.reasoning_effort:
+            result["reasoning_effort"] = credential.reasoning_effort
+
+        return result
+
+    def _build_vlm_config_dict(self) -> Dict[str, Any]:
+        """Build VLM instance config dict."""
+        config, name = self.get_provider_config()
+
+        result = {
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_retries": self.max_retries,
+            "timeout": self.timeout,
+            "keepalive_expiry": (
+                config.get("keepalive_expiry")
+                if config and config.get("keepalive_expiry") is not None
+                else self.keepalive_expiry
+            ),
+            "provider": name,
+            "thinking": self.thinking,
+            "max_tokens": self.max_tokens,
+            "api_version": self.api_version,
+            "media": self.media.model_dump(),
+        }
+
+        if config:
+            if config.get("api_key"):
+                result["api_key"] = config.get("api_key")
+            if config.get("forward_api_key") is not None:
+                result["forward_api_key"] = config.get("forward_api_key")
+            if config.get("api_base"):
+                result["api_base"] = config.get("api_base")
+            if config.get("extra_headers"):
+                result["extra_headers"] = config.get("extra_headers")
+            if config.get("extra_request_body"):
+                result["extra_request_body"] = config.get("extra_request_body")
+            if config.get("reasoning_effort"):
+                result["reasoning_effort"] = config.get("reasoning_effort")
+
+        return result
+
+    def get_completion(
+        self,
+        prompt: str = "",
+        thinking: Optional[bool] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Union[str, Any]:
+        """Get LLM completion."""
+        effective_thinking = self.thinking if thinking is None else thinking
+        return self.get_vlm_instance().get_completion(
+            prompt=prompt,
+            thinking=effective_thinking,
+            tools=tools,
+            messages=messages,
+        )
+
+    async def get_completion_async(
+        self,
+        prompt: str = "",
+        thinking: Optional[bool] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Union[str, Any]:
+        """Get LLM completion asynchronously."""
+        effective_thinking = self.thinking if thinking is None else thinking
+        return await self.get_vlm_instance().get_completion_async(
+            prompt=prompt,
+            thinking=effective_thinking,
+            tools=tools,
+            tool_choice=tool_choice,
+            messages=messages,
+        )
+
+    def is_available(self) -> bool:
+        """Check if LLM is configured."""
+        if self._resolve_provider_name() == "openai-codex":
+            has_codex_auth_available = _load_codex_auth_module().has_codex_auth_available
+
+            return bool(self._get_effective_api_key() or has_codex_auth_available())
+        if self._resolve_provider_name() == "litellm":
+            return bool(self.model)
+        return self._get_effective_api_key() is not None
+
+    def get_vision_completion(
+        self,
+        prompt: str = "",
+        images: Optional[list] = None,
+        thinking: Optional[bool] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Union[str, Any]:
+        """Get LLM completion with images."""
+        effective_thinking = self.thinking if thinking is None else thinking
+        return self.get_vlm_instance().get_vision_completion(
+            prompt=prompt,
+            images=images,
+            thinking=effective_thinking,
+            tools=tools,
+            messages=messages,
+        )
+
+    def _get_media_semaphore(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        with self._media_semaphore_lock:
+            semaphore_ref = self._media_semaphores.get(loop)
+            semaphore = semaphore_ref() if semaphore_ref is not None else None
+            if semaphore is None:
+                semaphore = asyncio.Semaphore(self.media.max_concurrent)
+                self._media_semaphores[loop] = weakref.ref(semaphore)
+            return semaphore
+
+    def supports_media(
+        self,
+        *,
+        media_type: str,
+        filename: str,
+        size_bytes: int,
+    ) -> bool:
+        """Return whether enabled VLM media processing supports this input."""
+        if not self.media.enabled or not self.is_available():
+            return False
+        return bool(
+            self.get_vlm_instance().supports_media(
+                media_type=media_type,
+                filename=filename,
+                size_bytes=size_bytes,
+            )
+        )
+
+    async def get_media_completion_async(
+        self,
+        *,
+        prompt: str,
+        media_path: Path,
+        filename: str,
+        media_type: str,
+        prepare_media: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> str:
+        """Stage and understand audio/video under the configured media limit."""
+        from openviking.models.vlm.base import UnsupportedMediaInputError
+
+        if not self.media.enabled:
+            raise UnsupportedMediaInputError("VLM media understanding is disabled")
+
+        async with self._get_media_semaphore():
+            if prepare_media is not None:
+                await prepare_media()
+            return await self.get_vlm_instance().get_media_completion_async(
+                prompt=prompt,
+                media_path=media_path,
+                filename=filename,
+                media_type=media_type,
+            )
+
+    async def get_vision_completion_async(
+        self,
+        prompt: str = "",
+        images: Optional[list] = None,
+        thinking: Optional[bool] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Union[str, Any]:
+        """Get LLM completion with images asynchronously."""
+        effective_thinking = self.thinking if thinking is None else thinking
+        return await self.get_vlm_instance().get_vision_completion_async(
+            prompt=prompt,
+            images=images,
+            thinking=effective_thinking,
+            tools=tools,
+            messages=messages,
+        )
+
+
+# Resolve forward reference for backup field
+VLMConfig.model_rebuild()

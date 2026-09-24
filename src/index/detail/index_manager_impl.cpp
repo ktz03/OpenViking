@@ -1,0 +1,724 @@
+// Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+// SPDX-License-Identifier: AGPL-3.0
+#include "index/detail/index_manager_impl.h"
+#include <algorithm>
+#include <stdexcept>
+#include <memory>
+#include <chrono>
+#include <limits>
+#include <thread>
+#include "spdlog/spdlog.h"
+#include "common/ann_utils.h"
+#include "index/detail/scalar/filter/op_base.h"
+#include "index/detail/scalar/filter/filter_ops.h"
+#include "index/detail/scalar/filter/sort_ops.h"
+#include "index/detail/scalar/bitmap_holder/bitmap.h"
+
+namespace vectordb {
+
+const std::string kMetaFile = "manager_meta.json";
+const std::string kVectorIndexDir = "vector_index";
+const std::string kScalarIndexDir = "scalar_index";
+constexpr size_t kFilterTokenCacheCapacity = 32;
+constexpr uint64_t kFilterLayoutInverseMaxSpanFactor = 4;
+constexpr uint32_t kMissingFilterLayoutOffset =
+    std::numeric_limits<uint32_t>::max();
+
+IndexManagerImpl::IndexManagerImpl(const std::string& path_or_json) {
+  int ret = 0;
+  std::filesystem::path dir(path_or_json);
+  std::error_code ec;
+  if (std::filesystem::exists(dir, ec)) {
+    load_from_path(dir);
+    return;
+  }
+
+  JsonDoc json;
+  json.Parse(path_or_json.c_str());
+  if (!json.HasParseError()) {
+    init_from_json(json);
+    return;
+  }
+  return;
+}
+
+void IndexManagerImpl::init_from_json(const JsonDoc& json) {
+  manager_meta_ = std::make_shared<ManagerMeta>();
+  if (manager_meta_->init_from_json(json) != 0) {
+    SPDLOG_ERROR(
+        "IndexManagerImpl::init_from_json manager_meta_ init_from_json failed");
+    throw std::runtime_error(
+        "IndexManagerImpl::init_from_json manager_meta_ init_from_json failed");
+  }
+  SPDLOG_DEBUG("IndexManagerImpl::init_from_json vector_index_type: {}",
+               manager_meta_->vector_index_type);
+
+  if (manager_meta_->vector_index_type == "flat") {
+    auto bf_meta = std::dynamic_pointer_cast<BruteForceMeta>(
+        manager_meta_->vector_index_meta);
+    vector_index_ = std::make_shared<BruteForceIndex>(bf_meta);
+  } else {
+    SPDLOG_ERROR("IndexManagerImpl::init_from_json not support index_type={}",
+                 manager_meta_->vector_index_type);
+    throw std::runtime_error(
+        "IndexManagerImpl::init_from_json not support index_type=" +
+        manager_meta_->vector_index_type);
+  }
+  if (manager_meta_->scalar_index_meta) {
+    scalar_index_ =
+        std::make_shared<ScalarIndex>(manager_meta_->scalar_index_meta);
+    register_label_offset_converter_();
+  } else {
+    SPDLOG_WARN(
+        "IndexManagerImpl::init_from_json manager_meta_ scalar_index_meta is "
+        "null");
+  }
+  return;
+}
+
+void IndexManagerImpl::load_from_path(const std::filesystem::path& dir) {
+  auto meta_path = dir / kMetaFile;
+  manager_meta_ = std::make_shared<ManagerMeta>();
+  int ret = 0;
+  ret = manager_meta_->init_from_file(meta_path);
+  if (ret != 0) {
+    SPDLOG_ERROR("IndexManagerImpl::load meta file failed, ret={}", ret);
+    throw std::runtime_error("IndexManagerImpl::load meta file failed, ret=" +
+                             std::to_string(ret));
+  }
+
+  if (manager_meta_->vector_index_type == "flat") {
+    auto bf_meta = std::dynamic_pointer_cast<BruteForceMeta>(
+        manager_meta_->vector_index_meta);
+    vector_index_ = std::make_shared<BruteForceIndex>(bf_meta);
+  } else {
+    SPDLOG_ERROR("IndexLoader::load not support index_type={}",
+                 manager_meta_->vector_index_type);
+    throw std::runtime_error("IndexManagerImpl::not support index_type=" +
+                             manager_meta_->vector_index_type);
+  }
+  auto vector_index_dir = dir / kVectorIndexDir;
+  ret = vector_index_->load(vector_index_dir);
+  if (ret != 0) {
+    SPDLOG_ERROR("IndexManagerImpl::load index failed, ret={}", ret);
+    throw std::runtime_error("IndexManagerImpl::load  index failed, ret=" +
+                             std::to_string(ret));
+  }
+
+  auto scalar_index_dir = dir / kScalarIndexDir;
+  scalar_index_ = std::make_shared<ScalarIndex>(
+      manager_meta_->scalar_index_meta, scalar_index_dir);
+  register_label_offset_converter_();
+  SPDLOG_DEBUG("IndexManagerImpl::load_from_path success, path: {}",
+               dir.string());
+}
+
+void IndexManagerImpl::register_label_offset_converter_() {
+  scalar_index_->get_field_sets()->register_label_offset_converter(
+      [this](const std::vector<uint64_t>& labels,
+             std::vector<uint32_t>& offsets) -> bool {
+        try {
+          offsets.clear();
+          offsets.reserve(labels.size());
+          for (auto label : labels) {
+            if (!vector_index_) {
+              SPDLOG_ERROR("label_offset_converter vector_index_ is null");
+              return false;
+            }
+            int offset = vector_index_->get_offset_by_label(label);
+            if (offset >= 0) {
+              offsets.push_back(static_cast<uint32_t>(offset));
+            }
+          }
+          return true;
+        } catch (const std::exception& e) {
+          SPDLOG_ERROR("label_offset_converter exception: {}", e.what());
+          return false;
+        } catch (...) {
+          SPDLOG_ERROR("label_offset_converter unknown exception");
+          return false;
+        }
+      });
+}
+
+int parse_dsl_query(const std::string& dsl_filter_query_str,
+                    SearchContext& ctx) {
+  if (dsl_filter_query_str.empty()) {
+    return 0;
+  }
+  JsonDoc dsl_filter_query;
+
+  dsl_filter_query.Parse(dsl_filter_query_str.c_str());
+
+  bool has_filter = false;
+  bool has_sorter = false;
+  if (parse_and_precheck_op_parts(dsl_filter_query, has_filter, has_sorter) <
+      0) {
+    return -1;
+  }
+  if (has_filter) {
+    ctx.filter_op = parse_filter_json_doc_outter(dsl_filter_query);
+  }
+  if (has_sorter) {
+    ctx.sorter_op = parse_sorter_json_doc_outter(dsl_filter_query);
+  }
+  return 0;
+}
+
+int IndexManagerImpl::search(const SearchRequest& req, SearchResult& result) {
+  auto start = std::chrono::high_resolution_clock::now();
+  const auto& dsl_filter_query_str = req.dsl;
+
+  SearchContext ctx;
+  if (int ret = parse_dsl_query(dsl_filter_query_str, ctx); ret != 0) {
+    SPDLOG_ERROR("IndexManagerImpl::search [{}] scalar index search fail",
+                 dsl_filter_query_str);
+    return ret;
+  }
+
+  std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+
+  BitmapPtr bitmap = nullptr;
+  if (ctx.filter_op) {
+    bitmap = calculate_filter_bitmap(ctx, dsl_filter_query_str);
+    if (!bitmap) {
+      SPDLOG_DEBUG(
+          "IndexManagerImpl::search calculate_filter_bitmap returned null");
+      return -1;
+    }
+  }
+
+  int ret = 0;
+  if (ctx.sorter_op) {
+    ret = handle_sorter_query(ctx, bitmap, result, dsl_filter_query_str);
+  } else if (!req.query.empty()) {
+    ret = perform_vector_recall(req, ctx, bitmap, result);
+  }
+
+  if (ret == 0) {
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration =
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+            .count();
+    SPDLOG_DEBUG(
+        "IndexManagerImpl::search finish, dsl: {}, query size: {}, topk: {}, "
+        "result size: {}, cost: {}us",
+        req.dsl, req.query.size(), req.topk, result.labels.size(), duration);
+  }
+
+  return ret;
+}
+
+int IndexManagerImpl::search_with_filter_token(const SearchRequest& req,
+                                               uint64_t filter_token,
+                                               SearchResult& result,
+                                               bool& token_found) {
+  token_found = false;
+  if (filter_token == 0 || req.query.empty()) {
+    return 0;
+  }
+
+  std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+  BitmapPtr bitmap;
+  {
+    std::lock_guard<std::mutex> token_lock(filter_token_mutex_);
+    const auto it = filter_token_cache_.find(filter_token);
+    if (it == filter_token_cache_.end()) {
+      return 0;
+    }
+    bitmap = it->second;
+  }
+
+  token_found = true;
+  SearchContext ctx;
+  return perform_vector_recall(req, ctx, bitmap, result);
+}
+
+int IndexManagerImpl::set_filter_layout(
+    const std::vector<uint64_t>& ordered_labels) {
+  std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+  clear_filter_layout_();
+  filter_layout_offsets_.reserve(ordered_labels.size());
+  uint64_t valid_offset_count = 0;
+  uint32_t min_offset = kMissingFilterLayoutOffset;
+  uint32_t max_offset = 0;
+  for (const uint64_t label : ordered_labels) {
+    const int offset = vector_index_->get_offset_by_label(label);
+    if (offset < 0) {
+      filter_layout_offsets_.push_back(kMissingFilterLayoutOffset);
+      continue;
+    }
+    const auto logical_offset = static_cast<uint32_t>(offset);
+    filter_layout_offsets_.push_back(logical_offset);
+    ++valid_offset_count;
+    min_offset = std::min(min_offset, logical_offset);
+    max_offset = std::max(max_offset, logical_offset);
+  }
+
+  if (valid_offset_count == 0) {
+    return 0;
+  }
+  const uint64_t inverse_span =
+      static_cast<uint64_t>(max_offset) - min_offset + 1;
+  if (inverse_span >
+      kFilterLayoutInverseMaxSpanFactor * valid_offset_count) {
+    return 0;
+  }
+
+  filter_layout_rows_by_offset_.assign(
+      static_cast<size_t>(inverse_span), kMissingFilterLayoutOffset);
+  for (size_t row = 0; row < filter_layout_offsets_.size(); ++row) {
+    const uint32_t offset = filter_layout_offsets_[row];
+    if (offset == kMissingFilterLayoutOffset) {
+      continue;
+    }
+    const size_t inverse_row = static_cast<size_t>(offset - min_offset);
+    if (filter_layout_rows_by_offset_[inverse_row] !=
+        kMissingFilterLayoutOffset) {
+      filter_layout_rows_by_offset_.clear();
+      return 0;
+    }
+    filter_layout_rows_by_offset_[inverse_row] = static_cast<uint32_t>(row);
+  }
+  filter_layout_inverse_base_ = min_offset;
+  filter_layout_inverse_ready_ = true;
+  return 0;
+}
+
+int IndexManagerImpl::evaluate_filter(const std::string& dsl,
+                                      uint64_t max_cached_candidates,
+                                      FilterResult& result) {
+  SearchContext ctx;
+  if (int ret = parse_dsl_query(dsl, ctx); ret != 0) {
+    SPDLOG_ERROR("IndexManagerImpl::evaluate_filter [{}] parse failed", dsl);
+    return ret;
+  }
+
+  std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+  BitmapPtr bitmap = nullptr;
+  if (ctx.filter_op) {
+    bitmap = calculate_filter_bitmap(ctx, dsl);
+    if (!bitmap) {
+      SPDLOG_DEBUG(
+          "IndexManagerImpl::evaluate_filter calculate_filter_bitmap returned null");
+      return -1;
+    }
+  }
+
+  result.eligible_count = 0;
+  result.bitset_words.assign((filter_layout_offsets_.size() + 31) / 32, 0);
+  for (size_t row = 0; row < filter_layout_offsets_.size(); ++row) {
+    const uint32_t offset = filter_layout_offsets_[row];
+    const bool eligible = offset != std::numeric_limits<uint32_t>::max() &&
+                          (!bitmap || bitmap->Isset(offset));
+    if (!eligible) {
+      continue;
+    }
+    result.bitset_words[row / 32] |=
+        static_cast<uint32_t>(1U << (row % 32));
+    ++result.eligible_count;
+  }
+  if (bitmap && result.eligible_count > 0 &&
+      result.eligible_count <= max_cached_candidates) {
+    result.native_filter_token = cache_filter_bitmap_(bitmap);
+  }
+  return 0;
+}
+
+int IndexManagerImpl::evaluate_filter_for_routing(
+    const std::string& dsl, uint64_t native_threshold,
+    FilterResult& result) {
+  if (native_threshold == 0) {
+    return evaluate_filter(dsl, 0, result);
+  }
+
+  SearchContext ctx;
+  if (int ret = parse_dsl_query(dsl, ctx); ret != 0) {
+    SPDLOG_ERROR(
+        "IndexManagerImpl::evaluate_filter_for_routing [{}] parse failed",
+        dsl);
+    return ret;
+  }
+
+  std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+  BitmapPtr bitmap = nullptr;
+  if (ctx.filter_op) {
+    bitmap = calculate_filter_bitmap(ctx, dsl);
+    if (!bitmap) {
+      SPDLOG_DEBUG(
+          "IndexManagerImpl::evaluate_filter_for_routing "
+          "calculate_filter_bitmap returned null");
+      return -1;
+    }
+  }
+
+  result.eligible_count = 0;
+  result.bitset_words.clear();
+  result.native_filter_token = 0;
+
+  // A selective scalar bitmap can be projected through the inverse layout in
+  // O(bitmap cardinality), without scanning every external dense-index row.
+  if (bitmap && filter_layout_inverse_ready_ &&
+      bitmap->nbit() <= native_threshold) {
+    std::vector<uint32_t> eligible_offsets;
+    bitmap->get_set_list(eligible_offsets);
+    for (const uint32_t offset : eligible_offsets) {
+      if (offset < filter_layout_inverse_base_) {
+        continue;
+      }
+      const uint64_t inverse_row =
+          static_cast<uint64_t>(offset) - filter_layout_inverse_base_;
+      if (inverse_row >= filter_layout_rows_by_offset_.size() ||
+          filter_layout_rows_by_offset_[inverse_row] ==
+              kMissingFilterLayoutOffset) {
+        continue;
+      }
+      ++result.eligible_count;
+    }
+    if (result.eligible_count > 0) {
+      result.native_filter_token = cache_filter_bitmap_(bitmap);
+    }
+    return 0;
+  }
+
+  // Keep at most threshold + 1 row ids while counting. If the filter is wide,
+  // allocate the full projection only after the route decision is known.
+  std::vector<uint32_t> narrow_rows;
+  const bool cannot_exceed_threshold =
+      native_threshold >= filter_layout_offsets_.size();
+  if (!cannot_exceed_threshold) {
+    narrow_rows.reserve(static_cast<size_t>(native_threshold + 1));
+  }
+  for (size_t row = 0; row < filter_layout_offsets_.size(); ++row) {
+    const uint32_t offset = filter_layout_offsets_[row];
+    const bool eligible = offset != kMissingFilterLayoutOffset &&
+                          (!bitmap || bitmap->Isset(offset));
+    if (!eligible) {
+      continue;
+    }
+    ++result.eligible_count;
+    if (cannot_exceed_threshold) {
+      continue;
+    }
+    if (result.bitset_words.empty()) {
+      narrow_rows.push_back(static_cast<uint32_t>(row));
+      if (result.eligible_count <= native_threshold) {
+        continue;
+      }
+      result.bitset_words.assign((filter_layout_offsets_.size() + 31) / 32,
+                                 0);
+      for (const uint32_t narrow_row : narrow_rows) {
+        result.bitset_words[narrow_row / 32] |=
+            static_cast<uint32_t>(1U << (narrow_row % 32));
+      }
+      narrow_rows.clear();
+      continue;
+    }
+    result.bitset_words[row / 32] |=
+        static_cast<uint32_t>(1U << (row % 32));
+  }
+
+  if (bitmap && result.eligible_count > 0 &&
+      result.eligible_count <= native_threshold) {
+    result.native_filter_token = cache_filter_bitmap_(bitmap);
+  }
+  return 0;
+}
+
+uint64_t IndexManagerImpl::cache_filter_bitmap_(const BitmapPtr& bitmap) {
+  std::lock_guard<std::mutex> lock(filter_token_mutex_);
+  uint64_t token = next_filter_token_++;
+  if (token == 0) {
+    token = next_filter_token_++;
+  }
+  filter_token_cache_[token] = bitmap;
+  filter_token_order_.push_back(token);
+  while (filter_token_order_.size() > kFilterTokenCacheCapacity) {
+    filter_token_cache_.erase(filter_token_order_.front());
+    filter_token_order_.pop_front();
+  }
+  return token;
+}
+
+void IndexManagerImpl::clear_filter_token_cache_() {
+  std::lock_guard<std::mutex> lock(filter_token_mutex_);
+  filter_token_cache_.clear();
+  filter_token_order_.clear();
+}
+
+void IndexManagerImpl::clear_filter_layout_() {
+  filter_layout_offsets_.clear();
+  filter_layout_rows_by_offset_.clear();
+  filter_layout_inverse_base_ = 0;
+  filter_layout_inverse_ready_ = false;
+}
+
+BitmapPtr IndexManagerImpl::calculate_filter_bitmap(const SearchContext& ctx,
+                                                    const std::string& dsl) {
+  auto bitmap = ctx.filter_op->calc_bitmap(scalar_index_->get_field_sets(),
+                                           nullptr, ctx.filter_op->op_name());
+  if (!bitmap) {
+    SPDLOG_DEBUG("ScalarIndex::search [{}] calc_bitmap fail", dsl);
+  }
+  return bitmap;
+}
+
+int IndexManagerImpl::handle_sorter_query(const SearchContext& ctx,
+                                          const BitmapPtr& bitmap,
+                                          SearchResult& result,
+                                          const std::string& dsl) {
+  if (ctx.sorter_op->op_name() == "count" && !ctx.filter_op) {
+    uint64_t valid_data_num = vector_index_->get_data_num();
+
+    JsonDoc json_result;
+    json_result.SetObject();
+    JsonDoc::AllocatorType& allocator = json_result.GetAllocator();
+
+    JsonValue key;
+    JsonValue value;
+    key.SetString("__total_count__", sizeof("__total_count__") - 1, allocator);
+    value.SetInt64(static_cast<int64_t>(valid_data_num));
+    json_result.AddMember(key, value, allocator);
+
+    result.extra_json = json_stringify(json_result);
+
+    SPDLOG_DEBUG(
+        "Count without filter: returning {} from vector index, dsl: {}",
+        valid_data_num, dsl);
+    return 0;
+  }
+
+  auto sorter_res =
+      ctx.sorter_op->calc_topk_result(scalar_index_->get_field_sets(), bitmap);
+  if (sorter_res) {
+    for (size_t i = 0; i < sorter_res->offsets.size(); ++i) {
+      auto label = vector_index_->get_label_by_offset(sorter_res->offsets[i]);
+      sorter_res->labels_u64.push_back(label);
+    }
+    std::swap(result.scores, sorter_res->scores);
+    std::swap(result.labels, sorter_res->labels_u64);
+    if (sorter_res->dsl_op_extra_json) {
+      result.extra_json = json_stringify(*sorter_res->dsl_op_extra_json);
+    }
+  }
+  return 0;
+}
+
+int IndexManagerImpl::perform_vector_recall(const SearchRequest& req,
+                                            SearchContext& ctx,
+                                            const BitmapPtr& bitmap,
+                                            SearchResult& result) {
+  VectorRecallRequest recall_request{
+      .dense_vector = req.query.data(),
+      .topk = req.topk,
+      .bitmap = bitmap.get(),
+      .sparse_terms =
+          req.sparse_raw_terms.empty() ? nullptr : &req.sparse_raw_terms,
+      .sparse_values =
+          req.sparse_values.empty() ? nullptr : &req.sparse_values};
+
+  VectorRecallResult recall_result;
+  int ret = vector_index_->recall(recall_request, recall_result);
+  if (ret != 0) {
+    SPDLOG_ERROR("IndexManagerImpl::search vector recall failed, ret={}", ret);
+    return ret;
+  }
+
+  std::swap(result.labels, recall_result.labels);
+  std::swap(result.scores, recall_result.scores);
+  return 0;
+}
+
+int IndexManagerImpl::add_data(const std::vector<AddDataRequest>& data_list) {
+  auto start = std::chrono::high_resolution_clock::now();
+  std::vector<FieldsDict> parsed_fields_list(data_list.size());
+  std::vector<FieldsDict> parsed_old_fields_list(data_list.size());
+
+  for (size_t i = 0; i < data_list.size(); ++i) {
+    if (!data_list[i].fields_str.empty()) {
+      parsed_fields_list[i].parse_from_json(data_list[i].fields_str);
+    }
+    if (!data_list[i].old_fields_str.empty()) {
+      parsed_old_fields_list[i].parse_from_json(data_list[i].old_fields_str);
+    }
+  }
+
+  bool has_update = false;
+  std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+  for (size_t i = 0; i < data_list.size(); ++i) {
+    const auto& data = data_list[i];
+    FloatValSparseDatapointLowLevel sparse_datapoint(&data.sparse_raw_terms,
+                                                     &data.sparse_values);
+    vector_index_->stream_add_data(data.label, data.vector.data(),
+                                   &sparse_datapoint);
+    int offset = vector_index_->get_offset_by_label(data.label);
+    if (offset < 0) {
+      SPDLOG_WARN("IndexManagerImpl::add_data label={} not found", data.label);
+      continue;
+    } else {
+      has_update = true;
+    }
+
+    scalar_index_->add_row_data(offset, parsed_fields_list[i],
+                                parsed_old_fields_list[i]);
+  }
+  if (has_update) {
+    clear_filter_layout_();
+    clear_filter_token_cache_();
+    auto duration = std::chrono::system_clock::now().time_since_epoch();
+    manager_meta_->update_timestamp =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+  }
+
+  auto end = std::chrono::high_resolution_clock::now();
+  auto duration_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+          .count();
+  SPDLOG_DEBUG("IndexManagerImpl::add_data finish, batch size: {}, cost: {}us",
+               data_list.size(), duration_us);
+
+  return 0;
+}
+
+int IndexManagerImpl::delete_data(
+    const std::vector<DeleteDataRequest>& data_list) {
+  auto start = std::chrono::high_resolution_clock::now();
+  std::vector<FieldsDict> parsed_old_fields_list(data_list.size());
+  for (size_t i = 0; i < data_list.size(); ++i) {
+    if (!data_list[i].old_fields_str.empty()) {
+      parsed_old_fields_list[i].parse_from_json(data_list[i].old_fields_str);
+    }
+  }
+
+  bool has_update = false;
+  std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+  for (size_t i = 0; i < data_list.size(); ++i) {
+    const auto& data = data_list[i];
+    int offset = vector_index_->get_offset_by_label(data.label);
+    if (offset < 0) {
+      SPDLOG_DEBUG("IndexManagerImpl::delete_data label={} not found",
+                   data.label);
+      continue;
+    } else {
+      has_update = true;
+    }
+
+    scalar_index_->delete_row_data(offset, parsed_old_fields_list[i]);
+    vector_index_->stream_delete_data(data.label);
+  }
+  if (has_update) {
+    clear_filter_layout_();
+    clear_filter_token_cache_();
+    auto duration = std::chrono::system_clock::now().time_since_epoch();
+    manager_meta_->update_timestamp =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count();
+  }
+  auto end = std::chrono::high_resolution_clock::now();
+  auto duration_us =
+      std::chrono::duration_cast<std::chrono::microseconds>(end - start)
+          .count();
+  SPDLOG_DEBUG(
+      "IndexManagerImpl::delete_data finish, batch size: {}, cost: {}us",
+      data_list.size(), duration_us);
+  return 0;
+}
+
+int IndexManagerImpl::rebuild_scalar_index(
+    const std::string& scalar_index_json,
+    const std::function<bool(std::vector<AddDataRequest>&)>& read_batch) {
+  JsonDoc scalar_index_doc;
+  scalar_index_doc.Parse(scalar_index_json.c_str());
+  if (scalar_index_doc.HasParseError() || !scalar_index_doc.IsArray()) {
+    throw std::invalid_argument("Invalid scalar index metadata");
+  }
+
+  auto next_meta = std::make_shared<ScalarIndexMeta>();
+  if (next_meta->init_from_json(scalar_index_doc) != 0) {
+    throw std::invalid_argument("Invalid scalar index metadata");
+  }
+
+  auto next_scalar_index = std::make_shared<ScalarIndex>(next_meta);
+  std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+  std::vector<AddDataRequest> batch;
+  while (read_batch(batch)) {
+    for (const auto& data : batch) {
+      FieldsDict fields;
+      if (fields.parse_from_json(data.fields_str) != 0) {
+        throw std::runtime_error(
+            "Failed to parse scalar fields for label=" +
+            std::to_string(data.label));
+      }
+      const int offset = vector_index_->get_offset_by_label(data.label);
+      if (offset < 0) {
+        SPDLOG_WARN("IndexManagerImpl::rebuild_scalar_index label={} not found",
+                    data.label);
+        continue;
+      }
+      if (next_scalar_index->add_row_data(offset, fields, FieldsDict{}) != 0) {
+        throw std::runtime_error(
+            "Failed to rebuild scalar fields for label=" +
+            std::to_string(data.label));
+      }
+    }
+    batch.clear();
+  }
+
+  scalar_index_ = std::move(next_scalar_index);
+  manager_meta_->scalar_index_meta = std::move(next_meta);
+  register_label_offset_converter_();
+  clear_filter_layout_();
+  clear_filter_token_cache_();
+  const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+  manager_meta_->update_timestamp = std::max(
+      manager_meta_->update_timestamp + 1, static_cast<uint64_t>(now));
+  return 0;
+}
+
+int64_t IndexManagerImpl::dump(const std::string& dir) {
+  std::filesystem::path dir_path(dir);
+  std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+  auto start = std::chrono::high_resolution_clock::now();
+  auto scalar_index_dir = dir_path / kScalarIndexDir;
+  std::error_code ec;
+  std::filesystem::create_directories(scalar_index_dir, ec);
+  if (ec) {
+    SPDLOG_ERROR(
+        "IndexManagerImpl::dump create_directories failed, path={}, ec={}",
+        scalar_index_dir.string(), ec.message());
+    throw std::runtime_error(
+        "IndexManagerImpl::dump create_directories failed, path=" +
+        scalar_index_dir.string());
+  }
+  scalar_index_->dump(scalar_index_dir);
+
+  auto vector_index_dir = dir_path / kVectorIndexDir;
+  std::filesystem::create_directories(vector_index_dir, ec);
+  if (ec) {
+    SPDLOG_ERROR(
+        "IndexManagerImpl::dump create_directories failed, path={}, ec={}",
+        vector_index_dir.string(), ec.message());
+    throw std::runtime_error(
+        "IndexManagerImpl::dump create_directories failed, path=" +
+        vector_index_dir.string());
+  }
+  vector_index_->dump(vector_index_dir);
+  auto manager_meta_path = dir_path / kMetaFile;
+  manager_meta_->save_to_file(manager_meta_path);
+
+  auto end = std::chrono::high_resolution_clock::now();
+  auto duration_total =
+      std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  SPDLOG_DEBUG("IndexManagerImpl::dump finish, path: {}, cost: {}us", dir,
+               duration_total.count());
+
+  return manager_meta_->update_timestamp;
+}
+
+int IndexManagerImpl::get_state(StateResult& state_result) {
+  state_result.update_timestamp = manager_meta_->update_timestamp;
+  return 0;
+}
+
+}  // namespace vectordb

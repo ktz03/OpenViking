@@ -1,0 +1,250 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+# Shared memory-plugin JS source — not a Python build artifact.
+!examples/memory-plugin-shared/lib/
+!examples/opencode-plugin/lib/
+!examples/opencode-plugin/lib/**
+!examples/pi-coding-agent-extension/lib/
+!examples/pi-coding-agent-extension/lib/**
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.ttadk
+MANIFEST
+# The shared memory-plugin installer's module list — not a Python sdist manifest.
+!examples/memory-plugin-shared/lib/MANIFEST
+openviking.egg-info/
+data/
+
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+.ruff_cache/
+cover/
+test_data/
+test_data_sync/
+reports/
+test-results.xml
+test-reports/
+report.html
+temp/
+
+# codex
+diagrams/
+doc-fetch-resources/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+.obsidian/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+
+# Thumbnails
+._*
+
+# Files that might appear in the root of a volume
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Directories potentially created on remote AFP share
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Config files - contains sensitive information
+config/settings.py
+
+# Docker
+docker-compose.override.yml
+
+# OpenViking specific
+/data/*
+/demo_data/*
+/benchmark_data/*
+.claude
+# Only the parser's scratch dirs, not all of `.openviking/` — a workspace keeps
+# its committed `.openviking/config.json` there (`config.local.json` is private).
+.openviking/media/
+.openviking/downloads/
+.openviking/config.local.json
+*.code-workspace
+.openviking.pid
+exports/
+.local-data/
+
+# API Test temporary files
+tests/api_test/api-test-report.html
+tests/api_test/openviking-server.log
+tests/api_test/openviking-server.pid
+tests/oc2ov_test/config/settings.py
+
+# Benchmark outputs
+examples/benchmark/outputs/
+examples/benchmark/datasets/full/
+examples/benchmark/*.log
+RAGbenchmark/datasets/*/
+!RAGbenchmark/datasets/Benchmark_Lite/
+RAGbenchmark/Output/
+RAGbenchmark/*.log
+
+# AI Coding
+CLAUDE.md
+*.so
+AGENTS.md
+AGENTS.md.local
+
+# Git worktrees
+.worktrees/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+.tmp/
+ov.conf
+ovcli.conf
+result/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# celery beat schedule file
+celerybeat-schedule
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# mkdocs documentation
+/site
+docs/superpowers/
+docs/node_modules/
+docs/.vitepress/cache/
+docs/.vitepress/dist/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+openviking/bin/
+openviking/web_studio/dist/
+third_party/agfs/bin/
+test_scripts/
+examples/data/
+openviking/_version.py
+specs/
+.trae/
+.codex/
+.ttadk/
+tests/integration/.tmp_*/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+
+# Beads issue tracker local state
+.beads/
+
+# LoopX local control-plane state
+.loopx/
+
+# all node_modules folders
+node_modules/
+
+# Local scratch / working notes
+.scratch/
+
+# Shared runtime copies built at pack time by examples/memory-plugin-shared/sync.mjs.
+# The plugins that publish as an npm package or as a tarball generate these on
+# the way out; only the plugins a host installs by pointing at a directory in
+# this repository keep their copies in git.
+examples/opencode-plugin/lib/shared/
+examples/dsh-memory-plugin/shared/
+examples/pi-coding-agent-extension/shared/

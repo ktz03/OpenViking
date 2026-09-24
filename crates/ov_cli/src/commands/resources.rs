@@ -1,0 +1,69 @@
+use crate::client::HttpClient;
+use crate::error::Result;
+use crate::output::{OutputFormat, output_success};
+use serde_json::{Map, Value};
+
+pub async fn add_resource(
+    client: &HttpClient,
+    path: &str,
+    add_type: Option<String>,
+    to: Option<String>,
+    parent: Option<String>,
+    parent_auto_create: Option<String>,
+    reason: String,
+    instruction: String,
+    wait: bool,
+    timeout: Option<f64>,
+    strict: bool,
+    ignore_dirs: Option<String>,
+    include: Option<String>,
+    exclude: Option<String>,
+    directly_upload_media: bool,
+    watch_interval: f64,
+    processing_mode: String,
+    resource_args: Option<Map<String, Value>>,
+    tags: Vec<String>,
+    tag_mode: String,
+    acl: Option<serde_json::Value>,
+    format: OutputFormat,
+    compact: bool,
+    show_progress: bool,
+    verbose: bool,
+) -> Result<()> {
+    let result = client
+        .add_resource(
+            path,
+            add_type,
+            to,
+            parent,
+            parent_auto_create,
+            &reason,
+            &instruction,
+            wait,
+            timeout,
+            strict,
+            ignore_dirs,
+            include,
+            exclude,
+            directly_upload_media,
+            watch_interval,
+            processing_mode,
+            resource_args,
+            tags,
+            tag_mode,
+            acl,
+            show_progress,
+            verbose,
+        )
+        .await?;
+
+    if !wait && matches!(format, OutputFormat::Table) {
+        eprintln!("Note: Resource is being processed in the background.");
+        eprintln!(
+            "Use 'ov task status <task_id>' to check progress, or 'ov task list' to see all tasks."
+        );
+    }
+
+    output_success(&result, format, compact);
+    Ok(())
+}
