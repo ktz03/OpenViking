@@ -135,8 +135,13 @@ OpenViking's server config is separate from Hermes:
   `account`, and `user`. It is read from `OPENVIKING_CLI_CONFIG_FILE` or
   `~/.openviking/ovcli.conf`.
 
-Hermes-side provider config is read from environment variables in the active
-profile's `.env`:
+Hermes-side provider config is read from the initialized profile's `.env`.
+After initialization, the provider keeps that profile for connection, identity,
+and recall settings, including when another profile is active in the same
+process. For the launch profile, process-level `OPENVIKING_*` values fill missing
+`.env` values. Under multi-profile hosting, Hermes uses the process values frozen
+at activation; a messaging gateway without that snapshot does not read them.
+Routed profiles never inherit the launch profile's process values.
 
 | Env Var | Default | Description |
 |---------|---------|-------------|

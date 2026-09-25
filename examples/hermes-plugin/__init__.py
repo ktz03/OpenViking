@@ -41,7 +41,7 @@ from agent.memory_provider import MemoryProvider, spawn_context_thread
 from agent.secret_scope import get_secret
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from hermes_cli import __version__ as _HERMES_VERSION
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_process_hermes_home
 from tools.registry import tool_error
 from utils import atomic_json_write, env_var_enabled
 
@@ -52,6 +52,11 @@ except ImportError:  # pragma: no cover - Windows
 
 logger = logging.getLogger(__name__)
 
+try:
+    from hermes_constants import get_routing_process_hermes_home as _get_launch_hermes_home
+except ImportError:  # Hermes releases before process-home pinning
+    _get_launch_hermes_home = get_process_hermes_home
+
 _DEFAULT_ENDPOINT = "http://127.0.0.1:1933"
 _OPENVIKING_SERVICE_ENDPOINT = "https://api.vikingdb.cn-beijing.volces.com/openviking"
 _DEFAULT_AGENT = ""
@@ -60,6 +65,7 @@ _OVCLI_CONFIG_ENV = "OPENVIKING_CLI_CONFIG_FILE"
 _OVCLI_DEFAULT_RELATIVE_PATH = ".openviking/ovcli.conf"
 _OVCLI_SAVED_PREFIX = "ovcli.conf."
 _CONNECTION_KEYS = ("endpoint", "api_key", "account", "user", "agent")
+_IDENTITY_UNSET = object()
 _OPENVIKING_ENV_KEYS = tuple(f"OPENVIKING_{key.upper()}" for key in _CONNECTION_KEYS)
 _TIMEOUT = 30.0
 _SESSION_DRAIN_TIMEOUT = 10.0
@@ -266,16 +272,18 @@ class _VikingClient:
     """Thin HTTP client for the OpenViking REST API (httpx, no SDK dependency)."""
 
     def __init__(self, endpoint: str, api_key: str = "",
-                 account: Optional[str] = None, user: Optional[str] = None, agent: Optional[str] = None):
+                 account: Optional[str] | object = _IDENTITY_UNSET,
+                 user: Optional[str] | object = _IDENTITY_UNSET,
+                 agent: Optional[str] | object = _IDENTITY_UNSET):
         self._endpoint = endpoint.rstrip("/")
         self._api_key = api_key
         # Account/user are local/trusted-mode tenant identity. API-key requests
         # omit these headers unless OpenViking explicitly asks for them (retry).
         # Tenant identity is a profile .env value: scope-read so a multiplexed
         # secondary never writes into the default profile's tenant.
-        self._account = account or get_secret("OPENVIKING_ACCOUNT", "") or "default"
-        self._user = user or get_secret("OPENVIKING_USER", "") or "default"
-        self._agent = agent if agent is not None else (get_secret("OPENVIKING_AGENT", "") or _DEFAULT_AGENT)
+        self._account = (get_secret("OPENVIKING_ACCOUNT", "") if account is _IDENTITY_UNSET or account is None else account) or "default"
+        self._user = (get_secret("OPENVIKING_USER", "") if user is _IDENTITY_UNSET or user is None else user) or "default"
+        self._agent = (get_secret("OPENVIKING_AGENT", "") or _DEFAULT_AGENT) if agent is _IDENTITY_UNSET or agent is None else agent
         # Every client owns its resolved identity, including clients retained across reloads.
         self._conn_snapshot = (self._endpoint, self._api_key, self._account, self._user, self._agent)
         self._httpx = _get_httpx()
@@ -597,8 +605,8 @@ def _default_ovcli_config_path() -> Path:
     return Path.home() / _OVCLI_DEFAULT_RELATIVE_PATH
 
 
-def _resolve_ovcli_config_path(config_path: str = "") -> Path:
-    chosen = os.environ.get(_OVCLI_CONFIG_ENV, "").strip() or config_path
+def _resolve_ovcli_config_path(config_path: str = "", *, env: Optional[dict] = None) -> Path:
+    chosen = (os.environ if env is None else env).get(_OVCLI_CONFIG_ENV, "").strip() or config_path
     return Path(chosen).expanduser() if chosen else _default_ovcli_config_path()
 
 
@@ -786,11 +794,24 @@ def _is_local_openviking_url(value: str) -> bool:
     return parsed.scheme.lower() == "http" and (parsed.hostname or "").lower() in _LOCAL_OPENVIKING_HOSTS
 
 
-def _load_hermes_openviking_config() -> dict:
+def _load_hermes_openviking_config(hermes_home: Optional[str] = None, *, env: Optional[dict] = None) -> dict:
     try:
         from hermes_cli.config import load_config_readonly
+        if hermes_home:
+            from agent.secret_scope import reset_secret_scope, set_secret_scope
+            from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-        config = load_config_readonly()
+            if env is None:
+                env = _profile_openviking_env(hermes_home)
+            home_token = set_hermes_home_override(hermes_home)
+            scope_token = set_secret_scope(env, profile_home=hermes_home)
+            try:
+                config = load_config_readonly()
+            finally:
+                reset_secret_scope(scope_token)
+                reset_hermes_home_override(home_token)
+        else:
+            config = load_config_readonly()
         memory_config = config.get("memory", {}) if isinstance(config, dict) else {}
         provider_config = memory_config.get("openviking", {}) if isinstance(memory_config, dict) else {}
         return dict(provider_config) if isinstance(provider_config, dict) else {}
@@ -798,37 +819,77 @@ def _load_hermes_openviking_config() -> dict:
         return {}
 
 
-def _ovcli_values_for(provider_config: dict) -> dict:
+def _profile_openviking_env(hermes_home: Optional[str]) -> Optional[dict]:
+    """Read this provider's home, including Hermes-managed external secret sources."""
+    if not hermes_home:
+        return None
+    try:
+        from agent.secret_scope import (
+            build_profile_secret_scope,
+            is_multiplex_active,
+        )
+        from hermes_cli.env_loader import hydrate_profile_secret_sources
+
+        hydrate_profile_secret_sources(hermes_home)
+        env = build_profile_secret_scope(Path(hermes_home))
+        # A routed provider must never inherit launch process credentials.
+        if _get_launch_hermes_home().resolve() == Path(hermes_home).resolve():
+            if is_multiplex_active():
+                try:
+                    from tui_gateway import launch_profile_policy
+                except ImportError:  # older Hermes without launch-profile hosting
+                    pass
+                else:
+                    # launch_secret_scope captures live os.environ when no snapshot
+                    # exists. The messaging gateway has no snapshot, so only use
+                    # the frozen one created by multi-profile host activation.
+                    if getattr(launch_profile_policy, "_snapshot", None) is not None:
+                        env = launch_profile_policy.launch_secret_scope(hermes_home)
+            else:
+                for key, value in os.environ.items():
+                    if key.startswith("OPENVIKING_"):
+                        env.setdefault(key, value)
+        return env
+    except Exception as exc:
+        logger.warning("OpenViking could not load profile secrets for %s (%s).", hermes_home, type(exc).__name__)
+        return {}  # A failed profile read must not borrow another profile's credentials.
+
+
+def _ovcli_values_for(provider_config: dict, *, env: Optional[dict] = None) -> dict:
     """Connection values from the linked ovcli profile, or {} when none is linked."""
     if not provider_config.get("use_ovcli_config"):
         return {}
-    ovcli_path = _resolve_ovcli_config_path(str(provider_config.get("ovcli_config_path") or ""))
+    ovcli_path = _resolve_ovcli_config_path(str(provider_config.get("ovcli_config_path") or ""), env=env)
     return _connection_values_from_ovcli(_load_ovcli_config(ovcli_path))
 
 
-def _resolve_connection_settings(provider_config: Optional[dict] = None) -> dict:
+def _resolve_connection_settings(provider_config: Optional[dict] = None, *, env: Optional[dict] = None) -> dict:
     """Layering: env -> linked ovcli profile -> config.yaml -> built-in default.
     An env account/user (even empty) is authoritative; the secret api_key never
     comes from config.yaml. Every env read goes through the profile secret scope:
     under multiplexing ``os.environ`` is the DEFAULT profile's .env, and a raw read
     would spend its key and tenant on behalf of a secondary profile."""
     provider_config = dict(provider_config or {})
-    ovcli_values = _ovcli_values_for(provider_config)
+    ovcli_values = _ovcli_values_for(provider_config, env=env)
 
     def layered(key: str, default: str = "", *, env_authoritative: bool = False) -> str:
-        env = get_secret(f"OPENVIKING_{key.upper()}")
-        if env is not None:
-            env = env.strip()
+        value = get_secret(f"OPENVIKING_{key.upper()}") if env is None else env.get(f"OPENVIKING_{key.upper()}")
+        if value is not None:
+            value = value.strip()
             if env_authoritative:
-                return env
-        return env or ovcli_values.get(key) or _clean_config_value(provider_config.get(key)) or default
+                return value
+        return value or ovcli_values.get(key) or _clean_config_value(provider_config.get(key)) or default
 
-    api_key_env = get_secret("OPENVIKING_API_KEY")
+    api_key_env = get_secret("OPENVIKING_API_KEY") if env is None else env.get("OPENVIKING_API_KEY")
+    api_key = api_key_env.strip() if api_key_env is not None else ovcli_values.get("api_key", "")
+    account = layered("account", env_authoritative=True)
+    user = layered("user", env_authoritative=True)
+    account, user = account or "default", user or "default"
     return {
         "endpoint": _normalize_openviking_url(layered("endpoint", _DEFAULT_ENDPOINT)),
-        "api_key": api_key_env.strip() if api_key_env is not None else ovcli_values.get("api_key", ""),
-        "account": layered("account", env_authoritative=True),
-        "user": layered("user", env_authoritative=True),
+        "api_key": api_key,
+        "account": account,
+        "user": user,
         "agent": layered("agent", _DEFAULT_AGENT),
     }
 
@@ -922,8 +983,11 @@ def _validate_openviking_setup_values(values: dict, *, require_api_key: bool = F
     api_key = _clean_config_value(values.get("api_key"))
     if require_api_key and not api_key:
         return False, "Remote OpenViking configs require an API key.", None
+    account = _clean_config_value(values.get("account"))
+    user = _clean_config_value(values.get("user"))
+    account, user = account or "default", user or "default"
     try:
-        client = _VikingClient(endpoint, api_key, account=_clean_config_value(values.get("account")), user=_clean_config_value(values.get("user")),
+        client = _VikingClient(endpoint, api_key, account=account, user=user,
                                agent=_clean_config_value(values.get("agent")) or _DEFAULT_AGENT)
         identity, health = _probe_openviking_identity(client)
         if identity == "invalid":
@@ -1279,6 +1343,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         # speaker must not change an earlier queued turn's identity.
         self._turn_peer: ContextVar[Optional[str]] = ContextVar("openviking_turn_peer", default=None)
         self._session_id, self._turn_count, self._hermes_home = "", 0, ""
+        self._hermes_home_bound = False
         # (conn snapshot, user): keyed on the snapshot so every client built from it
         # shares the resolved user and a /reload invalidates it.
         # Server-asserted user space for explicit-uid URIs (#91995). Key the cache on the connection
@@ -1494,9 +1559,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
         is_cli = kwargs.get("platform") == "cli"
         warning_callback = kwargs.get("warning_callback") if is_cli else None
         status_callback = kwargs.get("status_callback") if is_cli else None
+        requested_home = str(kwargs.get("hermes_home") or "").strip()
+        self._hermes_home = requested_home or str(get_hermes_home())
+        self._hermes_home_bound = bool(requested_home)
         connection_error = ""
         try:
-            settings = _resolve_connection_settings(_load_hermes_openviking_config())
+            settings = self._resolve_bound_connection_settings()
         except _OpenVikingEndpointError as exc:
             connection_error = str(exc)
             settings = dict.fromkeys(_CONNECTION_KEYS, "")
@@ -1513,7 +1581,6 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._gateway_user_id_alt = str(kwargs.get("user_id_alt") or "").strip()
         self._user_id = _gateway_peer_id(self._gateway_platform, self._gateway_user_id_alt or self._gateway_user_id)
         self._turn_peer.set(None)
-        self._hermes_home = str(kwargs.get("hermes_home") or "").strip() or str(get_hermes_home())
         self._agent_context = str(kwargs.get("agent_context") or "primary")
         self._writes_enabled = self._agent_context not in _NON_PRIMARY_AGENT_CONTEXTS
         if not self._writes_enabled:
@@ -1564,6 +1631,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
         with self._client_refresh_lock:
             return self._ensure_client_locked()
 
+    def _profile_config_and_env(self) -> tuple[dict, Optional[dict]]:
+        home = self._hermes_home if self._hermes_home_bound else None
+        env = _profile_openviking_env(home)
+        return _load_hermes_openviking_config(home, env=env), env
+
+    def _resolve_bound_connection_settings(self) -> dict:
+        config, env = self._profile_config_and_env()
+        return _resolve_connection_settings(config, env=env)
+
     def _in_cooldown(self, failed_key) -> bool:
         failed = self._failed_refresh
         return failed is not None and failed[0] == failed_key and time.monotonic() - failed[1] < _FAILED_CONFIG_RETRY_COOLDOWN_SECONDS
@@ -1574,7 +1650,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             self._client = None
             return None
         try:
-            settings = _resolve_connection_settings(_load_hermes_openviking_config())
+            settings = self._resolve_bound_connection_settings()
         except _OpenVikingEndpointError as exc:
             failed_key = ("invalid-endpoint", str(exc))
             if not self._in_cooldown(failed_key):
@@ -1851,12 +1927,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return None
 
     @classmethod
-    def _setting(cls, key: str, provider_config: dict) -> Any:
+    def _setting(cls, key: str, provider_config: dict, *, env: Optional[dict] = None) -> Any:
         """Typed, range-clamped setting per _SETTING_SPECS (config.yaml primary, env override);
         an invalid value falls back to the default with one warning per (source, value)."""
         spec = _SETTING_SPECS[key]
         default = spec["default"]
-        env_value = get_secret(spec["env_var"])
+        env_value = get_secret(spec["env_var"]) if env is None else env.get(spec["env_var"])
         if env_value is not None and env_value.strip():
             value, source = env_value, spec["env_var"]
         else:
@@ -1877,20 +1953,22 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return max(spec["minimum"], min(spec["maximum"], parsed)) if "minimum" in spec else parsed
 
     def _recall_config(self) -> Dict[str, Any]:
-        cfg = _load_hermes_openviking_config()
+        cfg, env = self._profile_config_and_env()
         resolved = {
-            key.removeprefix("recall_"): self._setting(key, cfg) for key in _RECALL_SETTING_KEYS
+            key.removeprefix("recall_"): self._setting(key, cfg, env=env) for key in _RECALL_SETTING_KEYS
         }
         if resolved["compress"] in ("server", "auto"):
             # Retrieval plus server rewrite has a longer fuse. Keep explicit
             # user deadlines authoritative and the default off path unchanged.
             for key in ("recall_timeout_seconds", "recall_request_timeout_seconds"):
-                if key not in cfg and not os.environ.get(_SETTING_SPECS[key]["env_var"]):
+                override = get_secret(_SETTING_SPECS[key]["env_var"]) if env is None else env.get(_SETTING_SPECS[key]["env_var"])
+                if key not in cfg and not override:
                     resolved[key.removeprefix("recall_")] = 55.0
         return resolved
 
     def _profile_token_budget(self) -> int:
-        return self._setting("profile_token_budget", _load_hermes_openviking_config())
+        cfg, env = self._profile_config_and_env()
+        return self._setting("profile_token_budget", cfg, env=env)
 
     # -- session-start memory block -----------------------------------------
 
@@ -2290,7 +2368,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
             if not self._inflight_writers.get(sid):
                 self._inflight_writers.pop(sid, None)
 
-        threshold = self._setting("commit_token_threshold", _load_hermes_openviking_config())
+        cfg, env = self._profile_config_and_env()
+        threshold = self._setting("commit_token_threshold", cfg, env=env)
 
         def upload_and_check() -> None:
             # Serialize writes with commits on the workers, so a slow commit never
