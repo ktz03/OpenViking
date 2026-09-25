@@ -15,6 +15,16 @@ function toolParts(turns, toolName) {
     .filter((part) => part.type === "tool" && part.tool_name === toolName);
 }
 
+test("keeps timestamped user log lines on the capture wire", () => {
+  const log = "2024-01-01 12:00:00 ERROR something broke\n2024-01-01 12:00:01 INFO retry";
+  const turns = extractCaptureTurns([{
+    type: "response_item",
+    payload: { type: "message", role: "user", content: [{ type: "input_text", text: log }] },
+  }], CAPTURE_CONFIG);
+  assert.equal(turns.length, 1);
+  assert.deepEqual(turns[0].parts, [{ type: "text", text: log }]);
+});
+
 test("pairs current Codex function_call records by call_id", () => {
   const turns = extractCaptureTurns(
     [

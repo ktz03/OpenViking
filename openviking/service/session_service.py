@@ -47,6 +47,7 @@ from openviking_cli.utils.config.memory_config import SessionAutoCommitConfig
 logger = get_logger(__name__)
 
 if TYPE_CHECKING:
+    from openviking.config.vlm import VLMResolver
     from openviking.session.compressor_v3 import SessionCompressorV3
     from openviking.usage_reporter import UsageReporter
 
@@ -66,6 +67,7 @@ class SessionService:
         self._tool_output_externalization_config = ToolOutputExternalizationConfig()
         self._agent_evolution_default_enabled = AgentEvolutionConfig().enabled
         self._runtime_config_manager: Optional[Any] = None
+        self._vlm_resolver: Optional["VLMResolver"] = None
         self._default_user_memory_policy: Optional[Dict[str, Any]] = None
         self._default_user_auto_commit_policy: Optional[Dict[str, Any]] = None
         self._usage_reporter: Optional["UsageReporter"] = None
@@ -83,11 +85,13 @@ class SessionService:
         vikingdb: VikingDBManager,
         viking_fs: VikingFS,
         session_compressor: "SessionCompressorV3",
+        vlm_resolver: Optional["VLMResolver"] = None,
     ) -> None:
         """Set dependencies (for deferred initialization)."""
         self._vikingdb = vikingdb
         self._viking_fs = viking_fs
         self._session_compressor = session_compressor
+        self._vlm_resolver = vlm_resolver
 
     def set_tool_output_externalization_config(
         self, config: ToolOutputExternalizationConfig
@@ -138,7 +142,7 @@ class SessionService:
     def _new_session_auto_commit_policy(self) -> Optional[Dict[str, Any]]:
         if self._default_user_auto_commit_policy is not None:
             return dict(self._default_user_auto_commit_policy)
-        if self._session_auto_commit_config.default_enabled:
+        if self._session_auto_commit_config.enabled:
             return AutoCommitPolicy.from_dict(None).to_dict()
         return None
 
@@ -213,6 +217,7 @@ class SessionService:
             ),
             memory_policy_provider=lambda: self._get_user_memory_policy(ctx),
             usage_reporter=self._usage_reporter,
+            vlm_resolver=self._vlm_resolver,
         )
 
     async def _get_user_memory_policy(self, ctx: RequestContext) -> Optional[Dict[str, Any]]:
@@ -648,7 +653,7 @@ class SessionService:
             return self._message_write_threshold_exceeded(session, policy)
 
         if reason == "idle_timeout":
-            if not self._session_auto_commit_config.idle_enabled:
+            if not self._session_auto_commit_config.enabled:
                 return False
             idle_timeout = get_idle_timeout_seconds(policy)
             if idle_timeout is None or not has_idle_uncommitted_content(session.meta.to_dict()):

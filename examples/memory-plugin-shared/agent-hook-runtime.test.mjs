@@ -9,6 +9,7 @@ import { filterCaptureTurns } from "./lib/capture-utils.mjs";
 import { expectExit, runHookScript, withMockOpenViking, writeJson } from "./testing/support.mjs";
 
 import {
+  addAgentMessages,
   commitAgentSession,
   loadAgentHookConfig,
   makeAgentFetchJSON,
@@ -207,6 +208,22 @@ test("a turn past captureMaxLength is capped rather than dropped", () => {
   assert.ok(kept[0].content.startsWith("remember this detail."));
 });
 
+test("hook capture rules judge sanitized text beyond the send cap", () => {
+  const content = `Remember the audit result ${"x".repeat(100)} SECRET123`;
+  const turn = { role: "user", content };
+  const cfg = { captureMaxLength: 64, captureFilters: ["d/SECRET123/"] };
+  assert.deepEqual(filterCaptureTurns([turn], cfg), {
+    kept: [], dropped: [{ role: "user", reason: "filtered" }],
+  });
+
+  const kept = filterCaptureTurns([turn], {
+    captureMaxLength: 64, captureFilters: ["k/SECRET123/"],
+  }).kept;
+  assert.equal(kept.length, 1);
+  assert.ok(kept[0].content.length <= 64);
+  assert.ok(kept[0].content.endsWith("[truncated]"));
+});
+
 test("filterCaptureTurns tolerates a missing or malformed turn list", () => {
   for (const input of [undefined, null, "text", 3, {}]) {
     assert.deepEqual(filterCaptureTurns(input), { kept: [], dropped: [] });
@@ -234,6 +251,7 @@ test("the thin harnesses resolve the same layers as everyone else", () => {
       url: "http://127.0.0.1:1933",
       plugin: {
         recallLimit: 7,
+        captureFilters: ["d/secret/"],
         cursor: { captureMode: "keyword" },
         "trae-cn": { scoreThreshold: 0.8 },
         zcode: { autoRecall: false },
@@ -252,6 +270,9 @@ test("the thin harnesses resolve the same layers as everyone else", () => {
     // The hyphenated spelling of a harness finds the same override.
     assert.equal(loadAgentHookConfig("trae-cn", workspace).scoreThreshold, 0.8);
     assert.equal(loadAgentHookConfig("trae", workspace).scoreThreshold, 0.35);
+    for (const clientId of ["cursor", "trae", "trae-cn", "zcode", "kimicode"]) {
+      assert.deepEqual(loadAgentHookConfig(clientId, workspace).captureFilters, ["d/secret/"]);
+    }
 
     // A workspace file outranks ovcli.conf, and the environment outranks both.
     writeFileSync(
@@ -432,4 +453,24 @@ test("the envelope is written once when the callback answers early", async () =>
   );
 
   assert.deepEqual(seen.envelopes, ["detached"]);
+});
+
+test("captured messages carry the effective peer in the body, and none when peer mode is off", async () => {
+  const sent = [];
+  const fetchJSON = async (_path, init) => {
+    sent.push(JSON.parse(init.body).messages);
+    return { ok: true, status: 200, result: { added: -1 } };
+  };
+  await addAgentMessages(fetchJSON, "s1", [
+    { role: "user", content: "a" },
+    { role: "assistant", content: "b", peer_id: "explicit" },
+  ], "workspace-peer");
+  await addAgentMessages(fetchJSON, "s1", [{ role: "user", content: "c" }], "");
+  assert.deepEqual(sent, [
+    [
+      { role: "user", content: "a", peer_id: "workspace-peer" },
+      { role: "assistant", content: "b", peer_id: "explicit" },
+    ],
+    [{ role: "user", content: "c" }],
+  ]);
 });

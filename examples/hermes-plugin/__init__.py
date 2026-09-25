@@ -121,6 +121,10 @@ _SESSION_START_SUFFIXES = ("memories/profile.md", "memories/preferences", "memor
 _SESSION_START_LIST_PARAMS = {"output": "agent", "recursive": True, "abs_limit": 512, "node_limit": 512}
 # Built-in memory tool `target` -> mirror subdir (user facts -> preferences, agent notes -> patterns).
 _MEMORY_WRITE_TARGET_SUBDIR_MAP = {"user": "preferences", "memory": "patterns"}
+# Host contexts that must not write into OpenViking. Fixed-prompt output from scheduled
+# jobs, delegated subagents, and flush forks has no memory value and would spend server-side
+# extraction budget. Hermes delivers the context to initialize(); recall/read paths are unchanged.
+_NON_PRIMARY_AGENT_CONTEXTS = frozenset({"cron", "subagent", "flush"})
 # OpenViking-generated summaries; non-.md sidecars are already rejected by the .md check.
 _GENERATED_MEMORY_SUMMARY_FILENAMES = {".abstract.md", ".overview.md"}
 _LOCAL_OPENVIKING_HOSTS = {"localhost", "127.0.0.1", "::1"}
@@ -1312,6 +1316,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._runtime_start_thread: Optional[threading.Thread] = None
         self._runtime_start_pending = False
         self._shutting_down = False  # finalizers stop issuing network writes
+        # Non-primary contexts (cron/subagent/flush) skip OpenViking writes; resolved in
+        # initialize() from the host's agent_context.
+        self._agent_context = "primary"
+        self._writes_enabled = True
 
     @property
     def name(self) -> str:
@@ -1506,6 +1514,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._user_id = _gateway_peer_id(self._gateway_platform, self._gateway_user_id_alt or self._gateway_user_id)
         self._turn_peer.set(None)
         self._hermes_home = str(kwargs.get("hermes_home") or "").strip() or str(get_hermes_home())
+        self._agent_context = str(kwargs.get("agent_context") or "primary")
+        self._writes_enabled = self._agent_context not in _NON_PRIMARY_AGENT_CONTEXTS
+        if not self._writes_enabled:
+            logger.debug(
+                "OpenViking writes disabled for %s context (session %s)",
+                self._agent_context,
+                session_id,
+            )
         self._acquire_run_lock()
         self._profile_prefetched_sessions.clear()
 
@@ -2236,6 +2252,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
                   messages: Optional[List[Dict[str, Any]]] = None,
                   turn_author: Optional[Dict[str, Any]] = None) -> None:
         """Record the conversation turn in OpenViking's session (non-blocking)."""
+        if not self._writes_enabled:
+            return
         if not self._ensure_client():
             return
         user_content = _derive_openviking_user_text(user_content)
@@ -2624,6 +2642,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Commit the session (synchronously — it must land before process exit) to
         trigger extraction of profile/preferences/entities/events/cases/patterns."""
+        if not self._writes_enabled:
+            return
         if not self._ensure_client():
             return
         with self._session_state_lock:
@@ -2640,25 +2660,26 @@ class OpenVikingMemoryProvider(MemoryProvider):
             self._commit_session(sid, turn_count, context="on session end", scope=scope)
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, **kwargs) -> None:
-        """Commit the old session and rotate cached state to the new session_id.
+        """Rotate cached state to the new session_id; commit only when writes are enabled.
 
         Fires on /resume, /branch, /reset, /new, and context compression. Without it
         ``_session_id`` stays stuck at the initialize() value, later sync_turn writes
         land in the closed session and the new one never gets extracted. The old
         session's drain+commit is offloaded so command threads never block.
+        Read-only contexts still rotate so deep search uses the current session.
 
         The new session never accumulates messages, and memory extraction never fires for it. See
         hermes-agent#28296.
         """
         new_id = str(new_session_id or "").strip()
-        if not new_id or not self._ensure_client():
+        if not new_id or (self._writes_enabled and not self._ensure_client()):
             return
         rewound = bool(kwargs.get("rewound"))
         compression = kwargs.get("reason") == "compression"
 
         # Rotate under the lock so a concurrent sync_turn lands fully under old or new.
         with self._session_state_lock:
-            scope = self._capture_commit_scope()
+            scope = self._capture_commit_scope() if self._writes_enabled else None
             # Rotate cached session state synchronously (cheap, in-memory) and snapshot the old session
             # under the lock so a concurrent sync_turn either lands fully before the rotation (counted under
             # old) or fully after (counted under new) — never split. The OLD session's commit (drain +
@@ -2680,7 +2701,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             # Re-inject the profile after compression; the prefetch key may be either id.
             self._profile_prefetched_sessions.discard(old_session_id)
             self._profile_prefetched_sessions.discard(new_id)
-            if not rotate and old_session_id:
+            if not rotate and old_session_id and self._writes_enabled:
                 # In-place compression keeps the same (still live) sid, which compress_context()
                 # just committed and latched. Re-arm so later commits aren't rejected. Rotation
                 # mode is untouched: the old id stays latched to dedupe its async finalizer.
@@ -2689,7 +2710,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if not rotate:
             logger.debug("OpenViking on_session_switch skipped rotation: session=%s rewound=%s", old_session_id, rewound)
             return
-        if old_session_id:
+        if old_session_id and self._writes_enabled:
             self._finalize_session_async(old_session_id, old_turn_count, context="on switch", scope=scope)
         logger.debug("OpenViking on_session_switch: old=%s new=%s parent=%s reset=%s", old_session_id, new_id, parent_session_id, reset)
 
@@ -2732,6 +2753,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Mirror successful built-in memory mutations to OpenViking."""
+        if not self._writes_enabled:
+            return
         if action not in {"add", "replace", "remove"} or not self._ensure_client():
             return
         if action in {"add", "replace"} and not content:

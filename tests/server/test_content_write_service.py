@@ -188,7 +188,7 @@ async def test_shared_resource_creation_inherits_acl_and_preserves_plain_append(
     queue_status = await service.resources.wait_processed()
     assert queue_status["Embedding"]["error_count"] == 0
     import_root = imported["root_uri"]
-    children = await service.fs.ls(import_root, ctx=writer, simple=True)
+    children = (await service.fs.ls(import_root, ctx=writer, simple=True)).entries
     for target in [import_root, *children]:
         acl = await service.fs.get_acl(target, ctx=admin)
         assert acl["direct_entries"] == []
@@ -207,7 +207,7 @@ async def test_shared_resource_creation_inherits_acl_and_preserves_plain_append(
     assert removed_acl["acl_mode"] == "inherit"
     assert removed_acl["direct_entries"] == []
     assert removed_acl["effective_entries"] == inherited_entries
-    assert await service.fs.ls(import_root, ctx=reader, simple=True) == children
+    assert (await service.fs.ls(import_root, ctx=reader, simple=True)).entries == children
 
     await service.fs.write(uri, content="line2\n", ctx=writer, mode="append", wait=True)
     assert (await service.fs.get_acl(uri, ctx=admin))["direct_entries"] == []
@@ -268,7 +268,9 @@ async def test_shared_resource_creation_inherits_acl_and_preserves_plain_append(
     assert (await service.fs.get_acl(explicit_import, ctx=admin))[
         "direct_entries"
     ] == inherited_entries
-    imported_children = await service.fs.ls(explicit_import, ctx=admin, simple=True)
+    imported_children = (
+        await service.fs.ls(explicit_import, ctx=admin, simple=True)
+    ).entries
     for child in imported_children:
         report = await service.fs.get_acl(child, ctx=admin)
         assert report["direct_entries"] == []
@@ -1229,8 +1231,8 @@ async def test_create_mode_memory_scope(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_create_mode_resource_scope(monkeypatch):
-    file_uri = "viking://resources/demo/test.md"
-    root_uri = "viking://resources/demo"
+    file_uri = "viking://resources/team_notes/final_draft.md"
+    root_uri = "viking://resources/team_notes"
     ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
     viking_fs = _FakeVikingFSForCreate(file_uri=file_uri, root_uri=root_uri, file_exists=False)
     coordinator = ContentWriteCoordinator(viking_fs=viking_fs)
@@ -1252,10 +1254,15 @@ async def test_create_mode_resource_scope(monkeypatch):
     monkeypatch.setattr(coordinator, "_wait_for_queues", _fake_wait_for_queues)
 
     result = await coordinator.write(
-        uri=file_uri, content="content", mode="create", ctx=ctx, wait=True
+        uri="viking://resources/team notes/final draft.md",
+        content="content",
+        mode="create",
+        ctx=ctx,
+        wait=True,
     )
     assert result["context_type"] == "resource"
-    assert viking_fs.content[file_uri] == "content"
+    assert result["uri"] == file_uri
+    assert viking_fs.content == {file_uri: "content"}
 
 
 class _AnyDirVikingFS:
