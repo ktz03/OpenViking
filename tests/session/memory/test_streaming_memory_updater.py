@@ -31,6 +31,7 @@ from openviking.session.memory.streaming_memory_updater import (
     StreamingMemoryUpdater,
     StreamingMemoryUpdaterConfig,
     StreamingMemoryUpdateResult,
+    acquire_memory_operation_lease,
     classify_memory_merge_mode,
     enforce_merge_group_peer_id,
     get_streaming_memory_updater,
@@ -124,6 +125,11 @@ class RecordingPathlockClient:
         )
         lease = {"lease_ref": lease_ref}
         self.events.append(("acquire", tuple(paths), timeout_secs))
+        return lease
+
+    async def pathlock_acquire_exact_tree_batch(self, exact_paths, tree_paths, timeout_secs=0.0):
+        lease = {"lease_ref": "memory-mixed-lease"}
+        self.events.append(("acquire_mixed", tuple(exact_paths), tuple(tree_paths), timeout_secs))
         return lease
 
     async def pathlock_release(self, lease):
@@ -373,6 +379,125 @@ async def test_replacement_reacquires_persisted_relation_locks_before_writes(mon
     assert writes
     assert all(event[2] == {"lease_ref": "memory-batch-lease-2"} for event in writes)
     assert fs.events.index(acquires[1]) < min(fs.events.index(event) for event in writes)
+
+
+async def test_streaming_apply_migrates_uri_under_one_stable_lease(monkeypatch):
+    source_uri = "viking://user/u/memories/notes/old.md"
+    target_uri = "viking://user/u/memories/notes/new.md"
+    old_file = MemoryFile(
+        uri=source_uri,
+        content="old content",
+        memory_type="notes",
+        extra_fields={"note_name": "old"},
+    )
+    fs = PathlockedInMemoryVikingFS({source_uri: MemoryFileUtils.write(old_file)})
+    fs.search = AsyncMock(return_value=[])
+    for module in ("streaming_memory_updater", "memory_updater"):
+        monkeypatch.setattr(f"openviking.session.memory.{module}.get_viking_fs", lambda: fs)
+
+    registry = _registry()
+    registry.get("notes").fields[0].merge_op = MergeOp.REPLACE
+    operations = ResolvedOperations(
+        upsert_operations=[
+            ResolvedOperation(
+                old_memory_file_content=old_file,
+                memory_type="notes",
+                uris=[target_uri],
+                memory_fields={"note_name": "new"},
+            )
+        ],
+        delete_file_contents=[],
+        errors=[],
+    )
+    messages = [Message(id="m1", role="user", parts=[TextPart("rename note")])]
+
+    result = await StreamingMemoryUpdater(registry=registry)._apply_operations(
+        operations=operations,
+        request=MemoryUpdateRequest(
+            operations=operations,
+            messages=messages,
+            ctx=_ctx(),
+            memory_registry=registry,
+        ),
+        messages=messages,
+    )
+
+    assert result.written_uris == [target_uri]
+    assert result.deleted_uris == [source_uri]
+    assert source_uri not in fs.files
+    assert MemoryFileUtils.read(fs.files[target_uri]).extra_fields["note_name"] == "new"
+    acquire = next(event for event in fs.events if event[0] == "acquire")
+    assert "/user/u/memories/notes/old.md" in acquire[1]
+    assert "/user/u/memories/notes/new.md" in acquire[1]
+    lease = {"lease_ref": "memory-batch-lease"}
+    assert all(event[2] == lease for event in fs.events if event[0] == "write")
+    assert fs.events[-1] == ("release", lease)
+
+
+async def test_cross_directory_migration_tree_locks_old_parent():
+    source_uri = "viking://user/u/memories/entities/人物/小美.md"
+    target_uri = "viking://user/u/memories/entities/person/xiaomei.md"
+    old_file = MemoryFile(
+        uri=source_uri,
+        content="小美",
+        memory_type="entities",
+        extra_fields={"category": "人物", "name": "小美"},
+    )
+    fs = PathlockedInMemoryVikingFS({source_uri: MemoryFileUtils.write(old_file)})
+    operations = ResolvedOperations(
+        upsert_operations=[
+            ResolvedOperation(
+                old_memory_file_content=old_file,
+                memory_type="entities",
+                uris=[target_uri],
+                memory_fields={"category": "person", "name": "xiaomei"},
+            )
+        ],
+        delete_file_contents=[],
+        errors=[],
+    )
+
+    lease = await acquire_memory_operation_lease(operations, fs, _ctx())
+
+    source_directory_path = "/user/u/memories/entities/人物"
+    target_file_path = "/user/u/memories/entities/person/xiaomei.md"
+    mixed = next(event for event in fs.events if event[0] == "acquire_mixed")
+    assert mixed[2] == (source_directory_path,)
+    assert target_file_path in mixed[1]
+    assert not any(path.startswith(f"{source_directory_path}/") for path in mixed[1])
+    assert lease == {"lease_ref": "memory-mixed-lease"}
+
+
+async def test_same_directory_migration_keeps_exact_locks():
+    source_uri = "viking://user/u/memories/entities/person/小美.md"
+    target_uri = "viking://user/u/memories/entities/person/xiaomei.md"
+    old_file = MemoryFile(
+        uri=source_uri,
+        content="小美",
+        memory_type="entities",
+        extra_fields={"category": "person", "name": "小美"},
+    )
+    fs = PathlockedInMemoryVikingFS({source_uri: MemoryFileUtils.write(old_file)})
+    operations = ResolvedOperations(
+        upsert_operations=[
+            ResolvedOperation(
+                old_memory_file_content=old_file,
+                memory_type="entities",
+                uris=[target_uri],
+                memory_fields={"category": "person", "name": "xiaomei"},
+            )
+        ],
+        delete_file_contents=[],
+        errors=[],
+    )
+
+    lease = await acquire_memory_operation_lease(operations, fs, _ctx())
+
+    assert not any(event[0] == "acquire_mixed" for event in fs.events)
+    exact = next(event for event in fs.events if event[0] == "acquire")
+    assert "/user/u/memories/entities/person/小美.md" in exact[1]
+    assert "/user/u/memories/entities/person/xiaomei.md" in exact[1]
+    assert lease == {"lease_ref": "memory-batch-lease"}
 
 
 async def test_operation_to_patch_skips_failed_field_preview_update():
@@ -882,6 +1007,40 @@ def test_scope_memory_update_result_to_submitter_filters_shared_batch_by_source(
     )
     assert scoped.operations.upsert_operations == [op_a]
     assert scoped.metadata["unscoped_written_uris"] == [op_a.uris[0], op_b.uris[0]]
+
+
+def test_split_request_by_merge_group_keeps_rename_source_for_add_and_delete():
+    old_uri = "viking://user/u/memories/notes/old.md"
+    new_uri = "viking://user/u/memories/notes/new.md"
+    old_file = MemoryFile(
+        uri=old_uri,
+        content="old body",
+        memory_type="notes",
+        extra_fields={"note_name": "old"},
+    )
+    rename_op = ResolvedOperation(
+        old_memory_file_content=old_file,
+        memory_type="notes",
+        uris=[new_uri],
+        memory_fields={"note_name": "new", "content": "old body"},
+    )
+    request = MemoryUpdateRequest(
+        operations=ResolvedOperations(
+            upsert_operations=[rename_op],
+            delete_file_contents=[],
+            errors=[],
+        ),
+        messages=[],
+        ctx=_ctx(),
+    )
+
+    grouped = split_request_by_merge_group(request)
+
+    [(_, group_request)] = grouped
+    [cloned] = group_request.operations.upsert_operations
+    assert cloned.uris == [new_uri]
+    assert cloned.old_memory_file_content is not None
+    assert cloned.old_memory_file_content.uri == old_uri
 
 
 def test_split_request_by_merge_group_groups_by_peer_and_memory_type():

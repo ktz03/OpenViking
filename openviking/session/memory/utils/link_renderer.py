@@ -314,6 +314,42 @@ class LinkRenderer:
         return LinkRenderer._replace_markdown_links(content, lambda link: link.text)
 
     @staticmethod
+    def strip_managed_links(content: str, source_uri: str, links: List[Dict]) -> str:
+        """Strip only Markdown links represented by the supplied StoredLink metadata.
+
+        External links and unrelated hand-written relative links are preserved. This is used
+        before remapping a managed relation so a stale rendered destination can be regenerated
+        from the updated metadata.
+        """
+        managed: List[tuple[str, set[str]]] = []
+        for stored_link in links or []:
+            if stored_link.get("from_uri") != source_uri:
+                continue
+            match_text = str(stored_link.get("match_text") or "")
+            target_uri = str(stored_link.get("to_uri") or "")
+            if not match_text or not target_uri:
+                continue
+            expected_targets = {LinkRenderer.normalize_markdown_target(target_uri)}
+            relative_target = LinkRenderer.relative_path(source_uri, target_uri)
+            if relative_target is not None:
+                expected_targets.add(LinkRenderer.normalize_markdown_target(relative_target))
+            managed.append((match_text, expected_targets))
+
+        if not managed:
+            return content
+
+        def _replace_link(link: MarkdownLink) -> str:
+            normalized_target = LinkRenderer.normalize_markdown_target(link.target)
+            for match_text, expected_targets in managed:
+                if normalized_target not in expected_targets:
+                    continue
+                if LinkRenderer._find_match_span(link.text, match_text) is not None:
+                    return link.text
+            return content[link.start : link.end]
+
+        return LinkRenderer._replace_markdown_links(content, _replace_link)
+
+    @staticmethod
     def relative_path(source_uri: str, target_uri: str) -> Optional[str]:
         """Compute a relative path from source_uri to target_uri in the viking:// namespace.
 

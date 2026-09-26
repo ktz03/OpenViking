@@ -23,6 +23,7 @@ from openviking.session.memory.merge_op import (
     FieldType,
     ImmutableOp,
     MergeOp,
+    MergeOpFactory,
     SearchReplaceBlock,
     StrPatch,
 )
@@ -92,7 +93,7 @@ _CONTRACT_PREAMBLE = (
     "Prose frequently contains apostrophes (e.g. Evan's), quotes, colons, or dates that break "
     'single- or double-quoted literals. Inside triple quotes, escape any literal """ and '
     "backslash; never put a real newline inside a single- or double-quoted string.",
-    "Only keyword arguments are accepted by create, set, and obj.update(); a field's update() takes one positional string. Unknown business fields are ignored.",
+    "Only keyword arguments are accepted by create, set, and obj.update(); a field's update() takes one positional string.",
     "You may end the program with sdk.commit(); when present it must be the final call. If there are no changes, return only sdk.commit().",
     "Use the system-provided existing-object variable names exactly as shown. When a newly "
     "created memory must be referenced by delete(replacement=...) or link(...), assign the "
@@ -155,6 +156,7 @@ class _FieldHandle:
     field_name: str
     blocks: list[Any] = field(default_factory=list)
     full_value: Any = _UNSET
+    is_noop: bool = False
 
 
 class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
@@ -215,12 +217,18 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             )
             for field in schema.fields
         }
+        schema_fields = {field.name: field for field in schema.fields}
         for name, _type_name, description in fields:
             if name in merge_ops:
                 # Render only YAML field descriptions, using the same context and
                 # restricted renderer as JSON. Keep the DSL's own edit instructions
                 # instead of copying the JSON model's merge-operation wrappers.
                 description = render_description_template(description, context.template_context)
+                field = schema_fields[name]
+                if field.merge_op == MergeOp.REPLACE:
+                    description = MergeOpFactory.from_field(field).get_output_schema_description(
+                        description
+                    )
             normalized_description = " ".join(str(description or "").split())
             qualifier = f" [{merge_ops[name]}]" if name in merge_ops else ""
             lines.append(f"  - {_identifier_alias(name)}{qualifier}: {normalized_description}")
@@ -263,7 +271,10 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
 - Update or delete an existing memory only through its system-provided bound object; never pass or construct a URI.
 - Create collection memories with listed sdk.create_<memory_type>(...) methods.
 - Set a single-file memory with its listed sdk.set_<memory_type>(...) method; each target scope has only one such object.
-- Existing-object identity, storage paths, and immutable fields are preserved by the system.
+- Existing-object immutable fields are preserved by the system. URI identity fields may be
+  updated when their schema allows it; changing one renames the memory object.
+- If a rename target already exists, do not rename over it. Read both objects, update the
+  canonical target with every distinct fact, then delete the source with replacement=target.
 - delete() removes the whole object; use obj.content.drop(text=...) (with the real field name) when only some content must go and the rest stays.
 - For canonical merges, use duplicate.delete(replacement=canonical); for pure deletes, call delete() without replacement.
 - delete(replacement=canonical) discards the duplicate's content entirely and keeps only the canonical. Before deleting a duplicate, first fold every distinct valid fact it holds into the canonical (e.g. canonical.content.edit(...)); merging or compacting must never drop a unique fact that only the duplicate recorded.
@@ -758,19 +769,11 @@ class _PythonProgramCompiler:
             alias_map = self._field_alias_to_real.get(owner.memory_type, {})
             real_field = alias_map.get(node.attr, node.attr)
             if node.attr.startswith("_") or real_field not in owner.fields:
-                available = (
-                    ", ".join(sorted(_identifier_alias(name) for name in owner.fields)) or "(none)"
-                )
-                hint = (
-                    " Use the real field name (e.g. content), not the literal word 'field'."
-                    if node.attr == "field"
-                    else ""
-                )
-                self._error(
-                    node,
-                    f"memory field {node.attr!r} is unavailable; editable fields on "
-                    f"{owner.name or owner.memory_type}: {available}.{hint}",
-                )
+                # Unknown field: mirror the tolerance kwargs already have on
+                # create/set/update. Return a no-op handle so the whole
+                # program keeps compiling; the offending statement produces
+                # no effect on server state.
+                return _FieldHandle(owner=owner, field_name=real_field, is_noop=True)
             # obj.<field> is a write handle, not the raw value: it exposes
             # .update()/.edit()/.drop() and cannot be read as a string.
             return _FieldHandle(owner=owner, field_name=real_field)
@@ -1051,6 +1054,10 @@ class _PythonProgramCompiler:
         )
 
     def _call_field(self, handle: _FieldHandle, method: str, node: ast.Call) -> _FieldHandle:
+        if handle.is_noop:
+            # Unknown field: swallow the whole edit chain so the offending
+            # statement compiles without touching server state.
+            return handle
         if method == "update":
             kwargs = self._eval_keywords(node)
             if kwargs or len(node.args) != 1:
@@ -1096,6 +1103,9 @@ class _PythonProgramCompiler:
     def _apply_field_handle(self, handle: _FieldHandle, node: ast.AST) -> None:
         owner = handle.owner
         name = handle.field_name
+        if handle.is_noop:
+            # Unknown field: skip application entirely.
+            return
         schema = self.schemas[owner.memory_type]
         field_schema = {item.name: item for item in schema.fields}.get(name)
         if handle.full_value is _UNSET and not handle.blocks:
@@ -1212,10 +1222,15 @@ class _PythonProgramCompiler:
             fields = dict(obj.changed_fields)
             if obj.existing:
                 schema = self.schemas[obj.memory_type]
-                for memory_field in schema.fields:
-                    if memory_field.merge_op == MergeOp.IMMUTABLE:
-                        if memory_field.name in obj.fields:
-                            fields[memory_field.name] = obj.fields[memory_field.name]
+                required_existing_fields = set(schema.identity_fields(include_peer_id=False))
+                required_existing_fields.update(
+                    memory_field.name
+                    for memory_field in schema.fields
+                    if memory_field.merge_op == MergeOp.IMMUTABLE
+                )
+                for field_name in required_existing_fields:
+                    if field_name in obj.fields and field_name not in fields:
+                        fields[field_name] = obj.fields[field_name]
             payload[obj.memory_type].append({"page_id": obj.page_id, **fields})
         if self.context.link_enabled:
             payload["links"] = []
