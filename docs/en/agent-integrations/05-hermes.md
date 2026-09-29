@@ -29,6 +29,9 @@ hermes memory setup openviking
 hermes memory status
 ```
 
+`available` means that the provider is configured. It does not check server
+connectivity or confirm memory extraction.
+
 ## See also
 
 - [Capability Reference](./16-capability-reference.md)

@@ -27,6 +27,8 @@ hermes memory setup openviking
 hermes memory status
 ```
 
+`available` 表示 provider 已配置，不会检查服务端连通性，也不代表记忆已完成抽取。
+
 ## 参见
 
 - [集成能力参考](./16-capability-reference.md)

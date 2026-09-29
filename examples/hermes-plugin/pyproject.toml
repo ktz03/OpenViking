@@ -9,7 +9,7 @@ license = { text = "MIT" }
 # and refuses a plugin whose requirements cannot resolve against them.
 dependencies = [
     "httpx>=0.27,<1",
-    "psutil>=5.9,<8",
+    "psutil>=5.9,<9",
 ]
 
 [tool.pytest.ini_options]

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+// SPDX-License-Identifier: AGPL-3.0
+
 package openviking
 
 import (
@@ -68,6 +71,10 @@ func (c *Client) Tree(ctx context.Context, uri string, opts *TreeOptions) ([]map
 	if absLimit == 0 {
 		absLimit = 128
 	}
+	overviewLimit := opts.OverviewLimit
+	if overviewLimit == 0 {
+		overviewLimit = 4000
+	}
 	nodeLimit := opts.NodeLimit
 	if nodeLimit == 0 {
 		nodeLimit = 1000
@@ -80,7 +87,17 @@ func (c *Client) Tree(ctx context.Context, uri string, opts *TreeOptions) ([]map
 	query.Set("uri", NormalizeURI(uri))
 	query.Set("output", output)
 	queryInt(query, "abs_limit", absLimit)
+	if opts.IncludeAbstract != nil {
+		queryBool(query, "include_abstract", *opts.IncludeAbstract)
+	}
+	if opts.IncludeOverview != nil {
+		queryBool(query, "include_overview", *opts.IncludeOverview)
+	}
+	queryInt(query, "overview_limit", overviewLimit)
 	queryBool(query, "show_all_hidden", opts.ShowAllHidden)
+	if opts.DirectoriesOnly {
+		query.Set("directories_only", "true")
+	}
 	queryInt(query, "node_limit", nodeLimit)
 	queryInt(query, "level_limit", levelLimit)
 	if opts.Offset != 0 {
@@ -278,8 +295,9 @@ func (c *Client) BatchWrite(
 }
 
 // SetTags sets explicit k=v retrieval tags metadata for a file or directory.
-// Valid modes are "replace" (default) and "append"; Recursive applies the tags
-// to every file under a directory URI.
+// Valid modes are "replace" (default), "append", and "clear". An empty
+// replace request is a no-op; clear removes existing tags. Recursive applies
+// the update to every file under a directory URI.
 func (c *Client) SetTags(ctx context.Context, uri string, tags []string, opts *SetTagsOptions) (map[string]any, error) {
 	if opts == nil {
 		opts = &SetTagsOptions{Mode: "replace"}
@@ -288,9 +306,8 @@ func (c *Client) SetTags(ctx context.Context, uri string, tags []string, opts *S
 	if mode == "" {
 		mode = "replace"
 	}
-	// The server contract is tags:list[str]; a nil slice would marshal to JSON
-	// null and fail validation, so normalize to an empty list. With mode
-	// "replace" an empty list clears all tags.
+	// Normalize nil to an empty list. The server treats replace + [] as a no-op
+	// and clear as the explicit request to remove existing tags.
 	if tags == nil {
 		tags = []string{}
 	}
@@ -322,8 +339,10 @@ func (c *Client) Reindex(ctx context.Context, uri string, opts *ReindexOptions) 
 		"uri":       NormalizeURI(uri),
 		"mode":      mode,
 		"wait":      opts.Wait,
-		"dry_run":   opts.DryRun,
 		"recursive": boolValue(opts.Recursive, true),
+	}
+	if opts.Force {
+		payload["force"] = true
 	}
 	if opts.Tags != nil || opts.TagMode == "clear" {
 		if opts.Tags != nil {
@@ -335,7 +354,7 @@ func (c *Client) Reindex(ctx context.Context, uri string, opts *ReindexOptions) 
 		}
 		payload["tag_mode"] = tagMode
 	}
-	if err := mergeExtraProtected(payload, opts.Extra, "tags", "tag_mode"); err != nil {
+	if err := mergeExtraProtected(payload, opts.Extra, "force", "tags", "tag_mode"); err != nil {
 		return nil, err
 	}
 	var result map[string]any

@@ -2,40 +2,41 @@
 
 Context database by Volcengine (ByteDance) with filesystem-style knowledge hierarchy, tiered retrieval, and automatic memory extraction.
 
-This directory prepares the standalone OpenViking provider for migration out of
-Hermes core. The installation and upgrade steps below are for migration testing
-in a separate Hermes profile.
+This plugin connects Hermes to OpenViking for long-term memory and knowledge
+retrieval. The installation steps below use a reviewed OpenViking commit.
 
-For normal use while Hermes still bundles OpenViking, follow the
+For Hermes releases that still bundle OpenViking, follow the
 [Hermes integration guide](../../docs/en/agent-integrations/05-hermes.md) and run
 `hermes memory setup openviking`. No external plugin installation is needed.
 
-See [DEVELOPMENT.md](DEVELOPMENT.md) for the source, license, migration contract,
-and test commands.
+For development and licensing details, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
-## Install for migration testing
+## Install
 
-Use a current Hermes version with repository-subdirectory plugin support:
+Hermes v2026.9.24 is the tested release baseline.
+
+For a direct installation, replace the placeholder with the reviewed OpenViking
+commit's full 40-character SHA:
 
 ```bash
-hermes plugins install 'https://github.com/volcengine/OpenViking/tree/main/examples/hermes-plugin'
+hermes plugins install 'https://github.com/volcengine/OpenViking/tree/main/examples/hermes-plugin' \
+  --ref '<full-40-character-commit-SHA>' --no-enable
 hermes plugins enable openviking
 hermes memory setup openviking
 hermes memory status
 ```
 
 The equivalent shorthand is `volcengine/OpenViking/examples/hermes-plugin`.
-Hermes installs this directory as `$HERMES_HOME/plugins/openviking/` and installs
-its `pyproject.toml` dependencies under Hermes's dependency constraints.
+Hermes installs this directory as `$HERMES_HOME/plugins/openviking/`.
+In this two-step flow, Hermes resolves its `pyproject.toml` dependencies under
+Hermes's dependency constraints when you enable the plugin.
 
 If Hermes still includes the bundled OpenViking provider, that copy takes
 precedence. The external copy becomes active after the bundled copy is removed.
 Keep `memory.provider: openviking` and your existing configuration. No memory
-data needs to move. Automatic installation after core removal also requires a
-published `openviking` entry in the Hermes catalog; this directory alone does
-not register one.
+data needs to move.
 
-## Upgrade a test installation
+## Upgrade
 
 For a direct subdirectory installation, use force-reinstallation instead of
 `hermes plugins update openviking`. Hermes does not retain the repository's
@@ -50,8 +51,8 @@ hermes plugins install 'volcengine/OpenViking/examples/hermes-plugin' \
 ```
 
 Existing connection settings and server data are retained. Restart Hermes or
-the gateway after the upgrade. Once the plugin is registered in the Hermes
-catalog, copies installed through the catalog use `hermes plugins update openviking`.
+the gateway after the upgrade. For catalog installations, use
+`hermes plugins update openviking`.
 
 ## Requirements
 
@@ -135,7 +136,10 @@ OpenViking's server config is separate from Hermes:
   `account`, and `user`. It is read from `OPENVIKING_CLI_CONFIG_FILE` or
   `~/.openviking/ovcli.conf`.
 
-Hermes-side provider config is read from the initialized profile's `.env`.
+Hermes reads provider settings from the initialized profile's `config.yaml`,
+profile secrets, and linked `ovcli.conf`. Connection values resolve in this order:
+profile environment, linked OpenViking config, Hermes YAML, then defaults. API keys
+come from profile secrets or the linked OpenViking config, not Hermes YAML.
 After initialization, the provider keeps that profile for connection, identity,
 and recall settings, including when another profile is active in the same
 process. For the launch profile, process-level `OPENVIKING_*` values fill missing
@@ -151,8 +155,8 @@ Routed profiles never inherit the launch profile's process values.
 | `OPENVIKING_USER` | `default` | Tenant user for local/trusted mode |
 | `OPENVIKING_AGENT` | (none) | Optional peer ID for separate assistant context |
 
-When `OPENVIKING_API_KEY` is set, Hermes lets OpenViking derive account/user
-identity from the key. In local or trusted deployments without an API key,
+User and admin API keys let OpenViking derive account/user identity from the key.
+In local or trusted deployments without an API key,
 Hermes sends `OPENVIKING_ACCOUNT` and `OPENVIKING_USER` as identity headers.
 Hermes also sends `User-Agent: openviking-memory-hermes/<version>` on
 OpenViking requests. This standard harness identifier contains the Hermes
@@ -299,15 +303,10 @@ the new connection from earlier mappings. New files require a server-confirmed
 user identity. Missing or ambiguous mappings block replacement and deletion
 with a warning; the plugin never selects a target by semantic similarity.
 
-Replacement and deletion require Hermes to provide authoritative
-`previous_content` metadata from the native-store commit. Older Hermes versions
-without this event contract skip those mirror operations with a warning; native
-local memory still changes. The plugin never falls back to matching the caller's
-`old_text` against its partial registry.
-The required event contract was merged in
-[Hermes PR #120003](https://github.com/NousResearch/hermes-agent/pull/120003)
-(commit `5908e1aaa83e82aaf12541d7a9d90762d0b46a64`), which landed
-[#118903](https://github.com/NousResearch/hermes-agent/pull/118903).
+Replacement and deletion require Hermes to provide the full previous entry
+content after its local memory write succeeds. If this data is unavailable,
+the plugin skips those mirror operations with a warning; local memory still
+changes. It does not guess which remote entry to change.
 
 Only entries created by this mirror have mappings. Session-extracted memories,
 explicit `viking_remember` results, and copies created before this registry are
@@ -386,9 +385,10 @@ exceed it, and the server may include other context during extraction.
 
 ### Non-primary contexts
 
-Hermes passes an `agent_context` to `initialize()`. Sessions started for scheduled
-cron jobs, delegated subagents, or flush forks (`cron`, `subagent`, `flush`) are
-non-primary: recall and profile reads keep working, but the provider skips turn
-uploads, session commits, and memory mirroring, so fixed-prompt job output neither
-lands in the memory bank nor spends server-side extraction budget. Interactive
-sessions (and hosts that predate `agent_context`) keep the previous write behavior.
+When Hermes initializes the provider with `agent_context` set to `cron`, `subagent`,
+or `flush`, recall and profile reads keep working. Automatic turn uploads,
+session-end/switch commits, and native memory mirroring are skipped for that
+context. Startup recovery can still commit pending messages from earlier sessions.
+Explicit `viking_*` tools keep their normal behavior, including writes and deletes.
+Interactive sessions (and hosts that predate `agent_context`) keep the previous
+automatic write behavior.

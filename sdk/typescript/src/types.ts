@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+// SPDX-License-Identifier: AGPL-3.0
+
 /** Arbitrary JSON object returned by APIs without a dedicated result type. */
 export type JsonObject = Record<string, unknown>;
 /** One target URI or multiple target scopes. */
@@ -128,7 +131,7 @@ export interface CompileOptions {
 }
 /** Retrieval tag update options. */
 export interface SetTagsOptions {
-  mode?: "replace" | "append";
+  mode?: "replace" | "append" | "clear";
   recursive?: boolean;
   telemetry?: unknown;
   extra?: JsonObject;
@@ -137,7 +140,7 @@ export interface SetTagsOptions {
 export interface ReindexOptions {
   mode?: string;
   wait?: boolean;
-  dryRun?: boolean;
+  force?: boolean;
   recursive?: boolean;
   tags?: string[];
   tagMode?: "replace" | "append" | "clear";
@@ -228,7 +231,11 @@ export interface ListOptions {
 export interface TreeOptions {
   output?: string;
   absLimit?: number;
+  includeAbstract?: boolean;
+  includeOverview?: boolean;
+  overviewLimit?: number;
   showAllHidden?: boolean;
+  directoriesOnly?: boolean;
   nodeLimit?: number;
   levelLimit?: number;
   offset?: number;

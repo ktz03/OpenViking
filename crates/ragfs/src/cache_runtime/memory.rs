@@ -1,6 +1,6 @@
 //! In-process provider used by Runtime tests and smoke validation.
 
-use super::provider::CacheProvider;
+use super::provider::{CacheOperation, CacheProvider};
 use super::{
     CacheError, CacheResult, Expiration, ListDirection, ListInsertPosition, ListInsertRequest,
     ListMoveRequest, SetCondition, SetOptions, SetResult,
@@ -231,6 +231,16 @@ impl Default for MemoryMockProvider {
 
 #[async_trait]
 impl CacheProvider for MemoryMockProvider {
+    /// Rejects script execution because the in-memory provider has no Lua engine.
+    fn validate_operations(&self, operations: &[CacheOperation]) -> CacheResult<()> {
+        if operations.contains(&CacheOperation::ExecuteScript) {
+            return Err(CacheError::UnsupportedOperation(
+                CacheOperation::ExecuteScript.name().to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn get(&self, key: &str) -> CacheResult<Option<Bytes>> {
         self.ensure_open()?;
         self.gets.fetch_add(1, Ordering::Relaxed);

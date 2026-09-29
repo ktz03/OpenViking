@@ -551,7 +551,7 @@ enum Commands {
         /// Viking URI to get tree for
         #[arg(value_name = "uri")]
         uri: String,
-        /// Abstract content limit (only for agent output)
+        /// Maximum returned abstract length
         #[arg(
             long = "abs-limit",
             short = 'l',
@@ -560,9 +560,43 @@ enum Commands {
             help_heading = "Advanced options"
         )]
         abs_limit: i32,
+        /// Include directory L0 abstracts (defaults to the selected output mode)
+        #[arg(
+            long = "include-abstract",
+            default_missing_value = "true",
+            num_args = 0..=1,
+            require_equals = true,
+            action = ArgAction::Set,
+            value_name = "bool",
+            help_heading = "Output options"
+        )]
+        include_abstract: Option<bool>,
+        /// Include directory L1 overviews
+        #[arg(
+            long = "include-overview",
+            default_missing_value = "true",
+            num_args = 0..=1,
+            require_equals = true,
+            action = ArgAction::Set,
+            value_name = "bool",
+            help_heading = "Output options"
+        )]
+        include_overview: Option<bool>,
+        /// Maximum overview content length
+        #[arg(
+            long = "overview-limit",
+            default_value = "4000",
+            value_parser = clap::value_parser!(i32).range(1..),
+            value_name = "n",
+            help_heading = "Advanced options"
+        )]
+        overview_limit: i32,
         /// Show all hidden files
         #[arg(short, long, help_heading = "Common options")]
         all: bool,
+        /// Only include directories
+        #[arg(long = "directories-only", help_heading = "Common options")]
+        directories_only: bool,
         /// Maximum number of nodes to list
         #[arg(
             long = "node-limit",
@@ -602,7 +636,7 @@ enum Commands {
         /// Simple path output (just paths, no tree formatting)
         #[arg(short, long, help_heading = "Common options")]
         simple: bool,
-        /// Comma-separated fields to display (name,uri,path,type,size,mode,mtime,locked,id,count,tags)
+        /// Comma-separated fields to display (name,uri,path,type,size,mode,mtime,locked,id,count,tags,abstract,overview)
         #[arg(short = 'f', long = "fields", value_delimiter = ',', value_name = "FIELDS", help_heading = "Output options")]
         fields: Option<Vec<String>>,
         /// Comma-separated k=v retrieval tags; all tags must match
@@ -1245,11 +1279,11 @@ enum Commands {
         /// Viking URI
         #[arg(value_name = "uri")]
         uri: String,
-        /// Reindex mode: vectors_only rebuilds vectors; semantic_and_vectors regenerates semantic artifacts, then vectors; prune_orphans deletes orphan vector records
+        /// Reindex mode: vectors_only rebuilds vectors; semantic_and_vectors regenerates semantic artifacts, then vectors
         #[arg(
             long,
             default_value = "vectors_only",
-            value_parser = ["vectors_only", "semantic_and_vectors", "prune_orphans"],
+            value_parser = ["vectors_only", "semantic_and_vectors"],
             value_name = "mode",
             help_heading = "Common options"
         )]
@@ -1263,9 +1297,9 @@ enum Commands {
             help_heading = "Common options"
         )]
         wait: bool,
-        /// Preview prune_orphans deletions without mutating vectors
+        /// Rebuild all selected semantic/vector data without comparing fingerprints
         #[arg(long, help_heading = "Common options")]
-        dry_run: bool,
+        force: bool,
         /// Comma-separated k=v retrieval tags for rebuilt vector records
         #[arg(long = "tags", value_delimiter = ',', value_name = "k=v", help_heading = "Common options")]
         tags: Vec<String>,
@@ -1363,7 +1397,7 @@ pub(crate) enum SnapshotCmd {
     Commit {
         #[arg(short = 'm', long)]
         message: String,
-        /// Limit to specific viking:// URIs (comma-separated); accepts files and directories. Directories are expanded recursively with the snapshot pruning rules. Omit to snapshot the full account tree.
+        /// Limit to specific viking:// URIs (comma-separated); accepts files and directories. Directories are expanded recursively with the snapshot pruning rules. Required for USER/ADMIN callers; only local ROOT mode may omit paths to snapshot the full account tree.
         #[arg(long, value_delimiter = ',')]
         paths: Option<Vec<String>>,
         #[arg(long, default_value = "main")]
@@ -3566,7 +3600,11 @@ async fn main() {
         Commands::Tree {
             uri,
             abs_limit,
+            include_abstract,
+            include_overview,
+            overview_limit,
             all,
+            directories_only,
             node_limit,
             offset,
             limit,
@@ -3578,7 +3616,11 @@ async fn main() {
             handlers::handle_tree(
                 uri,
                 abs_limit,
+                include_abstract,
+                include_overview,
+                overview_limit,
                 all,
+                directories_only,
                 node_limit,
                 offset,
                 limit,
@@ -3747,12 +3789,12 @@ async fn main() {
             uri,
             mode,
             wait,
-            dry_run,
+            force,
             tags,
             tag_mode,
             recursive,
         } => {
-            handlers::handle_reindex(uri, mode, wait, dry_run, tags, tag_mode, recursive, ctx).await
+            handlers::handle_reindex(uri, mode, wait, force, tags, tag_mode, recursive, ctx).await
         }
         Commands::Get { uri, local_path } => handlers::handle_get(uri, local_path, ctx).await,
         Commands::Find {
@@ -4240,6 +4282,11 @@ mod tests {
             "6",
             "--limit",
             "7",
+            "--directories-only",
+            "--include-abstract",
+            "--include-overview=false",
+            "--overview-limit",
+            "512",
         ])
         .expect("paged tree should parse");
         let health = Cli::try_parse_from(["ov", "health"]).expect("health should parse");
@@ -4266,11 +4313,19 @@ mod tests {
                 offset,
                 limit,
                 node_limit,
+                directories_only,
+                include_abstract,
+                include_overview,
+                overview_limit,
                 ..
             } => {
                 assert_eq!(offset, 6);
                 assert_eq!(limit, Some(7));
                 assert_eq!(node_limit, 256);
+                assert!(directories_only);
+                assert_eq!(include_abstract, Some(true));
+                assert_eq!(include_overview, Some(false));
+                assert_eq!(overview_limit, 512);
             }
             _ => panic!("expected tree command"),
         }
@@ -5794,9 +5849,9 @@ mod tests {
             "reindex",
             "viking://resources/demo",
             "--mode",
-            "prune_orphans",
+            "semantic_and_vectors",
             "--wait=false",
-            "--dry-run",
+            "--force",
             "--tags",
             "team=search",
             "--tag-mode",
@@ -5807,12 +5862,14 @@ mod tests {
         let cli = result.expect("reindex command should parse");
         match cli.command {
             Commands::Reindex {
+                force,
                 tags,
                 tag_mode,
                 recursive,
                 ..
             } => {
                 assert_eq!(tags, vec!["team=search"]);
+                assert!(force);
                 assert_eq!(tag_mode, "append");
                 assert!(!recursive);
             }

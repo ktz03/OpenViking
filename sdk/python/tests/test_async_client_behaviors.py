@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -307,9 +310,9 @@ async def test_async_http_client_reindex_posts_content_reindex():
 
     result = await client.reindex(
         "viking://resources/demo",
-        mode="prune_orphans",
+        mode="vectors_only",
         wait=False,
-        dry_run=True,
+        force=True,
         options=None,
     )
 
@@ -318,9 +321,9 @@ async def test_async_http_client_reindex_posts_content_reindex():
         "/api/v1/content/reindex",
         json={
             "uri": "viking://resources/demo",
-            "mode": "prune_orphans",
+            "mode": "vectors_only",
             "wait": False,
-            "dry_run": True,
+            "force": True,
             "recursive": True,
         },
     )
@@ -471,18 +474,16 @@ def test_sync_http_client_reindex_forwards_to_async_client():
         ) as mock_run:
             result = client.reindex(
                 "viking://resources/demo",
-                mode="prune_orphans",
+                mode="vectors_only",
                 wait=False,
-                dry_run=True,
             )
 
     assert result == {"status": "accepted"}
     assert mock_run.called
     mock_reindex.assert_called_once_with(
         "viking://resources/demo",
-        mode="prune_orphans",
+        mode="vectors_only",
         wait=False,
-        dry_run=True,
         recursive=True,
         options=None,
     )
@@ -1334,6 +1335,25 @@ async def test_grep_omits_unset_tags_and_forwards_explicit_tags():
 
     assert "tags" not in fake_http.post.await_args_list[0].kwargs["json"]
     assert fake_http.post.await_args_list[1].kwargs["json"]["tags"] == ["env=prod"]
+
+
+@pytest.mark.asyncio
+async def test_set_tags_clear_omits_tags_from_sdk_request():
+    client = AsyncHTTPClient(url="http://localhost:1933")
+    fake_http = SimpleNamespace(post=AsyncMock(return_value=object()))
+    client._http = fake_http
+    client._handle_response_data = lambda _response: {"result": {"tags": []}}
+
+    await client.set_tags("viking://resources/demo.md", mode="clear")
+
+    fake_http.post.assert_awaited_once_with(
+        "/api/v1/fs/attrs/set_tags",
+        json={
+            "uri": "viking://resources/demo.md",
+            "mode": "clear",
+            "recursive": False,
+        },
+    )
 
 
 @pytest.mark.asyncio

@@ -575,8 +575,8 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
         purpose: "Manage workspace snapshots: commit, restore, show, diff, and walk history.",
         examples: &[
             HelpItem {
-                label: "ov snapshot commit -m \"checkpoint before refactor\"",
-                description: "Commit the current workspace state.",
+                label: "ov snapshot commit -m \"checkpoint before refactor\" --paths viking://resources/my_project",
+                description: "Commit a project directory for which you have write access.",
             },
             HelpItem {
                 label: "ov snapshot log --branch main",
@@ -601,11 +601,11 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
         purpose: "Commit the current workspace state as a new snapshot.",
         examples: &[
             HelpItem {
-                label: "ov snapshot commit -m \"checkpoint before refactor\"",
-                description: "Commit the full workspace on the main branch.",
+                label: "ov snapshot commit -m \"checkpoint before refactor\" --paths viking://resources/my_project",
+                description: "Commit a writable project directory on the main branch. Omit --paths only in local ROOT mode.",
             },
             HelpItem {
-                label: "ov snapshot commit -m \"docs only\" --paths viking://docs",
+                label: "ov snapshot commit -m \"docs only\" --paths viking://resources/docs",
                 description: "Commit only the given viking:// URIs. Directories are expanded recursively (with snapshot pruning rules applied).",
             },
         ],
@@ -724,7 +724,7 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
             },
         ],
         next_steps: &[HelpItem {
-            label: "ov snapshot commit -m \"with ignore\"",
+            label: "ov snapshot commit -m \"with ignore\" --paths viking://resources/my_project",
             description: "Commit; matching files are excluded (see the `ignored` count).",
         }],
     },
@@ -1387,10 +1387,6 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
             HelpItem {
                 label: "ov reindex viking://projects/acme --mode semantic_and_vectors --recursive=false",
                 description: "Refresh only the target directory semantics and vectors, without sub-directory.",
-            },
-            HelpItem {
-                label: "ov reindex viking://projects/acme --mode prune_orphans --dry-run",
-                description: "Preview orphan vector cleanup.",
             },
         ],
         next_steps: &[
@@ -2956,8 +2952,8 @@ mod tests {
                 .expect("reindex help should render"),
         );
 
-        assert!(rendered.contains("--mode <vectors_only|semantic_and_vectors|prune_orphans>"));
-        assert!(rendered.contains("--dry-run"));
+        assert!(rendered.contains("--mode <vectors_only|semantic_and_vectors>"));
+        assert!(rendered.contains("--force"));
         assert!(rendered.contains("--recursive <true|false>"));
         assert!(rendered.contains("Regenerate semantic artifacts, then vectors."));
     }

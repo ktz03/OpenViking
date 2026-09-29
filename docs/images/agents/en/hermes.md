@@ -6,7 +6,8 @@
    hermes memory setup openviking
    ```
 
-2. The wizard first asks for the configuration source:
+2. If local `ovcli.conf` profiles exist, the wizard asks for the configuration
+   source. Otherwise, it starts creating a new configuration:
 
    ```text
    OpenViking config source
@@ -36,8 +37,7 @@
    {{OPENVIKING_API_KEY}}
    ```
 
-5. Fill in **Hermes peer ID in OpenViking**. This identifies the Hermes Agent in OpenViking so memories produced by different Agents can be separated. Press Enter to use the default `hermes`, or enter a custom value.
-6. Choose how to save the configuration. We recommend **Mirror to OpenViking store**:
+5. Choose how to save the configuration. We recommend **Mirror to OpenViking store**:
 
    ```text
    Save OpenViking config
@@ -46,8 +46,8 @@
     → (●) Mirror to OpenViking store - write ~/.openviking/ovcli.conf.<name> and link it
    ```
 
-7. Fill in **OpenViking profile name**. Hermes' multi-tenant capabilities can isolate models, memories, configuration, and credentials across Profiles. We recommend configuring an independent OpenViking environment or identity for each Hermes Profile, and using an easy-to-recognize local name here. This name is local only; it does not create a new user or change account identity or permissions.
-8. When setup completes, Hermes shows:
+6. Fill in **OpenViking profile name**, for example `hermes`. Hermes' multi-tenant capabilities can isolate models, memories, configuration, and credentials across Profiles. We recommend configuring an independent OpenViking environment or identity for each Hermes Profile, and using an easy-to-recognize local name here. This name is local only; it does not create a new user or change account identity or permissions.
+7. When setup completes, Hermes shows:
 
    ```text
    OpenViking memory is ready
@@ -55,6 +55,10 @@
      Config file: ~/.openviking/ovcli.conf.hermes
      Start a new Hermes session to activate.
    ```
+
+New connections use user memory without an assistant peer. Setup does not ask
+for a peer ID. To separate assistant context, set `memory.openviking.agent` in
+the active Hermes profile's `config.yaml`. Existing peer memories are not moved.
 
 ## Step 2: Verify
 
@@ -64,7 +68,8 @@
    hermes memory status
    ```
 
-2. A result similar to the following means the integration is successful:
+2. Confirm that OpenViking is selected and configured. `available` does not
+   check server connectivity or confirm memory extraction:
 
    ```text
    Memory status
@@ -78,21 +83,11 @@
      openviking config:
        use_ovcli_config: True
        ovcli_config_path: ~/.openviking/ovcli.conf.hermes
-       endpoint: `https://api.vikingdb.cn-beijing.volces.com/openviking`
-       agent: hermes
+       endpoint: https://api.vikingdb.cn-beijing.volces.com/openviking
 
      Plugin:    installed ✓
      Status:    available ✓
 
-     Installed plugins:
-       • byterover  (API key / local)
-       • hindsight  (API key / local)
-       • holographic  (local)
-       • honcho  (API key / local)
-       • mem0  (API key / local)
-       • openviking  (API key / local) ← active
-       • retaindb  (API key / local)
-       • supermemory  (requires API key)
    ```
 
 ## Troubleshoot
@@ -100,7 +95,7 @@
 | Problem | Fix |
 |---|---|
 | Provider is not openviking | Re-run `hermes memory setup openviking` |
-| Status is not available | Check the API key |
+| Status is not available | Check the configured endpoint and linked OpenViking config file |
 
 ## Reference
 

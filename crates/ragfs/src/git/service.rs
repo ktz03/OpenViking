@@ -262,7 +262,10 @@ impl GitService {
                     let abs = format!("/local/{}/{}", account, p);
                     match self.vfs.stat(&abs).await {
                         Ok(info) if info.is_dir => {
-                            // Directory: recursive listing + prev_tree subtree.
+                            // Directory: recursive listing + prev_tree subtree. Include an
+                            // old blob at this exact path too (file -> directory), even if
+                            // the new directory is empty and contributes no listed files.
+                            cleanup_exact.insert(p.clone());
                             cleanup_prefixes.push(format!("{}/", p));
 
                             let listed =
@@ -288,7 +291,7 @@ impl GitService {
                                 }
                                 let pref = format!("{}/", p);
                                 for (path, _) in prev_paths_cache.as_ref().unwrap() {
-                                    if !path.starts_with(&pref) {
+                                    if path != p && !path.starts_with(&pref) {
                                         continue;
                                     }
                                     if should_track_path(path, &ignore_matcher) {
@@ -549,8 +552,17 @@ impl GitService {
         let index_saved_at_ns: Option<i128> = prev_index.as_ref().and_then(|idx| idx.saved_at_ns);
         for rel_path in candidates {
             let abs = format!("/local/{}/{}", account, rel_path);
-            match self.vfs.stat(&abs).await {
-                Ok(info) => {
+            // Candidates include previous snapshot blobs. If one has become a
+            // directory, remove the old blob rather than reading the directory as
+            // a file. Its current children are separate, later-sorted candidates.
+            let file_info = match self.vfs.stat(&abs).await {
+                Ok(info) if !info.is_dir => Some(info),
+                Ok(_) => None,
+                Err(e) if is_not_found(&e) => None,
+                Err(e) => return Err(e.into()),
+            };
+            match file_info {
+                Some(info) => {
                     let stat = stat_signature(&info);
 
                     // Fast Path 1: cached `(size, mtime_ns)` match → reuse oid,
@@ -635,7 +647,7 @@ impl GitService {
                         }
                     }
                 }
-                Err(e) if is_not_found(&e) => {
+                None => {
                     // Only count as a change if the path actually existed
                     // in prev_tree, since TreeEditor::remove silently no-ops
                     // for missing paths. With no prev_tree (root commit) a
@@ -659,12 +671,11 @@ impl GitService {
                             .await?;
                         changed += 1;
                     }
-                    // Path is gone → drop any lingering cache entry.
+                    // The file is gone (or became a directory): drop its cached blob.
                     if self.index_store.is_some() {
                         new_index_entries.remove(&rel_path);
                     }
                 }
-                Err(e) => return Err(e.into()),
             }
         }
 
@@ -1988,6 +1999,7 @@ mod tests {
             _offset: Option<usize>,
             _sort_by: Option<crate::core::ListSortBy>,
             _sort_order: Option<crate::core::SortOrder>,
+            _directories_only: bool,
         ) -> Result<Vec<TreeEntry>> {
             let prefix = if path == "/" {
                 "/".to_string()
@@ -2325,6 +2337,77 @@ mod tests {
 
         let paths = commit_paths(object_store.as_ref() as &dyn ObjectStore, "acct", oid).await;
         assert_eq!(paths, vec!["foo/bar.md".to_string()]);
+    }
+
+    /// A previously snapshotted file can become a real directory. MockVfs reports
+    /// directories as NotFound, so it misses both the read-directory error when
+    /// committing a parent and the stale blob when committing the exact directory.
+    #[tokio::test]
+    async fn test_commit_file_to_directory_on_localfs() {
+        use crate::git::backends::local::LocalIndexStore;
+        use crate::git::index_store::IndexStore;
+        use crate::plugins::localfs::LocalFileSystem;
+
+        for scope in [None, Some("docs"), Some("docs/note.md")] {
+            for with_child in [false, true] {
+                let store_dir = tempfile::tempdir().unwrap();
+                let object_store = Arc::new(LocalObjectStore::new(store_dir.path()));
+                let ref_store = Arc::new(LocalRefStore::new(store_dir.path()));
+                let index_store = Arc::new(LocalIndexStore::new(store_dir.path()));
+                let work_dir = tempfile::tempdir().unwrap();
+                let acct_root = work_dir.path().join("local/acct");
+                std::fs::create_dir_all(acct_root.join("docs")).unwrap();
+                std::fs::write(acct_root.join("docs/note.md"), b"old file").unwrap();
+                std::fs::write(acct_root.join("outside.md"), b"keep").unwrap();
+                let vfs: Arc<dyn FileSystem> =
+                    Arc::new(LocalFileSystem::new(work_dir.path().to_str().unwrap()).unwrap());
+                let svc = GitService::with_index(
+                    vfs,
+                    object_store.clone(),
+                    ref_store,
+                    Some(index_store.clone()),
+                );
+                make_commit(&svc, "acct", "main", "before").await;
+                std::fs::remove_file(acct_root.join("docs/note.md")).unwrap();
+                std::fs::create_dir(acct_root.join("docs/note.md")).unwrap();
+                if with_child {
+                    std::fs::write(acct_root.join("docs/note.md/child.md"), b"new child").unwrap();
+                }
+                let paths = scope.map(|path| vec![path.to_string()]);
+                let response = svc
+                    .commit(req("acct", "main", "after", paths.clone()))
+                    .await
+                    .unwrap();
+                let commit_oid = match response {
+                    CommitResponse::Created { commit_oid, .. } => commit_oid,
+                    other => {
+                        panic!("expected Created for {scope:?}, child={with_child}: {other:?}")
+                    }
+                };
+                let actual = commit_paths(object_store.as_ref(), "acct", commit_oid).await;
+                let expected = if with_child {
+                    vec![
+                        "docs/note.md/child.md".to_string(),
+                        "outside.md".to_string(),
+                    ]
+                } else {
+                    vec!["outside.md".to_string()]
+                };
+                assert_eq!(actual, expected, "scope={scope:?}, child={with_child}");
+                let index = index_store.load("acct", "main").await.unwrap().unwrap();
+                assert!(!index.entries.contains_key("docs/note.md"));
+                assert_eq!(
+                    index.entries.contains_key("docs/note.md/child.md"),
+                    with_child
+                );
+                assert!(matches!(
+                    svc.commit(req("acct", "main", "unchanged", paths))
+                        .await
+                        .unwrap(),
+                    CommitResponse::Noop { .. }
+                ));
+            }
+        }
     }
 
     // ── 4e ─────────────────────────────────────────────────────────────
@@ -6126,6 +6209,7 @@ mod fast_path1_tests {
             _offset: Option<usize>,
             _sort_by: Option<crate::core::ListSortBy>,
             _sort_order: Option<crate::core::SortOrder>,
+            _directories_only: bool,
         ) -> Result<Vec<TreeEntry>> {
             let prefix = if path == "/" {
                 "/".to_string()

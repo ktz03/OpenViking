@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+// SPDX-License-Identifier: AGPL-3.0
+
 package openviking
 
 import (
@@ -266,6 +269,18 @@ func TestListAndTreeSendQueryOptions(t *testing.T) {
 				if got := r.URL.Query()["tags"]; !reflect.DeepEqual(got, []string{"env=prod"}) {
 					t.Fatalf("tags = %#v", got)
 				}
+				if got := r.URL.Query().Get("include_abstract"); got != "false" {
+					t.Fatalf("include_abstract = %q", got)
+				}
+				if got := r.URL.Query().Get("include_overview"); got != "true" {
+					t.Fatalf("include_overview = %q", got)
+				}
+				if got := r.URL.Query().Get("overview_limit"); got != "512" {
+					t.Fatalf("overview_limit = %q", got)
+				}
+				if got := r.URL.Query().Get("directories_only"); got != "true" {
+					t.Fatalf("directories_only = %q", got)
+				}
 			} else {
 				if got := r.URL.Query().Get("level_limit"); got != "3" {
 					t.Fatalf("level_limit = %q, want 3", got)
@@ -275,6 +290,15 @@ func TestListAndTreeSendQueryOptions(t *testing.T) {
 				}
 				if _, ok := r.URL.Query()["limit"]; ok {
 					t.Fatal("default tree request should omit limit")
+				}
+				if _, ok := r.URL.Query()["include_abstract"]; ok {
+					t.Fatal("default tree request should omit include_abstract")
+				}
+				if _, ok := r.URL.Query()["include_overview"]; ok {
+					t.Fatal("default tree request should omit include_overview")
+				}
+				if got := r.URL.Query().Get("overview_limit"); got != "4000" {
+					t.Fatalf("overview_limit = %q", got)
 				}
 			}
 			treeCalls++
@@ -296,11 +320,15 @@ func TestListAndTreeSendQueryOptions(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := client.Tree(context.Background(), "viking://resources/docs", &TreeOptions{
-		NodeLimit:  200,
-		LevelLimit: Int(0),
-		Offset:     6,
-		Limit:      7,
-		Tags:       []string{"env=prod"},
+		NodeLimit:       200,
+		LevelLimit:      Int(0),
+		Offset:          6,
+		Limit:           7,
+		Tags:            []string{"env=prod"},
+		IncludeAbstract: Bool(false),
+		IncludeOverview: Bool(true),
+		OverviewLimit:   512,
+		DirectoriesOnly: true,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -338,7 +366,7 @@ func TestFindSendsImageQuery(t *testing.T) {
 	}
 }
 
-func TestReindexSendsDryRun(t *testing.T) {
+func TestReindexSendsForceAndRecursive(t *testing.T) {
 	client, closeServer := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/content/reindex" {
 			t.Fatalf("path = %s", r.URL.Path)
@@ -350,14 +378,14 @@ func TestReindexSendsDryRun(t *testing.T) {
 		if got := body["uri"]; got != "viking://resources/demo" {
 			t.Fatalf("uri = %#v", got)
 		}
-		if got := body["mode"]; got != "prune_orphans" {
+		if got := body["mode"]; got != "vectors_only" {
 			t.Fatalf("mode = %#v", got)
 		}
 		if got := body["wait"]; got != false {
 			t.Fatalf("wait = %#v", got)
 		}
-		if got := body["dry_run"]; got != true {
-			t.Fatalf("dry_run = %#v", got)
+		if got := body["force"]; got != true {
+			t.Fatalf("force = %#v", got)
 		}
 		if got := body["recursive"]; got != false {
 			t.Fatalf("recursive = %#v", got)
@@ -367,9 +395,9 @@ func TestReindexSendsDryRun(t *testing.T) {
 	defer closeServer()
 
 	if _, err := client.Reindex(context.Background(), "resources/demo", &ReindexOptions{
-		Mode:      "prune_orphans",
+		Mode:      "vectors_only",
 		Wait:      false,
-		DryRun:    true,
+		Force:     true,
 		Recursive: Bool(false),
 	}); err != nil {
 		t.Fatal(err)

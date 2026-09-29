@@ -8,7 +8,6 @@ import threading
 import time
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import unquote, urlsplit
 
 from openviking.core.namespace import classify_uri
 from openviking.observability.context import (
@@ -45,6 +44,7 @@ from openviking.storage.abstract_overview import (
     deterministic_sample,
     freshness_metadata,
     markdown_safe_viking_uri,
+    parse_overview_file_summaries,
     plan_abstract_overview_refresh,
     write_abstract_overview,
 )
@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     from openviking.config.vlm import VLMHandle, VLMResolver
 
 logger = get_logger(__name__)
+
 
 class RequestQueueStats:
     processed: int = 0
@@ -152,15 +153,23 @@ class SemanticProcessor(DequeueHandlerBase):
 
     async def _get_vlm_config(self, ctx: RequestContext) -> "VLMHandle":
         if self._vlm_resolver is None:
-            raise RuntimeError(
-                "SemanticProcessor requires a VLM resolver for account-owned work"
-            )
+            raise RuntimeError("SemanticProcessor requires a VLM resolver for account-owned work")
         return await self._vlm_resolver.get_vlm(ctx.account_id)
 
     @classmethod
     def _cache_tree_stats(cls, telemetry_id: str, uri: str, stats: SemanticTreeStats) -> None:
         with cls._stats_lock:
             if telemetry_id:
+                previous = cls._tree_stats_by_telemetry_id.get(telemetry_id)
+                if previous is not None:
+                    stats = SemanticTreeStats(
+                        total_nodes=previous.total_nodes + stats.total_nodes,
+                        pending_nodes=previous.pending_nodes + stats.pending_nodes,
+                        in_progress_nodes=previous.in_progress_nodes + stats.in_progress_nodes,
+                        done_nodes=previous.done_nodes + stats.done_nodes,
+                        failures=[*previous.failures, *stats.failures],
+                        indexed_records=previous.indexed_records + stats.indexed_records,
+                    )
                 cls._tree_stats_by_telemetry_id[telemetry_id] = stats
             cls._tree_stats_by_uri[uri] = stats
             cls._tree_stats_order.append((telemetry_id, uri))
@@ -286,8 +295,10 @@ class SemanticProcessor(DequeueHandlerBase):
         else:
             logger.warning(f"No queue manager available, cannot re-enqueue: {msg.uri}")
 
-    async def _enqueue_skill_retry(self, queue, msg: SemanticMsg, scope: SemanticLockScope) -> None:
-        """Transfer the live package lease to a retry before releasing this worker.
+    async def _enqueue_semantic_retry(
+        self, queue, msg: SemanticMsg, scope: SemanticLockScope
+    ) -> None:
+        """Transfer the live semantic lease to a retry before releasing this worker.
 
         Reusing the consumed handoff would require acquiring an unrelated lock,
         which conflicts with an update request still waiting under its outer lease.
@@ -306,6 +317,10 @@ class SemanticProcessor(DequeueHandlerBase):
                 scope.lock = await agfs.pathlock_adopt(handoff)
                 scope._owned = True
             raise
+
+    async def _enqueue_skill_retry(self, queue, msg: SemanticMsg, scope: SemanticLockScope) -> None:
+        """Compatibility wrapper for existing skill retry callers."""
+        await self._enqueue_semantic_retry(queue, msg, scope)
 
     async def _requeue_semantic_msg_after_error(
         self,
@@ -529,8 +544,7 @@ class SemanticProcessor(DequeueHandlerBase):
 
                     if self._vlm_resolver is None:
                         raise RuntimeError(
-                            "SemanticProcessor requires a VLM resolver "
-                            "for account-owned work"
+                            "SemanticProcessor requires a VLM resolver for account-owned work"
                         )
                     if not await work.acquire_lock(current_ctx):
                         get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
@@ -557,12 +571,13 @@ class SemanticProcessor(DequeueHandlerBase):
                                     source=msg.plan.source_metadata,
                                     semantic_plan=msg.plan,
                                     telemetry_id=msg.telemetry_id,
+                                    generation_trigger=msg.generation_trigger,
                                 )
                                 await executor.run(run_uri)
                                 self._cache_tree_stats(
                                     msg.telemetry_id, run_uri, executor.get_stats()
                                 )
-                                if not executor.stale and msg.plan.propagation.enabled:
+                                if not executor.stale:
                                     write_result = getattr(
                                         executor,
                                         "root_write_result",
@@ -1232,6 +1247,7 @@ class SemanticProcessor(DequeueHandlerBase):
         llm_sem: asyncio.Semaphore,
         ctx: Optional[RequestContext] = None,
         file_content: Optional[bytes] = None,
+        materialize_content: bool = False,
     ) -> Dict[str, Any]:
         """Generate summary for a single text file (code, documentation, or other text)."""
         viking_fs = get_viking_fs()
@@ -1463,73 +1479,8 @@ class SemanticProcessor(DequeueHandlerBase):
 
     @classmethod
     def _parse_overview_md(cls, overview_content: str) -> Dict[str, str]:
-        """Parse overview.md and extract file summaries.
-
-        Args:
-            overview_content: Content of the overview.md file
-
-        Returns:
-            Dictionary mapping file names to their summaries
-        """
-        import re
-
-        summaries: Dict[str, str] = {}
-
-        overview_content = body_for_preview(overview_content)
-        if not overview_content or not overview_content.strip():
-            return summaries
-
-        lines = overview_content.split("\n")
-        current_file = None
-        current_summary_lines: List[str] = []
-
-        for line in lines:
-            header_match = re.match(r"^###\s+(.+?)\s*$", line)
-            if header_match:
-                if current_file and current_summary_lines:
-                    summaries[current_file] = " ".join(current_summary_lines).strip()
-
-                file_name = cls._overview_heading_cache_key(header_match.group(1).strip())
-                parts = file_name.split()
-                if len(parts) >= 2 and parts[0] == parts[1]:
-                    file_name = parts[0]
-
-                current_file = file_name
-                current_summary_lines = []
-                continue
-
-            numbered_match = re.match(r"^\[(\d+)\]\s+(.+?):\s*(.+)$", line)
-            if numbered_match:
-                if current_file and current_summary_lines:
-                    summaries[current_file] = " ".join(current_summary_lines).strip()
-                current_file = numbered_match.group(2).strip()
-                current_summary_lines = [numbered_match.group(3).strip()]
-                continue
-
-            if current_file:
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#"):
-                    current_summary_lines.append(stripped)
-
-        if current_file and current_summary_lines:
-            summaries[current_file] = " ".join(current_summary_lines).strip()
-
-        return summaries
-
-    @staticmethod
-    def _overview_heading_cache_key(heading: str) -> str:
-        """Return the entry name represented by a plain or linked H3 heading."""
-        if heading.startswith("[") and heading.endswith(")"):
-            destination_start = heading.rfind("](")
-            if destination_start > 0:
-                target = heading[destination_start + 2 : -1].strip()
-                if target.startswith("<") and target.endswith(">"):
-                    target = target[1:-1].strip()
-                if target.startswith("viking://"):
-                    path = unquote(urlsplit(target).path).rstrip("/")
-                    if path:
-                        return path.rsplit("/", 1)[-1]
-        return heading
+        """Parse overview.md and extract direct-file summaries."""
+        return parse_overview_file_summaries(overview_content)
 
     async def _generate_overview(
         self,
@@ -1850,6 +1801,7 @@ class SemanticProcessor(DequeueHandlerBase):
         ctx: RequestContext,
         regenerate: bool = False,
         lock: Optional[Dict[str, Any]] = None,
+        skill_content: str | bytes | None = None,
     ) -> Tuple[str, str]:
         """Keep the package root tied only to its SKILL.md definition."""
         viking_fs = get_viking_fs()
@@ -1866,7 +1818,11 @@ class SemanticProcessor(DequeueHandlerBase):
         from openviking.core.skill_loader import SkillLoader
         from openviking.utils.skill_processor import SkillProcessor
 
-        content = await viking_fs.read_file(f"{uri}/SKILL.md", ctx=ctx)
+        content = (
+            skill_content
+            if skill_content is not None
+            else await viking_fs.read_file(f"{uri}/SKILL.md", ctx=ctx)
+        )
         if isinstance(content, bytes):
             content = content.decode("utf-8")
         definition = SkillLoader.parse(content)
@@ -1907,6 +1863,7 @@ class SemanticProcessor(DequeueHandlerBase):
         include_abstract: bool = True,
         include_overview: bool = True,
         telemetry_id: str | None = None,
+        md5s: Optional[Dict[int, str]] = None,
     ) -> set[int]:
         """Create directory Context and enqueue to EmbeddingQueue."""
 
@@ -1939,6 +1896,7 @@ class SemanticProcessor(DequeueHandlerBase):
             include_abstract=include_abstract,
             include_overview=include_overview,
             telemetry_id=telemetry_id,
+            md5s=md5s,
         )
 
     async def _load_transfer_file_summaries(
@@ -2004,6 +1962,7 @@ class SemanticProcessor(DequeueHandlerBase):
         ingest_options: IngestOptions | None = None,
         file_md5: Optional[str] = None,
         file_content: Optional[bytes] = None,
+        materialize_content: bool = False,
         scalar_override: Optional[Dict[str, Any]] = None,
         field_patch: FieldPatch | None = None,
         action: str = "merge",
@@ -2024,6 +1983,7 @@ class SemanticProcessor(DequeueHandlerBase):
             ingest_options=ingest_options,
             file_md5=file_md5,
             file_content=file_content,
+            materialize_content=materialize_content,
             scalar_override=scalar_override,
             field_patch=field_patch,
             action=action,
