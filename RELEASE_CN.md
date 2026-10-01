@@ -84,9 +84,31 @@ TOS 发布流程会生成源码 zip，并上传以下类型资产：
 - Codex memory plugin 安装脚本
 - 对应 TOS install 脚本
 
-正式 GitHub Release 会自动触发 TOS 上传。手动补发时可指定 tag，并通过 `update_latest` 决定是否覆盖稳定路径。
+正式 GitHub Release 会自动触发 TOS 上传，并覆盖稳定路径。手动触发时指定 tag，workflow 上传该 tag 的版本化路径；只有设置 `update_latest=true`（默认 `false`）才会覆盖稳定路径，因此补传旧版本的资产不会把用户退回到旧版本。
 
 如果 TOS 相关 secrets 未配置完整，workflow 会跳过上传并在 step summary 中说明，不会使整个流程失败。
+
+### 文档站上的 Memory 插件下载
+
+安装器和 Memory 插件从文档站下载，不再从 TOS 发布桶下载。两条文档部署流水线（`17. Docs` 部署到 GitHub Pages 的 `docs.openviking.ai`，`19. Docs TOS Deploy` 部署到 `docs.openviking.net`）都会运行 `.github/scripts/build-plugin-downloads.sh`，把产物发布到 `/dl` 下，目录结构与发布桶一致：`memory-plugin-shared/install.sh` 和 `bootstrap.sh`、`releases/latest/memory-plugin-marketplace.zip`、`plugins/claude/marketplace.json` 和 `plugins/claude/openviking-memory-<插件版本>.zip`、`plugins/memory-plugins.git`，以及安装站点的版本检查读取的 `releases/latest/channels.json`。
+
+只要推送到 `main` 的提交改动了文档、插件、安装器或 `.github/scripts`，两条流水线就会部署，所以插件改动合入即发布，不需要打 tag，也不需要发 GitHub Release。发布出去的安装器以 `<日期>-<commit>` 作为版本号。发布插件修复时，合入修复并按 `.github/scripts/check-plugin-version-bumps.sh` 的要求升级插件版本；回滚时在 `main` 上 revert 该改动并再次升级版本号。两条流水线也可以在 `main` 上手动触发。
+
+TOS 发布桶仍会随每次发版收到同样的文件，供仍指向它的安装使用，见下文。
+
+### TOS 上的 Memory 插件热修复与回滚
+
+指向 TOS 发布桶的安装读它的稳定路径：`plugins/claude/marketplace.json`（Claude Code）、`plugins/memory-plugins.git`（Codex 和 TraeCode CLI）、`releases/latest/memory-plugin-marketplace.zip`（其他所有宿主）、`releases/latest/channels.json`（安装时的版本解析），以及 `memory-plugin-shared/install.sh` 和 `bootstrap.sh`。workflow 每次运行都从所给 tag 对应的 commit 构建这全部内容。
+
+在那里不发产品版本、单独发布插件热修复：
+
+1. 合入修复，并按 `.github/scripts/check-plugin-version-bumps.sh` 的要求升级插件版本。Claude Code 只在版本号变化时更新已安装的插件。
+2. 在“上一个正式版本 + 修复”的 commit 上打 tag，例如从上一个 `vX.Y.Z` tag 拉分支并 cherry-pick 修复。tag 不要以 `v` 开头，例如 `memory-plugins-YYYY.M.D`，也不要为它发布 GitHub Release：推送 `v*.*.*` tag 会触发 Docker workflow，发布 Release 会触发主包发版 workflow，主包版本号也从 `v*` tag 解析。
+3. 推送 tag，然后运行 `gh workflow run release-tos.yml -f tag=<tag> -f update_latest=true`。
+
+回滚时运行 `gh workflow run release-tos.yml -f tag=<上一个正常的 tag> -f update_latest=true`。workflow 定义取自默认分支，但它调用的脚本来自 tag 的 checkout，所以只能重新发布已经包含当前发布脚本的 tag；要退回更早的插件代码，按热修复流程发布。
+
+两种操作完成后，Claude Code（URL marketplace）在下次检查更新时生效，版本号变低也算更新。Codex 在下次启动时生效，TraeCode CLI 在执行 `trae-cli plugin marketplace upgrade` 时生效。Cursor、TRAE、TRAE CN、ZCode、Kimi Code、OpenCode、pi，以及使用本地目录 marketplace 的 Claude Code，需要重新运行安装器才会变化。dsh 从 npm 安装，不受影响。
 
 ## Python SDK 发版流程
 

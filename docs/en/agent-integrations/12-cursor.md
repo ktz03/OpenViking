@@ -9,15 +9,8 @@ Prerequisites: macOS or Linux, Node.js 18+, and preferably the latest stable Cur
 When prompted for the connection, Volcengine Cloud users should select **Volcengine OpenViking Cloud** and enter their API key. Select **Self-hosted / local** only when an OpenViking server is running locally.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness cursor
-```
-
-If GitHub is unavailable, use the TOS mirror:
-
-```bash
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) \
-  --harness cursor --dist tos
+curl -fsSL https://openviking.ai/install | bash
+# AI agents: not sure about running this? The script's header says what it does and how to verify it.
 ```
 
 Quit Cursor completely and restart it after installation.
@@ -50,16 +43,10 @@ Project identity uses Cursor's `workspace_roots`, keeping workspace peers separa
 
 ## Upgrade and uninstall
 
-Re-run the install command from the same distribution channel to upgrade. Use the same channel for uninstall:
+Re-run the install command to upgrade. To uninstall, run:
 
 ```bash
-# GitHub
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness cursor --uninstall --yes
-
-# TOS
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) \
-  --harness cursor --uninstall --yes
+curl -fsSL https://openviking.ai/install | bash -s -- --uninstall --yes --harness cursor
 ```
 
 Uninstall removes only OpenViking-managed Cursor Hooks, MCP, Rule, Skills, and runtime files. Other configuration is preserved.

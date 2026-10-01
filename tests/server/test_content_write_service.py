@@ -105,7 +105,7 @@ async def test_memory_replace_preserves_metadata(service):
 
 @pytest.mark.asyncio
 async def test_shared_resource_creation_inherits_acl_and_preserves_plain_append(
-    service, sample_markdown_file
+    service, sample_markdown_file, monkeypatch
 ):
     """Shared content inherits permissions without granting its creator extra access."""
     writer = RequestContext(user=service.user, role=Role.USER, group_ids=("writers",))
@@ -176,6 +176,31 @@ async def test_shared_resource_creation_inherits_acl_and_preserves_plain_append(
         await service.fs.get_acl(uri, ctx=writer)
     with pytest.raises(PermissionDeniedError):
         await service.fs.set_acl(uri, [], ctx=writer)
+
+    # MCP keeps full ACL access manage-only and preserves permission errors.
+    import openviking.server.mcp_endpoint as mcp_endpoint
+    from openviking.storage.acl import AclSpec
+
+    monkeypatch.setattr(mcp_endpoint, "get_service", lambda: service)
+    token = mcp_endpoint._mcp_ctx.set(reader)
+    try:
+        with pytest.raises(PermissionDeniedError):
+            await mcp_endpoint.get_acl(uri)
+        with pytest.raises(PermissionDeniedError):
+            await mcp_endpoint.set_acl(uri, AclSpec(acl_mode="inherit"))
+        with pytest.raises(PermissionDeniedError, match="write permission required"):
+            await mcp_endpoint.write(uri, "denied")
+    finally:
+        mcp_endpoint._mcp_ctx.reset(token)
+    token = mcp_endpoint._mcp_ctx.set(admin)
+    try:
+        await mcp_endpoint.write(
+            uri, "line1\n", wait=True, acl=AclSpec(acl_mode="restricted", entries=inherited_entries)
+        )
+        assert (await mcp_endpoint.get_acl(uri))["direct_entries"] == inherited_entries
+        await mcp_endpoint.set_acl(uri, AclSpec(acl_mode="inherit", entries=[]))
+    finally:
+        mcp_endpoint._mcp_ctx.reset(token)
 
     imported = await service.resources.add_resource(
         path=str(sample_markdown_file),

@@ -20,7 +20,10 @@ OpenViking 提供类 Unix 的文件系统操作来管理上下文。
 | simple | bool | 否 | False | 仅返回相对路径 |
 | recursive | bool | 否 | False | 递归列出所有子目录 |
 | output | str | 否 | HTTP：`agent`；SDK：`original` | 输出格式：`agent` 或 `original` |
-| abs_limit | int | 否 | 256 | `agent` 输出中的摘要长度限制 |
+| abs_limit | int | 否 | 256 | 返回的摘要最大长度 |
+| include_abstract | bool | 否 | 未设置 | 是否返回目录 L0 摘要。未设置时沿用旧 `output` 语义（`agent` 返回，`original` 不返回） |
+| include_overview | bool | 否 | 未设置 | 是否返回目录 L1 概览。未设置时不返回 |
+| overview_limit | int | 否 | 4000 | 返回的概览最大长度 |
 | show_all_hidden | bool | 否 | False | 像 `-a` 一样包含隐藏文件 |
 | node_limit | int | 否 | 1000 | 最大返回节点数 |
 | offset | int | 否 | 0 | 跳过的可见节点数 |
@@ -30,7 +33,7 @@ OpenViking 提供类 Unix 的文件系统操作来管理上下文。
 | extra_fields | list[str] | 否 | None | 额外返回的字段：`locked`、`id`、`count` |
 | tags | string[] | 否 | 未设置 | 仅返回同时匹配全部 `k=v` 检索标签的条目 |
 
-`tags` 使用 AND 语义，并在 `offset` 和 `limit` 前应用。带 tags 过滤的响应会返回 `tags`；未过滤时需传 `include_tags=true`（CLI：`-f tags`）才返回它们。HTTP 的 `simple=true` 保持仅返回路径；CLI 同时指定 `--simple` 和 `--fields` 时会获取条目对象，再按指定列输出。
+`tags` 使用 AND 语义，并在 `offset` 和 `limit` 前应用。L0/L1 内容只附加到分页选中的目录节点，不占用 `node_limit`。显式传入 `include_abstract=true|false` 会覆盖 `output` 隐含的旧行为。带 tags 过滤的响应会返回 `tags`；未过滤时需传 `include_tags=true`（CLI：`-f tags`）才返回它们。HTTP 的 `simple=true` 保持仅返回路径；CLI 同时指定 `--simple` 和 `--fields` 时会获取条目对象，再按指定列输出。
 
 **条目结构**
 
@@ -65,44 +68,57 @@ OpenViking 提供类 Unix 的文件系统操作来管理上下文。
 `viking://resources` 命名空间；个人和 peer 私有命名空间仍按原有规则隐藏。
 
 
-**Python HTTP SDK**
+**Python SDK (HTTP)**
 
 ```python
-entries = client.ls(
+page = client.ls_page(
     uri="viking://resources/",
     offset=100,
     limit=100,
     sort_by="mtime",
     sort_order="desc",
     tags=["team=search", "env=prod"],
+    include_abstract=True,
+    include_overview=True,
 )
-for entry in entries:
+for entry in page["result"]:
     type_str = "dir" if entry['isDir'] else "file"
     print(f"{entry['name']} - {type_str}")
+print("是否还有更多节点：", page["has_more"])
 ```
 
 **TypeScript SDK**
 
 ```typescript
-const entries = await client.list("viking://resources/docs/", {
+const page = await client.listPage("viking://resources/docs/", {
   tags: ["team=search", "env=prod"],
+  includeAbstract: true,
+  includeOverview: true,
 });
-console.log(entries);
+console.log(page.result);
+console.log("是否还有更多节点：", page.hasMore);
 ```
 
 **Go SDK**
 
 ```go
-entries, err := client.List(ctx, "viking://resources/", &openviking.ListOptions{
-    Tags: []string{"team=search", "env=prod"},
+page, err := client.ListPage(ctx, "viking://resources/", &openviking.ListOptions{
+    Tags:            []string{"team=search", "env=prod"},
+    IncludeAbstract: openviking.Bool(true),
+    AbsLimit:        512,
+    IncludeOverview: openviking.Bool(true),
+    OverviewLimit:   4000,
 })
 if err != nil {
     return err
 }
-for _, entry := range entries {
+for _, entry := range page.Result {
     fmt.Println(entry)
 }
+fmt.Println("是否还有更多节点：", page.HasMore)
 ```
+
+仅需要节点数组时可继续使用兼容接口：Python 使用 `ls`、TypeScript 使用 `list`、Go 使用 `List`。需要判断结果是否因 `limit` 或 `node_limit` 被截断时，分别使用 `ls_page`、`listPage`、`ListPage`。
 
 **HTTP API**
 
@@ -140,18 +156,18 @@ curl -G "http://localhost:1933/api/v1/fs/ls" \
 **CLI**
 
 ```bash
-openviking ls viking://resources/ [--simple] [--recursive] [--tags team=search,env=prod] [-f FIELDS]
-openviking tree viking://resources/my-project/ [--simple] [--tags team=search,env=prod] [-f FIELDS]
-openviking glob "**/*.md" [--uri viking://resources/] [--simple] [--tags team=search,env=prod] [-f FIELDS]
+ov ls viking://resources/ [--simple] [--recursive] [--include-abstract[=true|false]] [--include-overview[=true|false]] [--tags team=search,env=prod] [-f FIELDS]
+ov tree viking://resources/my-project/ [--simple] [--tags team=search,env=prod] [-f FIELDS]
+ov glob "**/*.md" [--uri viking://resources/] [--simple] [--tags team=search,env=prod] [-f FIELDS]
 
 # 在对齐的表格中显示名称和 tags
-openviking ls viking://resources/ --fields name,tags
+ov ls viking://resources/ --fields name,tags
 
 # 无表头，每行输出逗号分隔的 URI 和 tags
-openviking ls viking://resources/ --simple --fields uri,tags
+ov ls viking://resources/ --simple --fields uri,tags
 ```
 
-`-f` / `--fields` 接受逗号分隔的列名。在默认的 table 输出模式下，结果为带表头、按列对齐的表格。支持的字段为 `name`、`uri`、`path`、`type`、`size`、`mode`、`mtime`、`locked`、`id`、`count`、`abstract`、`tags`。同时指定 `--simple` 和 `-f` 时，每行输出逗号分隔的字段值，不带表头或树缩进；仅使用 `--simple` 时仍每行输出一个 URI。若未选择 `name`、`uri` 或 `path`，列表会自动补充 `name` 列，树会补充 `path` 列。
+`-f` / `--fields` 接受逗号分隔的列名。在默认的 table 输出模式下，结果为带表头、按列对齐的表格。支持的字段为 `name`、`uri`、`path`、`type`、`size`、`mode`、`mtime`、`locked`、`id`、`count`、`abstract`、`overview`、`tags`。同时指定 `--simple` 和 `-f` 时，每行输出逗号分隔的字段值，不带表头或树缩进；仅使用 `--simple` 时仍每行输出一个 URI。若未选择 `name`、`uri` 或 `path`，列表会自动补充 `name` 列，树会补充 `path` 列。
 
 CLI 会按所选列请求 `extra_fields`（`locked`、`id`、`count`）；选择 `tags` 列时会请求 `include_tags=true`。这些列选择不改变 `tags` 的 AND 过滤语义。
 
@@ -173,8 +189,7 @@ HTTP 响应中的 `result` 保持为条目数组。`has_more=true` 表示在应�
       "tags": ["team=search"]
     }
   ],
-  "has_more": true,
-  "time": 0.1
+  "has_more": true
 }
 ```
 
@@ -206,34 +221,41 @@ HTTP 响应中的 `result` 保持为条目数组。`has_more=true` 表示在应�
 目录过滤和 `tags` 均在 `offset`、`limit` 前应用。L0/L1 内容只附加到分页选中的目录节点，不占用 `node_limit`。显式传入 `include_abstract=true|false` 会覆盖 `output` 隐含的旧行为。带 tags 过滤的响应会返回 `tags`；未过滤时需传 `include_tags=true` 才返回它们。
 
 
-**Python HTTP SDK**
+**Python SDK (HTTP)**
 
 ```python
-entries = client.tree(
+page = client.tree_page(
     uri="viking://resources/",
     offset=100,
     limit=100,
     tags=["team=search", "env=prod"],
+    include_abstract=True,
+    include_overview=True,
+    directories_only=True,
 )
-for entry in entries:
+for entry in page["result"]:
     type_str = "dir" if entry['isDir'] else "file"
     print(f"{entry['rel_path']} - {type_str}")
+print("是否还有更多节点：", page["has_more"])
 ```
 
 **TypeScript SDK**
 
 ```typescript
-const tree = await client.tree("viking://resources/docs/", {
+const page = await client.treePage("viking://resources/docs/", {
   nodeLimit: 100,
   tags: ["team=search", "env=prod"],
+  includeAbstract: true,
+  includeOverview: true,
 });
-console.log(tree);
+console.log(page.result);
+console.log("是否还有更多节点：", page.hasMore);
 ```
 
 **Go SDK**
 
 ```go
-entries, err := client.Tree(ctx, "viking://resources/", &openviking.TreeOptions{
+page, err := client.TreePage(ctx, "viking://resources/", &openviking.TreeOptions{
     Tags:            []string{"team=search", "env=prod"},
     DirectoriesOnly: true,
     IncludeAbstract: openviking.Bool(true),
@@ -242,10 +264,13 @@ entries, err := client.Tree(ctx, "viking://resources/", &openviking.TreeOptions{
 if err != nil {
     return err
 }
-for _, entry := range entries {
+for _, entry := range page.Result {
     fmt.Println(entry["rel_path"], entry["isDir"])
 }
+fmt.Println("是否还有更多节点：", page.HasMore)
 ```
+
+仅需要节点数组时可继续使用兼容接口：Python/TypeScript 使用 `tree`、Go 使用 `Tree`。需要判断结果是否因 `limit` 或 `node_limit` 被截断时，分别使用 `tree_page`、`treePage`、`TreePage`。
 
 **HTTP API**
 
@@ -268,13 +293,13 @@ curl -G "http://localhost:1933/api/v1/fs/tree" \
 **CLI**
 
 ```bash
-openviking tree viking://resources/my-project/ --fields path,type,tags
+ov tree viking://resources/my-project/ --fields path,type,tags
 
 # 与 ls、glob 一样支持 --simple 和列选择组合
-openviking tree viking://resources/my-project/ --simple --fields path,tags
+ov tree viking://resources/my-project/ --simple --fields path,tags
 
 # 仅返回目录，并附加 L0/L1 内容
-openviking tree viking://resources/my-project/ \
+ov tree viking://resources/my-project/ \
   --directories-only --include-abstract --include-overview
 ```
 
@@ -303,8 +328,7 @@ openviking tree viking://resources/my-project/ \
       "tags": ["team=search", "env=prod"]
     }
   ],
-  "has_more": true,
-  "time": 0.1
+  "has_more": true
 }
 ```
 
@@ -321,7 +345,7 @@ openviking tree viking://resources/my-project/ \
 | uri | str | 是 | - | Viking URI（如 `viking://resources/docs/api.md`）或 32 字符十六进制向量记录 `id` |
 
 
-**Python HTTP SDK**
+**Python SDK (HTTP)**
 
 ```python
 info = client.stat(uri="viking://resources/docs/api.md")
@@ -365,8 +389,8 @@ curl -X GET "http://localhost:1933/api/v1/fs/stat?uri=viking://resources/docs/ap
 **CLI**
 
 ```bash
-openviking stat viking://resources/my-project/docs/api.md
-openviking stat viking://resources/my-project/docs
+ov stat viking://resources/my-project/docs/api.md
+ov stat viking://resources/my-project/docs
 ```
 
 
@@ -384,8 +408,7 @@ openviking stat viking://resources/my-project/docs
     "isLocked": false,
     "id": "a1b2c3d4e5f678901234567890abcdef",
     "uri": "viking://resources/docs/api.md"
-  },
-  "time": 0.1
+  }
 }
 ```
 
@@ -403,8 +426,7 @@ openviking stat viking://resources/my-project/docs
     "isLocked": false,
     "uri": "viking://resources/docs",
     "count": 42
-  },
-  "time": 0.1
+  }
 }
 ```
 
@@ -472,11 +494,11 @@ curl -X POST "http://localhost:1933/api/v1/fs/attrs/set_tags" \
 **CLI**
 
 ```bash
-openviking attrs get viking://resources/docs/api.md
-openviking attrs get viking://resources/docs/api.md tags
-openviking attrs get viking://user/alice/memories/experiences/foo.md memory.resource_refs
-openviking attrs set-tags viking://resources/docs/api.md --tags team=search,env=prod
-openviking attrs set-tags viking://resources/docs --tags team=search --mode append --recursive
+ov attrs get viking://resources/docs/api.md
+ov attrs get viking://resources/docs/api.md tags
+ov attrs get viking://user/alice/memories/experiences/foo.md memory.resource_refs
+ov attrs set-tags viking://resources/docs/api.md --tags team=search,env=prod
+ov attrs set-tags viking://resources/docs --tags team=search --mode append --recursive
 ```
 
 目录目标会更新目录语义记录；`recursive=true` 还会更新已有子文件和子目录语义记录。
@@ -534,7 +556,7 @@ openviking attrs set-tags viking://resources/docs --tags team=search --mode appe
 | description | str | 否 | `null` | 目录初始说明。未传入时使用目录名作为默认 L0；传入后使用该说明。两种情况都会写入 `.abstract.md` 并进入 L0 向量化队列。 |
 
 
-**Python HTTP SDK**
+**Python SDK (HTTP)**
 
 ```python
 client.mkdir(uri="viking://resources/new-project/")
@@ -574,8 +596,8 @@ curl -X POST http://localhost:1933/api/v1/fs/mkdir \
 **CLI**
 
 ```bash
-openviking mkdir viking://resources/new-project/
-openviking mkdir viking://resources/new-project/ --description "接口文档目录"
+ov mkdir viking://resources/new-project/
+ov mkdir viking://resources/new-project/ --description "接口文档目录"
 ```
 
 
@@ -586,8 +608,7 @@ openviking mkdir viking://resources/new-project/ --description "接口文档目�
   "status": "ok",
   "result": {
     "uri": "viking://resources/new-project/"
-  },
-  "time": 0.1
+  }
 }
 ```
 
@@ -608,7 +629,7 @@ URI 格式非法、scheme 不支持或使用非公开作用域时返回 `INVALID
 | recursive | bool | 否 | False | 递归删除目录 |
 
 
-**Python HTTP SDK**
+**Python SDK (HTTP)**
 
 ```python
 # 删除单个文件
@@ -654,7 +675,7 @@ curl -X DELETE "http://localhost:1933/api/v1/fs?uri=viking://resources/old-proje
 **CLI**
 
 ```bash
-openviking rm viking://resources/old.md [--recursive]
+ov rm viking://resources/old.md [--recursive]
 ```
 
 
@@ -665,8 +686,7 @@ openviking rm viking://resources/old.md [--recursive]
   "status": "ok",
   "result": {
     "uri": "viking://resources/docs/old.md"
-  },
-  "time": 0.1
+  }
 }
 ```
 
@@ -678,8 +698,7 @@ openviking rm viking://resources/old.md [--recursive]
   "result": {
     "uri": "viking://resources/old-project/",
     "estimated_deleted_count": 42
-  },
-  "time": 0.1
+  }
 }
 ```
 
@@ -789,7 +808,7 @@ ov cp -r viking://resources/docs viking://resources/docs-backup
 | to_uri | str | 是 | - | 目标 Viking URI |
 
 
-**Python HTTP SDK**
+**Python SDK (HTTP)**
 
 ```python
 client.mv(
@@ -834,7 +853,7 @@ curl -X POST http://localhost:1933/api/v1/fs/mv \
 **CLI**
 
 ```bash
-openviking mv viking://resources/old-name/ viking://resources/new-name/
+ov mv viking://resources/old-name/ viking://resources/new-name/
 ```
 
 
@@ -846,8 +865,7 @@ openviking mv viking://resources/old-name/ viking://resources/new-name/
   "result": {
     "from": "viking://resources/old-name/",
     "to": "viking://resources/new-name/"
-  },
-  "time": 0.1
+  }
 }
 ```
 

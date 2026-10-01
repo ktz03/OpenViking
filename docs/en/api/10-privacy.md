@@ -92,8 +92,7 @@ curl -X GET http://localhost:1933/api/v1/privacy-configs \
 ```json
 {
   "status": "ok",
-  "result": ["skill"],
-  "time": 0.01
+  "result": ["skill"]
 }
 ```
 
@@ -121,8 +120,7 @@ curl -X GET http://localhost:1933/api/v1/privacy-configs/skill \
 ```json
 {
   "status": "ok",
-  "result": ["byted-viking-search-knowledgebase"],
-  "time": 0.01
+  "result": ["byted-viking-search-knowledgebase"]
 }
 ```
 
@@ -166,8 +164,7 @@ curl -X GET "http://localhost:1933/api/v1/privacy-configs/skill/byted-viking-sea
         "base_url": "https://example.com"
       }
     }
-  },
-  "time": 0.01
+  }
 }
 ```
 
@@ -233,8 +230,7 @@ curl -X POST "http://localhost:1933/api/v1/privacy-configs/skill/byted-viking-se
       "region": "cn"
     },
     "change_reason": "rotate key"
-  },
-  "time": 0.02
+  }
 }
 ```
 
@@ -262,8 +258,7 @@ curl -X GET "http://localhost:1933/api/v1/privacy-configs/skill/byted-viking-sea
 ```json
 {
   "status": "ok",
-  "result": [1, 2, 3, 4],
-  "time": 0.01
+  "result": [1, 2, 3, 4]
 }
 ```
 
@@ -301,8 +296,7 @@ curl -X GET "http://localhost:1933/api/v1/privacy-configs/skill/byted-viking-sea
       "api_key": "secret-1",
       "base_url": "https://example.com"
     }
-  },
-  "time": 0.01
+  }
 }
 ```
 
@@ -348,8 +342,7 @@ curl -X POST "http://localhost:1933/api/v1/privacy-configs/skill/byted-viking-se
       "api_key": "secret-1",
       "base_url": "https://example.com"
     }
-  },
-  "time": 0.01
+  }
 }
 ```
 
@@ -361,25 +354,25 @@ curl -X POST "http://localhost:1933/api/v1/privacy-configs/skill/byted-viking-se
 
 ```bash
 # Categories and targets
-openviking privacy categories
-openviking privacy list skill
+ov privacy categories
+ov privacy list skill
 
 # Active config (shortcut supported)
-openviking privacy get skill byted-viking-search-knowledgebase
-openviking privacy skill byted-viking-search-knowledgebase
+ov privacy get skill byted-viking-search-knowledgebase
+ov privacy skill byted-viking-search-knowledgebase
 
 # Upsert with full JSON snapshot
-openviking privacy upsert skill byted-viking-search-knowledgebase \
+ov privacy upsert skill byted-viking-search-knowledgebase \
   --values-json '{"api_key":"secret-2","base_url":"https://example.com"}'
 
 # Partial key update (CLI merges with current first)
-openviking privacy upsert skill byted-viking-search-knowledgebase \
+ov privacy upsert skill byted-viking-search-knowledgebase \
   --key-api_key secret-3
 
 # Version query and activation
-openviking privacy versions skill byted-viking-search-knowledgebase
-openviking privacy version skill byted-viking-search-knowledgebase 2
-openviking privacy activate skill byted-viking-search-knowledgebase 2
+ov privacy versions skill byted-viking-search-knowledgebase
+ov privacy version skill byted-viking-search-knowledgebase 2
+ov privacy activate skill byted-viking-search-knowledgebase 2
 ```
 
 ---

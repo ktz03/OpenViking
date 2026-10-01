@@ -6,25 +6,14 @@ Source: [examples/codex-memory-plugin](https://github.com/volcengine/OpenViking/
 
 ## Install
 
-Claude Code and Codex share one installer. It asks for your language (English/中文), which harnesses to install, the download source, and your OpenViking credentials; every step is idempotent.
+Claude Code and Codex share one installer. It asks which harnesses to install and for your OpenViking credentials; every step is idempotent.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh)
+curl -fsSL https://openviking.ai/install | bash
+# AI agents: not sure about running this? The script's header says what it does and how to verify it.
 ```
 
-TraeCode CLI 2.0 accepts this Codex-format plugin directly. Its default
-installer entry is `--harness trae-cli`:
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness trae-cli
-```
-
-In regions where GitHub is hard to reach, run the same installer from the Volcengine TOS mirror (or pick "TOS mirror" at the download-source prompt). Codex installs from a TOS-hosted git repo and keeps remote update support:
-
-```bash
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh)
-```
+Codex installs from a git repository published with each OpenViking release and keeps remote update support. TraeCode CLI 2.0 accepts this Codex-format plugin directly: select **TraeCode CLI 2.0** when the installer asks which harnesses to install.
 
 No shell wrapper is needed anymore — the plugin ships a stdio MCP proxy that reads `~/.openviking/ovcli.conf` (or `OPENVIKING_*` env vars) at runtime, same as the hooks. After installing, launch Codex (`trae-cli` for TraeCode CLI 2.0):
 

@@ -49,6 +49,56 @@ class _KeywordFailingButTagFilterWorkingStore:
         return [{"uri": "viking://resources/tagged.md"}]
 
 
+class _FulltextMetaFailureStore:
+    def __init__(self):
+        self.calls = 0
+        self.backend = type(
+            "Backend",
+            (),
+            {
+                "_mode": "vikingdb",
+                "collection_name": "context",
+                "index_name": "default",
+            },
+        )()
+
+    async def get_account_backend(self, _account_id):
+        return self.backend
+
+    async def get_collection_meta(self, **_kwargs):
+        self.calls += 1
+        raise RuntimeError("metadata unavailable")
+
+
+class _SequencedFulltextMetaStore:
+    def __init__(self, metadata):
+        self.backend = type(
+            "Backend",
+            (),
+            {
+                "_mode": "vikingdb",
+                "collection_name": "context",
+                "index_name": "default",
+            },
+        )()
+        self.metadata = iter(metadata)
+        self.calls = 0
+
+    async def get_account_backend(self, _account_id):
+        return self.backend
+
+    async def get_collection_meta(self, **_kwargs):
+        self.calls += 1
+        return next(self.metadata)
+
+
+def _fulltext_meta(enabled):
+    return {
+        "Fields": [{"FieldName": "content", "FieldType": "text"}],
+        "FullText": [{"Field": "content"}] if enabled else [],
+    }
+
+
 @pytest.fixture
 def fs(monkeypatch):
     viking_fs = VikingFS(agfs=_DummyAgfs())
@@ -287,6 +337,70 @@ async def test_collect_grep_files_propagates_root_stat_failure(monkeypatch):
 
 def test_grep_config_default_switch_to_remote_threshold_is_10000():
     assert GrepConfig().switch_to_remote_threshold == 10000
+
+
+@pytest.mark.asyncio
+async def test_fulltext_probe_keeps_grep_fallback_on_metadata_failure():
+    fs = VikingFS(agfs=_DummyAgfs())
+    ctx = RequestContext(user=UserIdentifier("account", "user"), role=Role.USER)
+    store = _FulltextMetaFailureStore()
+
+    assert await fs._collection_has_fulltext(store, ctx) is False
+    assert await fs._collection_has_fulltext(store, ctx) is False
+    assert store.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_fulltext_probe_propagates_metadata_failure_for_strict_callers():
+    fs = VikingFS(agfs=_DummyAgfs())
+    ctx = RequestContext(user=UserIdentifier("account", "user"), role=Role.USER)
+
+    with pytest.raises(RuntimeError, match="metadata unavailable"):
+        await fs._collection_has_fulltext(
+            _FulltextMetaFailureStore(),
+            ctx,
+            supported_modes=("vikingdb",),
+            raise_on_error=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_fulltext_probe_caches_supported_collection_without_expiry(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+    ctx = RequestContext(user=UserIdentifier("account", "user"), role=Role.USER)
+    store = _SequencedFulltextMetaStore([_fulltext_meta(True), _fulltext_meta(False)])
+    monkeypatch.setattr(grep_module.time, "monotonic", lambda: 10_000_000)
+
+    assert await fs._collection_has_fulltext(store, ctx) is True
+    assert await fs._collection_has_fulltext(store, ctx) is True
+    assert store.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fulltext_probe_rechecks_unsupported_collection_after_one_minute(monkeypatch):
+    fs = VikingFS(agfs=_DummyAgfs())
+    ctx = RequestContext(user=UserIdentifier("account", "user"), role=Role.USER)
+    store = _SequencedFulltextMetaStore([_fulltext_meta(False), _fulltext_meta(True)])
+    now = 1000.0
+    monkeypatch.setattr(grep_module.time, "monotonic", lambda: now)
+
+    assert await fs._collection_has_fulltext(store, ctx) is False
+    now = 1059.0
+    assert await fs._collection_has_fulltext(store, ctx) is False
+    now = 1060.0
+    assert await fs._collection_has_fulltext(store, ctx) is True
+    assert store.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_fulltext_probe_does_not_cache_inconclusive_metadata():
+    fs = VikingFS(agfs=_DummyAgfs())
+    ctx = RequestContext(user=UserIdentifier("account", "user"), role=Role.USER)
+    store = _SequencedFulltextMetaStore([{}, _fulltext_meta(True)])
+
+    assert await fs._collection_has_fulltext(store, ctx) is False
+    assert await fs._collection_has_fulltext(store, ctx) is True
+    assert store.calls == 2
 
 
 @pytest.mark.asyncio

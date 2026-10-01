@@ -658,7 +658,7 @@ class LegacyAPIKeyManager:
                 conflict_type="account_registry_busy",
             ) from exc
         try:
-            accounts_data = await self._read_json(ACCOUNTS_PATH) or {"accounts": {}}
+            accounts_data = await self._read_accounts_for_update()
             persisted_accounts = accounts_data.setdefault("accounts", {})
             for account_id in normalized:
                 if account_id not in persisted_accounts:
@@ -1441,6 +1441,14 @@ class LegacyAPIKeyManager:
                 )
         self._prefix_index = prefix_index
 
+    async def _read_accounts_for_update(self) -> dict:
+        data = await self._read_json(ACCOUNTS_PATH)
+        if data is None:
+            raise FailedPreconditionError(
+                "Account registry is missing; refusing to overwrite it with account changes."
+            )
+        return data
+
     async def _save_accounts_json(
         self,
         *,
@@ -1458,7 +1466,7 @@ class LegacyAPIKeyManager:
                 conflict_type="account_registry_busy",
             ) from exc
         try:
-            data = await self._read_json(ACCOUNTS_PATH) or {"accounts": {}}
+            data = await self._read_accounts_for_update()
             accounts = data.setdefault("accounts", {})
             for account_id in reject_existing_account_ids or set():
                 if account_id in accounts:

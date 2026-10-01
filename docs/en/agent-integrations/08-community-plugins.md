@@ -20,15 +20,8 @@ ZCode does not expose `PreCompact`, `SessionEnd`, or subagent lifecycle hooks. T
 Prerequisites: Node.js 18+, a running OpenViking server, and ZCode.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness zcode
-```
-
-Use the TOS mirror where GitHub is unavailable:
-
-```bash
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) \
-  --harness zcode --dist tos
+curl -fsSL https://openviking.ai/install | bash
+# AI agents: not sure about running this? The script's header says what it does and how to verify it.
 ```
 
 The installer detects `~/.zcode/` or the `zcode` binary, installs the runtime under `~/.openviking/agent-integrations/zcode/`, and merges hooks and MCP configuration into `~/.zcode/cli/config.json`.
@@ -43,7 +36,7 @@ After restarting ZCode, verify that:
 | Hooks not firing | Hook configuration is disabled or stale | Re-run the installer and restart ZCode |
 | Recall returns nothing | OpenViking is unavailable or has not extracted memories yet | Check `curl http://127.0.0.1:1933/health` and wait for extraction |
 | MCP tools not appearing | The MCP proxy failed to start | Check the absolute `mcp.servers.openviking` command in `~/.zcode/cli/config.json` |
-| Duplicate captures | An older installation left duplicate hook entries | Run `install.sh --harness zcode --uninstall`, then reinstall |
+| Duplicate captures | An older installation left duplicate hook entries | Run `curl -fsSL https://openviking.ai/install \| bash -s -- --uninstall --yes --harness zcode`, then reinstall |
 
 Implementation details and currently verified ZCode assumptions are documented in the plugin's [README](https://github.com/volcengine/OpenViking/tree/main/examples/agent-hook-plugin) and [DESIGN.md](https://github.com/volcengine/OpenViking/blob/main/examples/agent-hook-plugin/DESIGN.md).
 
@@ -65,22 +58,19 @@ transcript decoding, output formatting, and commit policy:
 Prerequisites: Node.js 18+, a running OpenViking server, and Kimi Code CLI.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness kimicode
-```
-
-Use the TOS mirror where GitHub is unavailable:
-
-```bash
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) \
-  --harness kimicode --dist tos
+curl -fsSL https://openviking.ai/install | bash
+# AI agents: not sure about running this? The script's header says what it does and how to verify it.
 ```
 
 The installer assembles a self-contained runtime under
 `$KIMI_CODE_HOME/plugins/managed/openviking-memory/` (default Kimi home:
 `~/.kimi-code/`), then updates only the `openviking-memory` entry in
 `plugins/installed.json`. Existing plugin records are preserved. Re-run the
-same command to upgrade, or add `--uninstall` to remove only this plugin.
+same command to upgrade. To remove only this plugin:
+
+```bash
+curl -fsSL https://openviking.ai/install | bash -s -- --uninstall --yes --harness kimicode
+```
 
 The verified host contract and version are recorded in
 [`hosts/kimicode/DESIGN.md`](https://github.com/volcengine/OpenViking/blob/main/examples/agent-hook-plugin/hosts/kimicode/DESIGN.md).

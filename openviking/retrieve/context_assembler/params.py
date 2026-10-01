@@ -7,6 +7,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Mapping, Optional, Sequence, Tuple, Union
 
+from openviking.core.retrieval_types import SearchType
+
 Detail = Literal["abstract", "overview", "full"]
 # "auto" no longer selects a strategy; it is accepted as a synonym for "unset".
 DetailRequest = Union[Literal["auto", "abstract", "overview", "full"], Dict[str, Detail]]
@@ -120,10 +122,12 @@ class AssembleParams:
     """Resolved request contract for one context assembly run."""
 
     query: str = ""
+    search_type: SearchType = "semantic"
     image_url: Optional[str] = None
     limit: int = DEFAULT_LIMIT
     score_threshold: Optional[float] = None
     filter: Optional[Dict[str, Any]] = None
+    events_time_decay_protection: Optional[str] = None
 
     session_id: Optional[str] = None
     query_expansion: Literal["off", "auto"] = "auto"

@@ -6,7 +6,7 @@
 
 ### abstract()
 
-读取 L0 摘要（约 100 token 的概要），不包括 okf 文件头。
+读取 L0 摘要，不包括 OKF 文件头。目录摘要的默认字符上限为 256；字符数不等于 token 数。
 
 **参数**
 
@@ -54,7 +54,7 @@ curl -X GET "http://localhost:1933/api/v1/content/abstract?uri=viking://resource
 **CLI**
 
 ```bash
-openviking abstract viking://resources/docs/
+ov abstract viking://resources/docs/
 ```
 
 
@@ -63,8 +63,7 @@ openviking abstract viking://resources/docs/
 ```json
 {
   "status": "ok",
-  "result": "Documentation for the project API, covering authentication, endpoints...",
-  "time": 0.1
+  "result": "Documentation for the project API, covering authentication, endpoints..."
 }
 ```
 
@@ -119,7 +118,7 @@ curl -X GET "http://localhost:1933/api/v1/content/overview?uri=viking://resource
 **CLI**
 
 ```bash
-openviking overview viking://resources/docs/
+ov overview viking://resources/docs/
 ```
 
 
@@ -128,8 +127,7 @@ openviking overview viking://resources/docs/
 ```json
 {
   "status": "ok",
-  "result": "## docs/\n\nContains API documentation and guides...",
-  "time": 0.1
+  "result": "## docs/\n\nContains API documentation and guides..."
 }
 ```
 
@@ -193,7 +191,7 @@ curl -X GET "http://localhost:1933/api/v1/content/read?uri=viking://resources/do
 **CLI**
 
 ```bash
-openviking read viking://resources/docs/api.md
+ov read viking://resources/docs/api.md
 ```
 
 
@@ -202,8 +200,7 @@ openviking read viking://resources/docs/api.md
 ```json
 {
   "status": "ok",
-  "result": "# API Documentation\n\nFull content of the file...",
-  "time": 0.1
+  "result": "# API Documentation\n\nFull content of the file..."
 }
 ```
 
@@ -298,7 +295,7 @@ curl -X POST "http://localhost:1933/api/v1/content/write" \
 **CLI**
 
 ```bash
-openviking write viking://resources/docs/api.md \
+ov write viking://resources/docs/api.md \
   --content "# Updated API\n\nFresh content." \
   --tags team=search,env=prod \
   --tag-mode replace
@@ -717,18 +714,18 @@ curl -X POST http://localhost:1933/api/v1/content/reindex \
 **CLI**
 
 ```bash
-openviking reindex viking://resources --mode vectors_only \
+ov reindex viking://resources --mode vectors_only \
   --force --tags team=search,env=prod --tag-mode replace
 ```
 
 使用 `--tag-mode clear` 且无需传 `--tags` 即可清空已有标签：
 
 ```bash
-openviking reindex viking://resources --mode vectors_only --tag-mode clear
+ov reindex viking://resources --mode vectors_only --tag-mode clear
 ```
 
 ```bash
-openviking reindex viking://user/default/skills --mode semantic_and_vectors --wait false
+ov reindex viking://user/default/skills --mode semantic_and_vectors --wait false
 ```
 
 **异步响应（`wait=false`）**
@@ -742,8 +739,7 @@ openviking reindex viking://user/default/skills --mode semantic_and_vectors --wa
     "object_type": "resource",
     "status": "accepted",
     "task_id": "task_xxx"
-  },
-  "time": 0.1
+  }
 }
 ```
 

@@ -26,7 +26,7 @@ from pathlib import PurePosixPath
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from urllib.parse import quote
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import (
     AudioContent,
@@ -43,6 +43,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from openviking.core.path_variables import resolve_path_variables
 from openviking.core.retrieval_targets import default_target_directories
+from openviking.core.retrieval_types import SearchType
 from openviking.core.uri_validation import (
     validate_content_target_uri,
     validate_request_viking_uri,
@@ -59,11 +60,14 @@ from openviking.retrieve.skill_results import skill_root_uri
 from openviking.server.auth import (
     _build_request_context,
     _extract_api_key,
+    get_api_key_manager_or_raise,
     normalize_actor_peer_header,
+    registry_watcher_running,
     resolve_identity,
+    should_expose_user_key,
 )
 from openviking.server.dependencies import get_server_config, get_service
-from openviking.server.identity import RequestContext
+from openviking.server.identity import RequestContext, Role
 from openviking.server.local_input_guard import (
     TEMP_FILE_ID_RE,
     is_remote_resource_source,
@@ -75,6 +79,7 @@ from openviking.server.skill_ingest import install_skills
 from openviking.server.temp_upload_store import TempUploadStore
 from openviking.server.upload_token_store import upload_token_store
 from openviking.service.skill_sources import GIT_SKILL_SOURCE_PREFIXES
+from openviking.storage.acl import AclSpec
 from openviking.utils.media_limits import MAX_INLINE_TOOL_RESULT_MEDIA_BYTES
 from openviking.utils.search_filters import (
     SearchContextTypeInput,
@@ -82,6 +87,7 @@ from openviking.utils.search_filters import (
     resolve_context_types,
 )
 from openviking.utils.skill_processor import SkillProcessor
+from openviking.utils.time_decay import validate_event_time_decay_request
 from openviking_cli.exceptions import (
     InvalidArgumentError,
     NotFoundError,
@@ -278,8 +284,14 @@ _OPEN_WORLD_DESTRUCTIVE_TOOL_ANNOTATIONS = ToolAnnotations(
 class _MCPToolFailure(str):
     """Mark a returned string as a whole-call tool execution failure."""
 
+    error: OpenVikingError | None = None
 
-def _mcp_failure(message: str) -> _MCPToolFailure:
+
+def _mcp_failure(message: str | OpenVikingError) -> _MCPToolFailure:
+    if isinstance(message, OpenVikingError):
+        result = _MCPToolFailure(f"{message.code}: {message.message}")
+        result.error = message
+        return result
     return _MCPToolFailure(message)
 
 
@@ -288,25 +300,37 @@ def _mcp_error_results(*, structured_output: bool = True):
 
     Apply this above ``@mcp.tool`` so the literal registration remains the
     authoritative tool list. Direct Python calls keep the existing return value.
-    The registered MCP handler converts only ``_MCPToolFailure`` values to
-    ``CallToolResult(isError=True)``.
+    The registered MCP handler preserves business error codes and details and
+    converts failures to ``CallToolResult(isError=True)``.
     """
 
     def decorator(func):
-        registered_tool = mcp._tool_manager.get_tool(func.__name__)
+        registered_tool = next(
+            (tool for tool in mcp._tool_manager.list_tools() if tool.fn is func), None
+        )
         if registered_tool is None:
             raise RuntimeError(f"MCP tool is not registered: {func.__name__}")
 
         @wraps(func)
         async def wire_handler(*args, **kwargs):
-            result = await func(*args, **kwargs)
+            try:
+                result = await func(*args, **kwargs)
+            except OpenVikingError as exc:
+                result = _mcp_failure(exc)
             if not isinstance(result, _MCPToolFailure):
                 return result
 
             message = str(result)
+            structured = {"result": message}
+            if result.error is not None:
+                structured["error"] = {
+                    "code": result.error.code,
+                    "message": result.error.message,
+                    "details": result.error.details,
+                }
             return CallToolResult(
                 content=[TextContent(type="text", text=message)],
-                structuredContent={"result": message} if structured_output else None,
+                structuredContent=structured if structured_output else None,
                 isError=True,
             )
 
@@ -324,6 +348,90 @@ def _mcp_error_results(*, structured_output: bool = True):
     return decorator
 
 
+# -- account directory and resource ACL ------------------------------------
+
+
+@_mcp_error_results()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+async def list_users(
+    context: Context,
+    query: str = "",
+    limit: Annotated[int, Field(ge=1)] = 100,
+    page: Annotated[int, Field(ge=1)] = 1,
+    include_credentials: bool = False,
+) -> dict[str, Any]:
+    """Find users to grant access to in the caller's account. Returns user_id and
+    matching total by default, including for administrators. query matches a
+    substring of user_id. include_credentials=true requires ADMIN or ROOT and
+    returns available credentials; it is forbidden in trusted auth mode.
+    Resource manage permission does not grant account administrator privileges.
+    """
+    ctx = _get_ctx()
+    if include_credentials and ctx.role not in (Role.ADMIN, Role.ROOT):
+        raise PermissionDeniedError("include_credentials requires ADMIN or ROOT role")
+    request = context.request_context.request
+    if include_credentials and not should_expose_user_key(request):
+        raise PermissionDeniedError("Credential disclosure is disabled in trusted auth mode")
+    manager = get_api_key_manager_or_raise(request)
+    if not registry_watcher_running(request):
+        await manager.refresh_account_users_from_store(ctx.account_id)
+    result = manager.get_users_page(
+        ctx.account_id,
+        limit=limit,
+        page=page,
+        query_filter=query,
+        expose_key=include_credentials,
+    )
+    fields = ("user_id", "role", "api_key", "key_prefix") if include_credentials else ("user_id",)
+    return {
+        "users": [{key: user[key] for key in fields if key in user} for user in result["users"]],
+        "total": result["total"],
+    }
+
+
+@_mcp_error_results()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+async def list_groups(context: Context) -> dict[str, Any]:
+    """List group IDs that can be granted resource access in the caller's account.
+    Available to all account users; does not disclose group membership.
+    """
+    ctx = _get_ctx()
+    manager = get_api_key_manager_or_raise(context.request_context.request)
+    await manager.ensure_account_groups_loaded(ctx.account_id)
+    return {
+        "groups": [{"group_id": group["group_id"]} for group in manager.get_groups(ctx.account_id)]
+    }
+
+
+@_mcp_error_results()
+@mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
+async def get_acl(uri: str) -> dict[str, Any]:
+    """Read a shared resource's full ACL (direct, inherited, effective grants).
+    Requires manage permission on that resource, or account ADMIN role.
+    """
+    ctx = _get_ctx()
+    return await get_service().fs.get_acl(_resolve_mcp_workspace_uri(uri, ctx), ctx=ctx)
+
+
+@_mcp_error_results()
+@mcp.tool(annotations=_RETRY_SAFE_DESTRUCTIVE_TOOL_ANNOTATIONS)
+async def set_acl(uri: str, acl: AclSpec) -> dict[str, Any]:
+    """Set a shared resource's ACL; requires manage permission before the change.
+    entries replaces direct grants; omitted entries preserves them. Each entry
+    has principal (user:<id>, group:<id>, or user:*) and level (read/write/manage).
+    acl_mode=inherit adds parent grants; restricted uses only direct grants.
+    Reset with acl={"acl_mode":"inherit","entries":[]}. A restricted ACL can
+    remove your own access. Account ADMIN retains implicit management access.
+    """
+    ctx = _get_ctx()
+    return await get_service().fs.set_acl(
+        _resolve_mcp_workspace_uri(uri, ctx),
+        [entry.to_dict() for entry in acl.entries] if acl.entries is not None else None,
+        ctx=ctx,
+        acl_mode=acl.acl_mode,
+    )
+
+
 # -- find / search ---------------------------------------------------------
 
 
@@ -336,6 +444,7 @@ def _resolve_context_type_filter(
         raise InvalidArgumentError(str(exc)) from exc
 
 
+@_mcp_error_results()
 @mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def find(
     query: str,
@@ -345,8 +454,13 @@ async def find(
     level: Optional[List[int]] = None,
     context_type: Optional[Union[str, List[str]]] = None,
     read_content: bool = False,
+    events_time_decay_protection: Optional[str] = None,
 ) -> str:
     """Fast semantic retrieval without session context. Returns ranked memories, resources, and skills with URI, abstract, and score. context_type="skill" returns one hit per skill package, pointing at its SKILL.md, and without target_uri searches both the user's own and the account-shared skills."""
+    try:
+        validate_event_time_decay_request(events_time_decay_protection)
+    except ValueError as exc:
+        raise InvalidArgumentError(str(exc)) from exc
     service = get_service()
     ctx = _get_ctx()
     context_filter = _resolve_context_type_filter(context_type)
@@ -377,6 +491,7 @@ async def find(
             score_threshold=min_score,
             filter=context_filter,
             level=level,
+            events_time_decay_protection=events_time_decay_protection,
         )
     return await _format_search_result(result, service=service, ctx=ctx, read_content=read_content)
 
@@ -389,9 +504,11 @@ _MCP_CONTEXT_ONLY_ALIASES = {
 }
 
 
+@_mcp_error_results()
 @mcp.tool(annotations=_DESTRUCTIVE_TOOL_ANNOTATIONS)
 async def search(
     query: str,
+    search_type: SearchType = "semantic",
     target_uri: str = "",
     session_id: Optional[str] = None,
     limit: int = 10,
@@ -413,8 +530,9 @@ async def search(
     rewrite: Literal["off", "auto"] = "off",
     rewrite_max_bullets: Annotated[int, Field(ge=1, le=20)] = 6,
     read_content: bool = False,
+    events_time_decay_protection: Optional[str] = None,
 ) -> str:
-    """Deep semantic retrieval with optional session context and intent analysis.
+    """Retrieval with optional session context and intent analysis.
 
     ``mode="list"`` returns ranked memories, resources, and skills with URI,
     abstract, and score. ``mode="context"`` returns an injection-ready,
@@ -422,8 +540,14 @@ async def search(
     detail tiers, cross-turn deduplication, peer scoping, and optional rewriting.
     ``target_uri`` is only supported in list mode.
     """
+    try:
+        validate_event_time_decay_request(events_time_decay_protection)
+    except ValueError as exc:
+        raise InvalidArgumentError(str(exc)) from exc
     service = get_service()
     ctx = _get_ctx()
+    if search_type == "keywords" and not query.strip():
+        raise InvalidArgumentError("query must not be empty when search_type='keywords'")
     context_filter = _resolve_context_type_filter(context_type)
     if mode == "context":
         if read_content:
@@ -448,9 +572,11 @@ async def search(
             ctx=ctx,
             params=AssembleParams(
                 query=query,
+                search_type=search_type,
                 limit=limit,
                 score_threshold=min_score,
                 filter=context_filter,
+                events_time_decay_protection=events_time_decay_protection,
                 session_id=session_id,
                 query_expansion=query_expansion,
                 max_tokens=max_tokens,
@@ -515,6 +641,7 @@ async def search(
         await session.load()
     result = await service.search.search(
         query=query,
+        search_type=search_type,
         ctx=ctx,
         target_uri=target_uri,
         session=session,
@@ -522,6 +649,7 @@ async def search(
         score_threshold=0.35 if min_score is None else min_score,
         filter=context_filter,
         level=level,
+        events_time_decay_protection=events_time_decay_protection,
     )
     return await _format_search_result(result, service=service, ctx=ctx, read_content=read_content)
 
@@ -589,6 +717,8 @@ async def _format_search_result(result, *, service, ctx, read_content: bool = Fa
                 "hit_uri": m.uri,
                 "score": getattr(m, "score", 0.0),
                 "abstract": getattr(m, "abstract", "") or getattr(m, "overview", ""),
+                "origin_score": getattr(m, "origin_score", None),
+                "time_score": getattr(m, "time_score", None),
             }
             # Several files of one skill package can match; keep the best-scored hit.
             previous = seen.get(uri)
@@ -624,6 +754,10 @@ async def _format_search_result(result, *, service, ctx, read_content: bool = Fa
         abstract = (item["abstract"] or "(no abstract)").strip()
         uri = item["uri"]
         line = f"- [{item['type']} {item['score'] * 100:.0f}%] {uri}\n    {abstract}"
+        origin_score = item["origin_score"]
+        time_score = item["time_score"]
+        if origin_score is not None or time_score is not None:
+            line += f"\n    origin_score={origin_score}, time_score={time_score}"
         if uri in contents:
             line += f"\n\n    {contents[uri]}"
         lines.append(line)
@@ -772,7 +906,7 @@ async def read(
                 )
             return resolved_uri, size, None
         except OpenVikingError as exc:
-            return uri, None, _mcp_failure(str(exc))
+            return uri, None, _mcp_failure(exc)
 
     preflight = await asyncio.gather(*[_preflight_one(uri) for uri in uri_list])
     checked: list[tuple[str, Optional[int], Optional[_MCPToolFailure]]] = []
@@ -832,7 +966,7 @@ async def read(
                 )
                 return content
             except OpenVikingError as exc:
-                return _mcp_failure(str(exc))
+                return _mcp_failure(exc)
 
     if len(uri_list) == 1:
         result = await _read_one(uri_list[0], checked[0])
@@ -865,6 +999,7 @@ async def read(
 # -- list ------------------------------------------------------------------
 
 
+@_mcp_error_results()
 @mcp.tool(name="list", annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def ls(
     uri: str = "viking://",
@@ -946,6 +1081,7 @@ def _tree_abstract(entry: Dict[str, Any]) -> str:
     return " ".join(abstract.split())
 
 
+@_mcp_error_results()
 @mcp.tool(annotations=_READ_ONLY_TOOL_ANNOTATIONS)
 async def tree(
     uri: str = "viking://",
@@ -1025,6 +1161,7 @@ class StoreMessage(BaseModel):
     content: str = Field(description="Message text content")
 
 
+@_mcp_error_results()
 @mcp.tool(annotations=_DESTRUCTIVE_TOOL_ANNOTATIONS)
 async def remember(messages: list[StoreMessage]) -> str:
     """Store information into OpenViking long-term memory. Use when the user says 'remember this', shares preferences, important facts, or decisions worth persisting."""
@@ -1050,6 +1187,7 @@ async def remember(messages: list[StoreMessage]) -> str:
 # -- write -----------------------------------------------------------------
 
 
+@_mcp_error_results()
 @mcp.tool(annotations=_DESTRUCTIVE_TOOL_ANNOTATIONS)
 async def write(
     uri: str,
@@ -1057,6 +1195,7 @@ async def write(
     mode: Literal["replace", "append", "create"] = "replace",
     wait: bool = False,
     timeout: Optional[float] = None,
+    acl: Optional[AclSpec] = None,
 ) -> str:
     """Write text to a viking:// file. Use this to save files (notes, profiles, knowledge, state) in OpenViking the same way you would use a working directory. To change part of an existing file, prefer the edit tool over a full rewrite.
 
@@ -1064,15 +1203,20 @@ async def write(
     - mode="create": fail if the file already exists.
     - Any new file (whether created by "replace" or "create") must end in one of: .md .txt .json .yaml .yml .toml .py .js .ts
     - mode="append": append to the end of an existing file; fails if the file does not exist.
+    - acl: optional shared-resource ACL with acl_mode (inherit/restricted) and entries
+      (principal=user:<id>/group:<id>/user:*, level=read/write/manage). Explicit ACL
+      requires manage on the target, or its parent for a new file. Omit to preserve
+      existing ACL or inherit on creation.
 
     Writable scopes: viking://resources/, viking://user/{user_id}/, viking://agent/. The viking://~ home alias expands to the caller's user root. The managed user subtrees skills/, peers/, privacy/ and sessions/ are read-only. Do not write inside a skill package under viking://agent/skills/ either: a plain write skips installation, so the skill's abstract, overview and source metadata go stale. Change a skill with the add_skill tool. After a write, semantic search indexes refresh in the background; pass wait=true to block until search reflects the change."""
+    # An explicit ACL uses the kernel's manage check before any content is written.
     service = get_service()
     ctx = _get_ctx()
     uri = _resolve_mcp_workspace_uri(uri, ctx)
 
     try:
         result = await service.fs.write(
-            uri=uri, content=content, ctx=ctx, mode=mode, wait=wait, timeout=timeout
+            uri=uri, content=content, ctx=ctx, mode=mode, wait=wait, timeout=timeout, acl=acl
         )
     except NotFoundError:
         if mode != "replace":
@@ -1081,7 +1225,7 @@ async def write(
         # without first checking whether it exists; strict creation stays
         # available via mode="create".
         result = await service.fs.write(
-            uri=uri, content=content, ctx=ctx, mode="create", wait=wait, timeout=timeout
+            uri=uri, content=content, ctx=ctx, mode="create", wait=wait, timeout=timeout, acl=acl
         )
     written = result.get("written_bytes", 0)
     message = (
@@ -1090,6 +1234,7 @@ async def write(
     return message + _indexing_hint(result)
 
 
+@_mcp_error_results()
 @mcp.tool(annotations=_DESTRUCTIVE_TOOL_ANNOTATIONS)
 async def edit(
     uri: str,
@@ -1275,6 +1420,7 @@ async def add_resource(
     tags: Optional[list[str]] = None,
     tag_mode: str = "replace",
     args: Optional[dict[str, Any]] = None,
+    acl: Optional[AclSpec] = None,
 ) -> str:
     """Add a resource to OpenViking. Asynchronous — processing happens in the background.
 
@@ -1325,6 +1471,10 @@ async def add_resource(
         tags: Optional explicit k=v retrieval tags to apply after ingestion.
         tag_mode: Tag update mode: "replace", "append", or "clear". Clear removes
             existing tags without requiring ``tags``. Defaults to "replace".
+        acl: Optional ACL on the final import root. Uses acl_mode (inherit/restricted)
+            and entries with principal (user:<id>, group:<id>, user:*) and level
+            (read/write/manage). Requires manage on the existing target or parent
+            for a new target. Omit to preserve existing ACL or inherit on creation.
         args: Parser-specific options, e.g. {"auth_config": {"token": "..."}}
             for native HTTPS Git imports and watches, {"feishu_access_token": "..."}
             for Feishu imports, {"site": true} for whole-site ingestion, or
@@ -1348,7 +1498,7 @@ async def add_resource(
                 field_name="parent",
             )
     except (InvalidArgumentError, PermissionDeniedError) as exc:
-        return _mcp_failure(f"Error: {exc}")
+        return _mcp_failure(exc)
 
     try:
         mode = normalize_parse_mode((args or {}).get("parse_mode", ParseMode.DEFAULT))
@@ -1392,9 +1542,10 @@ async def add_resource(
                 processing_mode=processing_mode,
                 tags=tags,
                 tag_mode=tag_mode,
+                acl=acl,
             )
-        except (PermissionDeniedError, InvalidArgumentError) as exc:
-            return _mcp_failure(f"Error: {exc}")
+        except OpenVikingError as exc:
+            return _mcp_failure(exc)
         except Exception as exc:
             return _mcp_failure(f"Error adding resource: {exc}")
         error = _resource_add_error(result)
@@ -1441,7 +1592,10 @@ async def add_resource(
                 args=args,
                 tags=tags,
                 tag_mode=tag_mode,
+                acl=acl,
             )
+        except OpenVikingError as exc:
+            return _mcp_failure(exc)
         except Exception as exc:
             return _mcp_failure(f"Error adding resource: {exc}")
         error = _resource_add_error(result)
@@ -1482,6 +1636,8 @@ async def add_resource(
         ctx.user.account_id,
         ctx.user.user_id,
         ttl_seconds=ttl_seconds,
+        role=ctx.role,
+        from_oauth=ctx.from_oauth,
         to=to,
         parent=parent,
         reason=description,
@@ -1490,6 +1646,7 @@ async def add_resource(
         tags=tags,
         tag_mode=tag_mode,
         parse_mode=mode.value,
+        acl=acl,
     )
     base_url, url_source = _resolve_public_base_url()
     upload_url = f"{base_url}/api/v1/resources/temp_upload?token={quote(token, safe='')}"
@@ -1625,7 +1782,7 @@ async def add_skill(
             # Fail here, not after a one-time upload token is spent on a root the installer rejects.
             target = SkillProcessor._resolve_skill_root_uri(ctx, target)  # noqa: SLF001
     except (InvalidArgumentError, PermissionDeniedError) as exc:
-        return _mcp_failure(f"Error: {exc}")
+        return _mcp_failure(exc)
 
     if data.strip() or is_git:
         try:
@@ -1641,8 +1798,8 @@ async def add_skill(
                     else None
                 ),
             )
-        except (InvalidArgumentError, PermissionDeniedError) as exc:
-            return _mcp_failure(f"Error: {exc}")
+        except OpenVikingError as exc:
+            return _mcp_failure(exc)
         except Exception as exc:
             return _mcp_failure(f"Error adding skill: {exc}")
         return _format_skill_install_result(result, list_only=list_only)
@@ -1657,6 +1814,8 @@ async def add_skill(
         ctx.user.account_id,
         ctx.user.user_id,
         ttl_seconds=ttl_seconds,
+        role=ctx.role,
+        from_oauth=ctx.from_oauth,
         actor_peer_id=ctx.actor_peer_id or "",
         kind="skill",
         skill_target_uri=target,
@@ -1791,8 +1950,8 @@ async def cancel_watch(to_uri: str) -> str:
             ctx.user.user_id,
             str(ctx.role),
         )
-    except _wm_mod.PermissionDeniedError:
-        return _mcp_failure(f"Permission denied for {to_uri}")
+    except _wm_mod.PermissionDeniedError as exc:
+        return _mcp_failure(PermissionDeniedError(str(exc), resource=to_uri))
     return f"Watch cancelled: {to_uri}"
 
 
@@ -1830,7 +1989,8 @@ async def grep(
                 # miss, so carry the reason instead of dropping it. POST /search/grep maps
                 # and re-raises these; reporting them is what keeps the two faces agreeing
                 # about whether a failure is a result.
-                return (p, [], f"{type(exc).__name__}: {exc}")
+                code = exc.code if isinstance(exc, OpenVikingError) else type(exc).__name__
+                return (p, [], f"{code}: {exc}")
 
     results = await asyncio.gather(*[_grep_one(p) for p in patterns])
 
@@ -1883,6 +2043,8 @@ async def glob(pattern: str, uri: str = "viking://", node_limit: int = 100) -> s
 
     try:
         result = await service.fs.glob(pattern, ctx=ctx, uri=resolved_uri, node_limit=node_limit)
+    except OpenVikingError as exc:
+        return _mcp_failure(exc)
     except Exception as e:
         return _mcp_failure(f"Error: {e}")
 
@@ -1900,6 +2062,7 @@ async def glob(pattern: str, uri: str = "viking://", node_limit: int = 100) -> s
 # -- forget ----------------------------------------------------------------
 
 
+@_mcp_error_results()
 @mcp.tool(annotations=_RETRY_SAFE_DESTRUCTIVE_TOOL_ANNOTATIONS)
 async def forget(uri: str, recursive: bool = False) -> str:
     """Permanently delete a viking:// URI from OpenViking. Irreversible — confirm with user before calling.
@@ -2023,10 +2186,9 @@ _apply_portable_schemas()
 async def mcp_lifespan():
     """Run the MCP session manager. Call this inside the FastAPI lifespan."""
     async with mcp.session_manager.run():
+        tools = mcp._tool_manager.list_tools()
         logger.info(
-            "MCP endpoint ready (16 tools: find, search, read, write, edit, list, tree, "
-            "remember, add_resource, add_skill, list_watches, cancel_watch, grep, glob, forget, "
-            "health)"
+            "MCP endpoint ready (%d tools: %s)", len(tools), ", ".join(tool.name for tool in tools)
         )
         yield
 

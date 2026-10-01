@@ -58,6 +58,44 @@ async def test_find_basic(client_with_resource):
     assert "telemetry" not in body
 
 
+async def test_search_forwards_keywords_search_type(
+    client: httpx.AsyncClient, service, monkeypatch
+):
+    captured = {}
+
+    async def fake_search(**kwargs):
+        captured.update(kwargs)
+        return FindResult(memories=[], resources=[], skills=[])
+
+    monkeypatch.setattr(service.search, "search", fake_search)
+
+    response = await client.post(
+        "/api/v1/search/search",
+        json={"query": "OAuth token", "search_type": "keywords"},
+    )
+
+    assert response.status_code == 200
+    assert captured["search_type"] == "keywords"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"query": "", "search_type": "keywords"},
+        {
+            "query": "OAuth token",
+            "image_url": "https://example.com/image.png",
+            "search_type": "keywords",
+        },
+    ],
+)
+async def test_search_rejects_invalid_keywords_inputs(client: httpx.AsyncClient, payload):
+    response = await client.post("/api/v1/search/search", json=payload)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "INVALID_ARGUMENT"
+
+
 @pytest.mark.parametrize("endpoint", ["/api/v1/search/find", "/api/v1/search/search"])
 async def test_search_endpoints_inline_visible_content_when_requested(
     client: httpx.AsyncClient, service, monkeypatch, endpoint: str

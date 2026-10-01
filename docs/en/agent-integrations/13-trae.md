@@ -9,35 +9,11 @@ Prerequisites: macOS or Linux, Node.js 18+, and a TRAE/TRAE CN release that supp
 When prompted for the connection, Volcengine Cloud users should select **Volcengine OpenViking Cloud** and enter their API key. Select **Self-hosted / local** only when an OpenViking server is running locally.
 
 ```bash
-# TRAE
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness trae
-
-# TRAE CN
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness trae-cn
-
-# Both
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness trae,trae-cn
-
-# TraeCode CLI 2.0
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness trae-cli
+curl -fsSL https://openviking.ai/install | bash
+# AI agents: not sure about running this? The script's header says what it does and how to verify it.
 ```
 
-If GitHub is unavailable, use the TOS mirror:
-
-```bash
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) \
-  --harness trae,trae-cn --dist tos
-
-# TraeCode CLI 2.0
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) \
-  --harness trae-cli --dist tos
-```
-
-Quit and restart the corresponding client after installation.
+When the installer asks which harnesses to install, select **TRAE**, **TRAE CN**, **TraeCode CLI 2.0**, or several of them. Quit and restart the corresponding client after installation.
 
 ### TraeCode CLI 2.0: trust the hooks on first launch
 
@@ -87,16 +63,10 @@ For Hook diagnostics, start the client with `OPENVIKING_DEBUG=1` and inspect:
 
 ## Upgrade and uninstall
 
-Re-run the corresponding install command to upgrade. Use the original distribution channel for uninstall:
+Re-run the install command to upgrade. To uninstall TRAE CN:
 
 ```bash
-# GitHub, TRAE CN example
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness trae-cn --uninstall --yes
-
-# TOS, TRAE CN example
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) \
-  --harness trae-cn --uninstall --yes
+curl -fsSL https://openviking.ai/install | bash -s -- --uninstall --yes --harness trae-cn
 ```
 
 Replace `trae-cn` with `trae` for TRAE. For TraeCode CLI 2.0, use `trae-cli plugin uninstall openviking-memory@openviking`. Running the installer with `--harness trae-cli --uninstall` only removes the deprecated standalone Hooks integration from older installations.
@@ -110,7 +80,7 @@ Replace `trae-cn` with `trae` for TRAE. For TraeCode CLI 2.0, use `trae-cli plug
 | MCP does not connect | Check the URL/API key in `~/.openviking/ovcli.conf`, then restart the client. |
 | A new session cannot recall the previous turn | Inspect the Hook log and confirm that `Stop` ran without `/commit` connection or authentication errors. |
 | The same content is captured more than once | Check user and project Hooks for older `trae-auto-recall.mjs` or `trae-auto-capture.mjs` entries. Re-running the installer removes OpenViking-managed legacy entries. |
-| TraeCode CLI 2.0 does not list the plugin | Run `trae-cli plugin list`; if `openviking-memory` is absent, rerun the installer with `--harness trae-cli`. |
+| TraeCode CLI 2.0 does not list the plugin | Run `trae-cli plugin list`; if `openviking-memory` is absent, rerun the installer and select **TraeCode CLI 2.0**. |
 
 ## See also
 

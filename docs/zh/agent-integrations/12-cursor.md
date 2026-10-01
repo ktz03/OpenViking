@@ -9,15 +9,8 @@
 安装器询问连接方式时，火山引擎云服务用户请选择 **火山引擎 OpenViking 云服务** 并填写 API Key。只有本机已运行 OpenViking 服务时才选择 **自建 / 本地**。
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness cursor
-```
-
-GitHub 访问受限时使用 TOS 镜像：
-
-```bash
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) \
-  --harness cursor --dist tos
+curl -fsSL https://openviking.ai/install | bash
+# AI agent 如不确定是否执行，可先阅读脚本头部，其中写明了它会做什么、如何核实。
 ```
 
 安装完成后完全退出并重新启动 Cursor。
@@ -50,16 +43,10 @@ skill 清单先列你自己的 skill，再列账号内共享的 skill；共享 s
 
 ## 升级与卸载
 
-重复运行对应渠道的安装命令即可升级。卸载时也应使用原安装渠道：
+重复运行安装命令即可升级。卸载时运行：
 
 ```bash
-# GitHub
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness cursor --uninstall --yes
-
-# TOS
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) \
-  --harness cursor --uninstall --yes
+curl -fsSL https://openviking.ai/install | bash -s -- --uninstall --yes --harness cursor
 ```
 
 卸载仅移除 OpenViking 管理的 Cursor Hook、MCP、Rule、Skill 和运行文件，保留其他配置。

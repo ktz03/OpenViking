@@ -145,7 +145,7 @@ When you use a user key or admin key, the server derives `account` and `user` fr
 **CLI override flags**
 
 ```bash
-openviking ls viking://
+ov ls viking://
 ```
 
 ### Using --sudo with Root API Key
@@ -200,10 +200,10 @@ OIDC and LDAP authentication require optional dependencies. You can install them
 
 ```bash
 # Install auth features only
-uv pip install openviking[auth]
+uv pip install "openviking[auth]"
 
 # Or install with all features (including bot)
-uv pip install openviking[bot]
+uv pip install "openviking[bot]"
 ```
 
 ### Configure OIDC
@@ -358,7 +358,7 @@ Two modes are supported:
 {
   "account_id": {
     "source": "claim",
-    "claim": ["department", "team", "organization"],
+    "claims": ["department", "team", "organization"],
     "fallback": "default"
   }
 }
@@ -822,7 +822,7 @@ You can switch between LDAP and API Key authentication by editing `~/.openviking
 RUST_LOG=debug ov ls viking://
 
 # Check configuration
-ov doctor
+ov config validate
 ```
 
 ---

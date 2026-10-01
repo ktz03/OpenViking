@@ -118,7 +118,7 @@ function checkInstall(report) {
   }
 
   const missing = REQUIRED_PLUGIN_FILES.filter((rel) => !existsPath(join(PLUGIN_ROOT, rel)));
-  if (missing.length) report.fail("plugin files missing", missing.join(", "), `bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) --harness ${CLIENT}`);
+  if (missing.length) report.fail("plugin files missing", missing.join(", "), `curl -fsSL https://openviking.ai/install | bash -s -- --harness ${CLIENT}`);
   else report.ok("plugin files present (hook entry, URI guard, MCP proxy, host adapters)");
 
   // The runtime is not vendored: it sits beside the integration, assembled from

@@ -156,7 +156,7 @@ class VikingFS(
         self._vector_config_resolver = vector_config_resolver
         self._count_cache: Dict[str, tuple] = {}  # cache_key → (count, timestamp)
         self._count_cache_max_size = 1024
-        self._fulltext_available: Dict[tuple[str, str, str, str], bool] = {}
+        self._fulltext_available: Dict[tuple[str, str, str, str], tuple[bool, Optional[float]]] = {}
         self._bound_ctx: contextvars.ContextVar[Optional[RequestContext]] = contextvars.ContextVar(
             "vikingfs_bound_ctx", default=None
         )

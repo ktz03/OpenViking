@@ -175,15 +175,15 @@ per-harness 章节（档案卡）只写差异；所有共享事实均在本章�
 
 | harness | 集成形态 | 安装通道 | 会话 id 前缀/格式 | 配置来源 | 独立 setup 向导 |
 |---|---|---|---|---|---|
-| claude-code | CC 插件（marketplace）：包含 9 hook + MCP 代理 + slash + statusline + skill | 一键 `install.sh --harness claude`（支持现代 plugin 路径与 legacy `claude mcp add` 兼容路径）/ 手动 marketplace / TOS 镜像 | `cc-<CC session_id 原文>`；subagent 格式为 `…__subagent-<agent_id>` | env + ovcli.conf `plugin.claude_code` + ov.conf `claude_code` | ✅ `scripts/setup.mjs` |
+| claude-code | CC 插件（marketplace）：包含 9 hook + MCP 代理 + slash + statusline + skill | 一键 `install.sh --harness claude`（Claude Code 2.0+）/ 手动 marketplace | `cc-<CC session_id 原文>`；subagent 格式为 `…__subagent-<agent_id>` | env + ovcli.conf `plugin.claude_code` + ov.conf `claude_code` | ✅ `scripts/setup.mjs` |
 | codex | Codex 插件（marketplace）：包含 6 hook + MCP 代理 + skill | 一键 `--harness codex` / `codex plugin marketplace add`（TOS 走 dumb-HTTP git 以保留远程更新能力） | `cx-<safeId>`（确定性推导，不读取 state） | env + ovcli.conf `plugin.codex` + ov.conf `codex` | ✅ |
 | trae-cli | **codex 插件别名安装**（TraeCode CLI 2.0，仅支持 2.0；Codex 系：binary `traecli`、配置 `~/.trae/traecli.toml`；能力面与 codex 一致） | 一键 `--harness trae-cli`（复用 codex 安装流程；marketplace 命令会随指向的 binary 执行，如 `traecli plugin marketplace add`） | 与 codex 的派生规则一致 | 与 codex 一致（env + ovcli.conf `plugin.codex` + ov.conf） | ✅（同 codex） |
 | cursor | 配置驱动（写入 `~/.cursor/hooks.json`+`mcp.json`）+ rule + skill | 一键 `--harness cursor` | `cu-<conversation_id>` | env + ovcli.conf `plugin.cursor` | ❌（共用安装器 TUI） |
 | trae / trae-cn | 配置驱动（`~/.trae{,-cn}/hooks.json` + 平台相关 mcp.json） | 一键 `--harness trae,trae-cn` | `tr-` / `trcn-` | env + ovcli.conf `plugin.trae` / `plugin.trae_cn` | ❌ |
 | zcode | 配置驱动（合并进 `~/.zcode/cli/config.json`，并强制 `hooks.enabled=true`） | 一键 `--harness zcode` | `zc-<sess_…>` | env + ovcli.conf `plugin.zcode` | ❌ |
 | kimicode | Kimi Code 原生插件（`kimi.plugin.json`，managed copy + `installed.json`） | 一键 `--harness kimicode` | `kc-<session_id>` | env + ovcli.conf `plugin.kimicode` + workspace 文件 | ❌ |
-| opencode | npm 插件 `@openviking/opencode-plugin`（config hook 自注入 MCP 条目） | 一键 `--harness opencode`（npm 注册 + 代理快照兜底）/ 手动 npm / 源码 | `oc-<id>`；subagent 格式为 `oc-<parent>__subagent-<child>` | env + ovcli.conf `plugin.opencode` | ✅ |
-| dsh | Cordis 同进程插件（`cordis.patch.yml` 条目） | 统一安装器（会询问 profile，默认 `web`），或执行 `dsh plugin --profile web add @openviking/dsh-memory-plugin` | `dsh-<session.id 原样>`；subagent 各自独立会话 | env + ovcli.conf `plugin.dsh` + cordis patch config（行为旋钮的最低层；凭据仍以 patch 优先） | ❌ |
+| opencode | npm 插件 `@openviking/opencode-plugin`（config hook 自注入 MCP 条目） | 一键 `--harness opencode`（复制为 `~/.config/opencode/plugins/` 下的本地文件插件）/ 手动 npm / 源码 | `oc-<id>`；subagent 格式为 `oc-<parent>__subagent-<child>` | env + ovcli.conf `plugin.opencode` | ✅ |
+| dsh | Cordis 同进程插件（`cordis.patch.yml` 条目） | 统一安装器（默认装到 `web` profile，可用 `--dsh-profile` 指定），或执行 `dsh plugin --profile web add @openviking/dsh-memory-plugin` | `dsh-<session.id 原样>`；subagent 各自独立会话 | env + ovcli.conf `plugin.dsh` + cordis patch config（行为旋钮的最低层；凭据仍以 patch 优先） | ❌ |
 | pi | pi 原生扩展（目录装载，jiti 直译 TS） | 一键 `--harness pi`（复制到自动发现目录，无需 `pi install`） | `pi-<piSessionId>` | env + ovcli.conf `plugin.pi`（凭据字段由凭据链统一解析） | ✅ |
 | openclaw | context-engine 插件（`ownsCompaction:true`）+ 15 工具 + 5 slash + 4 hook + HTTP 路由 | ClawHub 执行 `openclaw plugins install clawhub:@openviking/openclaw-plugin` 搭配 `openclaw openviking setup` / npm 安装器 / TOS 离线包 | UUID 原样小写，否则 `sha256(sessionKey)`；`memory_store` 临时会话 `memory-store-<ts>-<rand>` | `openclaw.json` 的 `plugins.entries.openviking.config`（严格校验：存在未知键/非法值时插件进入 setup-only 模式）+ 少量 env | ✅ `openclaw openviking setup`（交互/非交互 + key 角色探测 + 版本兼容检查） |
 | hermes | Hermes bundled MemoryProvider（随 Hermes 发布，无需装插件） | 执行 `hermes memory setup openviking`（curses 向导）或手动 `hermes config set memory.provider openviking` + `.env` | 由 Hermes 生成，插件原样使用 | `.env`（`OPENVIKING_*`）或 ovcli.conf 联动（`use_ovcli_config` 模式会清空 .env 里的 5 个对应变量）+ config.yaml | ✅（多层菜单） |
@@ -193,7 +193,7 @@ per-harness 章节（档案卡）只写差异；所有共享事实均在本章�
 
 统一安装脚本 `examples/memory-plugin-shared/install.sh` 覆盖 11 个 harness id：`claude, codex, cursor, trae, trae-cn, trae-cli, zcode, kimicode, opencode, pi, dsh`（其中 openclaw 走自有渠道；`trae-cli` 则复用 codex 安装流程，[§3.1.1](#_3-1-1-判定矩阵)）。要点如下：
 
-- 双分发：`--dist github|tos`；三源：`--source remote|archive|dev`。以 `bash <(curl …)` 方式执行时会从 `/dev/tty` 读取输入，从而保留交互。
+- 安装源与交互：全部从 OpenViking 文档站提供的下载安装；在仓库 checkout 中运行时改用该 checkout（`--source archive|dev`）。以 `curl … | bash` 方式执行时会从 `/dev/tty` 读取输入，从而保留交互。
 - 官方 docs 的规范一键命令是不带 `--harness` 的裸命令（执行后进入 TUI 多选）；而各插件自带的 setup-helper 转发脚本在调用时会自动补 `--harness`。
 - 幂等合并：hooks/mcp 条目按 `OPENVIKING_INTEGRATION_ID` 标记识别自有条目，做到剔旧追新的同时不动第三方；写入采用原子操作——先备份 `.bak`，写 tmp 后 rename 覆盖，权限 0600。
 - 凭据向导写 `~/.openviking/ovcli.conf`：三选一（本地 `http://127.0.0.1:1933` / 火山云 `https://api.vikingdb.cn-beijing.volces.com/openviking` / 自定义），已有配置先展示当前值再问"沿用/重配"，API key 掩码。
@@ -600,7 +600,7 @@ MCP `write` / REST `content/write` 的三道 guard（`content_write.py`）：可
 
 - **形态**：唯一同进程 Cordis 原生插件（`export function apply`），工具面就是服务端的 MCP 面，经 `@deepseek-ai/dsh-mcp-client` 与共享 stdio 代理接入（以 `mcp__openviking__*` 发布），hook 侧 REST 直连。6 事件：agent/session-start（emit）/ agent/pre-step（waterfall）/ session/event / session/flush / tools/pre-execute / tools/post-execute。版本 0.5.1。
 - **能力亮点**：`ctx.provide("openvikingMemory")` 供其他 Cordis 插件二次开发；pre-step 注入走 user 消息，适配 DSH persona 的 `complete:true` 渲染模式。
-- **行为要点**：统一安装器已覆盖 dsh，会询问装到哪个 profile（默认 `web`，可用 `--dsh-profile` 指定）；npm 是该插件唯一的分发渠道，因此 github/tos 选择对它不适用，除 `dev` 外的模式一律装已发布的包；`dev` 会先把 checkout 打包再装——`dsh plugin` 转发给 pnpm，link 一个源码目录无法解析插件 import 的 dsh peer；teardown commit 3s 无阈值，SIGHUP/二次 Ctrl+C 不触发（[§3.3.3](#_3-3-3-关闭方式-×-harness-终局矩阵)）；compaction 不感知（注入内容随宿主压缩收缩，profile 不重投）；subagent 各自独立会话（[§3.3.5](#_3-3-5-subagent-会话对照)）；工具面即服务端自身的 MCP 面，经与其他集成同一个 stdio 代理接入、以 `mcp__openviking__*` 发布，服务端升级即可增加工具而无需发版；代价是代理每个 profile 只起一个进程，因此工具调用带的是进程级 actor peer、`remember` 也不绑当前会话（召回/捕获/commit 仍按会话解析 peer）；另随包附带共享的 `openviking-memory` 与 `openviking-skills` 两个 skill；uri-guard 先把工具名转成小写再匹配，tools/pre-execute 拒绝路径是 `viking://` URI 的文件工具（针对 skill URI 的 write/edit 会被引导到 `mcp__openviking__add_skill`），bash 命令带 `viking://` URI 时由 tools/post-execute 附加提示（`form: "notice"`）。
+- **行为要点**：统一安装器已覆盖 dsh，默认装到 `web` profile，可用 `--dsh-profile` 指定其他 profile；npm 是该插件唯一的分发渠道，因此除 `dev` 外的模式一律装已发布的包；`dev` 会先把 checkout 打包再装——`dsh plugin` 转发给 pnpm，link 一个源码目录无法解析插件 import 的 dsh peer；teardown commit 3s 无阈值，SIGHUP/二次 Ctrl+C 不触发（[§3.3.3](#_3-3-3-关闭方式-×-harness-终局矩阵)）；compaction 不感知（注入内容随宿主压缩收缩，profile 不重投）；subagent 各自独立会话（[§3.3.5](#_3-3-5-subagent-会话对照)）；工具面即服务端自身的 MCP 面，经与其他集成同一个 stdio 代理接入、以 `mcp__openviking__*` 发布，服务端升级即可增加工具而无需发版；代价是代理每个 profile 只起一个进程，因此工具调用带的是进程级 actor peer、`remember` 也不绑当前会话（召回/捕获/commit 仍按会话解析 peer）；另随包附带共享的 `openviking-memory` 与 `openviking-skills` 两个 skill；uri-guard 先把工具名转成小写再匹配，tools/pre-execute 拒绝路径是 `viking://` URI 的文件工具（针对 skill URI 的 write/edit 会被引导到 `mcp__openviking__add_skill`），bash 命令带 `viking://` URI 时由 tools/post-execute 附加提示（`form: "notice"`）。
 - **配置**：env + ovcli.conf `plugin.dsh` + workspace 文件 + cordis patch（行为旋钮的最低层）；凭据是例外，patch 里写的 endpoint / key / account / user / peer 仍然压过凭据链。
 - **维度索引**：工具面 [§1.1](#_1-1-主动工具面-agentic-调用能力) ｜召回 [§3.2](#_3-2-自动召回与注入) ｜commit [§3.3.2](#_3-3-2-常规-commit-触发条件)/[§3.3.3](#_3-3-3-关闭方式-×-harness-终局矩阵) ｜降级 [§3.6](#_3-6-降级与容错)。
 

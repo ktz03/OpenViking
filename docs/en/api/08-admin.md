@@ -108,8 +108,7 @@ curl http://localhost:1933/api/v1/admin/agent-evolution \
   "result": {
     "enabled": false,
     "account_id": "default"
-  },
-  "time": 0.1
+  }
 }
 ```
 
@@ -860,7 +859,7 @@ Create a new workspace with its first admin user.
 **Code Entry Points:**
 - `openviking/server/routers/admin.py:create_account` - HTTP route
 - `openviking/server/api_keys/new.py:APIKeyManager.create_account` - Core implementation
-- `openviking_cli/client/sync_http.py:SyncHTTPClient.admin_create_account` - Python SDK
+- `sdk/python/openviking_sdk/client.py:SyncHTTPClient.admin_create_account` - Python SDK
 
 #### 2. Interface and Parameters
 
@@ -1048,8 +1047,7 @@ ov --sudo admin create-account acme-private --admin alice \
     "account_id": "acme",
     "admin_user_id": "alice",
     "user_key": "7f3a9c1e..."
-  },
-  "time": 0.1
+  }
 }
 ```
 
@@ -1073,7 +1071,7 @@ List all workspaces (ROOT only).
 **Code Entry Points:**
 - `openviking/server/routers/admin.py:list_accounts` - HTTP route
 - `openviking/server/api_keys/new.py:APIKeyManager.get_accounts` - Core implementation
-- `openviking_cli/client/sync_http.py:SyncHTTPClient.admin_list_accounts` - Python SDK
+- `sdk/python/openviking_sdk/client.py:SyncHTTPClient.admin_list_accounts` - Python SDK
 
 #### 2. Interface and Parameters
 
@@ -1162,8 +1160,7 @@ ov --sudo admin list-accounts --limit 50 --page 2
   "result": [
     {"account_id": "default", "created_at": "2026-02-12T10:00:00Z", "user_count": 1},
     {"account_id": "acme", "created_at": "2026-02-13T08:00:00Z", "user_count": 2}
-  ],
-  "time": 0.1
+  ]
 }
 ```
 
@@ -1185,7 +1182,7 @@ Account and user cleanup share one queue with a single consumer. Account tasks c
 **Code Entry Points:**
 - `openviking/server/routers/admin.py:delete_account` - HTTP route
 - `openviking/service/deletion.py:DeletionService.delete` - Core implementation
-- `openviking_cli/client/sync_http.py:SyncHTTPClient.admin_delete_account` - Python SDK
+- `sdk/python/openviking_sdk/client.py:SyncHTTPClient.admin_delete_account` - Python SDK
 
 #### 2. Interface and Parameters
 
@@ -1263,8 +1260,7 @@ ov --sudo task status <task_id>
     "account_id": "acme",
     "status": "deleting",
     "task_id": "550e8400-e29b-41d4-a716-446655440000"
-  },
-  "time": 0.1
+  }
 }
 ```
 
@@ -1286,7 +1282,7 @@ Register a new user in a workspace.
 **Code Entry Points:**
 - `openviking/server/routers/admin.py:register_user` - HTTP route
 - `openviking/server/api_keys/new.py:APIKeyManager.register_user` - Core implementation
-- `openviking_cli/client/sync_http.py:SyncHTTPClient.admin_register_user` - Python SDK
+- `sdk/python/openviking_sdk/client.py:SyncHTTPClient.admin_register_user` - Python SDK
 
 #### 2. Interface and Parameters
 
@@ -1400,8 +1396,7 @@ ov admin register-user acme bob-private --role user \
     "account_id": "acme",
     "user_id": "bob",
     "user_key": "d91f5b2a..."
-  },
-  "time": 0.1
+  }
 }
 ```
 
@@ -1423,7 +1418,7 @@ List active users in a workspace. Users with deletion in progress are omitted.
 **Code Entry Points:**
 - `openviking/server/routers/admin.py:list_users` - HTTP route
 - `openviking/server/api_keys/new.py:APIKeyManager.get_users` - Core implementation
-- `openviking_cli/client/sync_http.py:SyncHTTPClient.admin_list_users` - Python SDK
+- `sdk/python/openviking_sdk/client.py:SyncHTTPClient.admin_list_users` - Python SDK
 
 #### 2. Interface and Parameters
 
@@ -1525,8 +1520,7 @@ ov admin list-users acme --limit 50 --page 2
   "result": [
     {"user_id": "alice", "role": "admin"},
     {"user_id": "bob", "role": "user"}
-  ],
-  "time": 0.1
+  ]
 }
 ```
 
@@ -1548,7 +1542,7 @@ Remove a user from a workspace. The user's API key is revoked immediately, and o
 **Code Entry Points:**
 - `openviking/server/routers/admin.py:remove_user` - HTTP route
 - `openviking/service/deletion.py:DeletionService.delete` - Core implementation
-- `openviking_cli/client/sync_http.py:SyncHTTPClient.admin_remove_user` - Python SDK
+- `sdk/python/openviking_sdk/client.py:SyncHTTPClient.admin_remove_user` - Python SDK
 
 #### 2. Interface and Parameters
 
@@ -1626,8 +1620,7 @@ ov --sudo admin remove-user acme bob
     "user_id": "bob",
     "status": "deleting",
     "task_id": "..."
-  },
-  "time": 0.1
+  }
 }
 ```
 
@@ -1647,7 +1640,7 @@ Promote an account user to ADMIN. ROOT may operate on any account; ADMIN is limi
 **Code Entry Points:**
 - `openviking/server/routers/admin.py:set_user_role` - HTTP route
 - `openviking/server/api_keys/new.py:APIKeyManager.set_role` - Core implementation
-- `openviking_cli/client/sync_http.py:SyncHTTPClient.admin_set_role` - Python SDK
+- `sdk/python/openviking_sdk/client.py:SyncHTTPClient.admin_set_role` - Python SDK
 
 #### 2. Interface and Parameters
 
@@ -1722,8 +1715,7 @@ ov --sudo admin set-role acme bob admin
     "account_id": "acme",
     "user_id": "bob",
     "role": "admin"
-  },
-  "time": 0.1
+  }
 }
 ```
 
@@ -1744,7 +1736,7 @@ Regenerate a user's API key. The old key is immediately invalidated.
 **Code Entry Points:**
 - `openviking/server/routers/admin.py:regenerate_key` - HTTP route
 - `openviking/server/api_keys/new.py:APIKeyManager.regenerate_key` - Core implementation
-- `openviking_cli/client/sync_http.py:SyncHTTPClient.admin_regenerate_key` - Python SDK
+- `sdk/python/openviking_sdk/client.py:SyncHTTPClient.admin_regenerate_key` - Python SDK
 
 #### 2. Interface and Parameters
 
@@ -1831,8 +1823,7 @@ ov --sudo admin regenerate-key acme bob
   "status": "ok",
   "result": {
     "user_key": "e82d4e0f..."
-  },
-  "time": 0.1
+  }
 }
 ```
 

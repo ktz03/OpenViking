@@ -3,11 +3,12 @@
 """
 Search Service for OpenViking.
 
-Provides semantic search operations: search, find.
+Provides search operations: search, find.
 """
 
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+from openviking.core.retrieval_types import SearchType
 from openviking.server.identity import RequestContext
 from openviking.storage.viking_fs import VikingFS
 from openviking.utils.image_search import (
@@ -45,7 +46,7 @@ def _ensure_non_empty_query(
 
 
 class SearchService:
-    """Semantic search service."""
+    """Search service."""
 
     def __init__(self, viking_fs: Optional[VikingFS] = None):
         self._viking_fs = viking_fs
@@ -70,6 +71,21 @@ class SearchService:
         if not self._viking_fs or self._viking_fs.retrieval_config is None:
             return True
         return bool(self._viking_fs.retrieval_config.enable_intent)
+
+    async def ensure_keywords_search_supported(self, ctx: RequestContext) -> None:
+        """Validate keyword-search support at the top-level request boundary."""
+        viking_fs = self._ensure_initialized()
+        vector_store = viking_fs._get_vector_store()
+        if not vector_store or not await viking_fs._collection_has_fulltext(
+            vector_store,
+            ctx,
+            supported_modes=("volcengine", "vikingdb"),
+            raise_on_error=True,
+        ):
+            raise InvalidArgumentError(
+                "Keyword search is not supported by the configured vector backend, or full-text "
+                "indexing is not enabled for the content field."
+            )
 
     async def _resolve_image_url(
         self,
@@ -99,8 +115,10 @@ class SearchService:
         filter: Optional[Dict] = None,
         level: Optional[List[int]] = None,
         image_url: Optional[str] = None,
+        events_time_decay_protection: Optional[str] = None,
+        search_type: SearchType = "semantic",
     ) -> Any:
-        """Complex search with session context.
+        """Search with session context.
 
         Args:
             query: Query string
@@ -114,8 +132,12 @@ class SearchService:
         Returns:
             FindResult
         """
+        if search_type == "keywords" and image_url:
+            raise InvalidArgumentError("image_url is not supported when search_type='keywords'")
         resolved_image_url = await self._resolve_image_url(image_url, ctx)
         _ensure_non_empty_query(query, resolved_image_url)
+        if search_type == "keywords":
+            await self.ensure_keywords_search_supported(ctx)
         viking_fs = self._ensure_initialized()
 
         session_info = None
@@ -133,6 +155,8 @@ class SearchService:
             filter=filter,
             level=level,
             image_url=resolved_image_url,
+            events_time_decay_protection=events_time_decay_protection,
+            search_type=search_type,
         )
         return result
 
@@ -146,8 +170,10 @@ class SearchService:
         filter: Optional[Dict] = None,
         level: Optional[List[int]] = None,
         image_url: Optional[str] = None,
+        events_time_decay_protection: Optional[str] = None,
+        search_type: SearchType = "semantic",
     ) -> Any:
-        """Semantic search without session context.
+        """Search without session context.
 
         Args:
             query: Query string
@@ -160,6 +186,8 @@ class SearchService:
         Returns:
             FindResult
         """
+        if search_type == "keywords" and image_url:
+            raise InvalidArgumentError("image_url is not supported when search_type='keywords'")
         resolved_image_url = await self._resolve_image_url(image_url, ctx)
         _ensure_non_empty_query(query, resolved_image_url, filter)
         viking_fs = self._ensure_initialized()
@@ -172,6 +200,8 @@ class SearchService:
             filter=filter,
             level=level,
             image_url=resolved_image_url,
+            events_time_decay_protection=events_time_decay_protection,
+            search_type=search_type,
         )
         return result
 
@@ -184,6 +214,7 @@ class SearchService:
         score_threshold: Optional[float] = None,
         level: Optional[List[int]] = None,
         filter: Optional[Dict] = None,
+        search_type: SearchType = "semantic",
     ) -> Any:
         """Find distinct packages; general find/search stay item-based."""
         from openviking.core.retrieval_targets import resolve_retrieval_targets
@@ -199,13 +230,12 @@ class SearchService:
         storage, embedder = fs._get_vector_store(), fs._get_embedder(ctx)
         if not storage:
             raise RuntimeError("Vector store not initialized. Call OpenViking.initialize() first.")
-        if not embedder:
+        if search_type == "semantic" and not embedder:
             raise RuntimeError("Embedder not configured.")
         retriever = SkillPackageRetriever(
             storage=storage,
             embedder=embedder,
             rerank_config=fs.rerank_config,
-            retrieval_config=fs.retrieval_config,
         )
         result = await retriever.retrieve_skills(
             TypedQuery(query, ContextType.SKILL, "", target_directories=targets),
@@ -215,5 +245,6 @@ class SearchService:
             score_threshold=score_threshold,
             level=level,
             scope_dsl=filter,
+            search_type=search_type,
         )
         return FindResult(memories=[], resources=[], skills=result.matched_contexts)

@@ -356,7 +356,7 @@ With `input: "multimodal"`, OpenViking can embed text, images (PNG, JPG, etc.), 
 - `voyage`: Voyage AI Embedding API
 - `minimax`: MiniMax Embedding API
 - `cohere`: Cohere Embedding API
-- `gemini`: Google Gemini Embedding API (text-only; requires `google-genai>=1.0.0`)
+- `gemini`: Google Gemini Embedding API (text-only; requires `google-genai>=1.39.0`)
 - `dashscope`: DashScope (Alibaba Tongyi) Embedding API
 - `litellm`: LiteLLM Embedding API
 - `local`: Local GGUF embedding models
@@ -531,7 +531,9 @@ OpenViking also expects dense float vectors throughout storage and retrieval, so
 
 **gemini provider example:**
 
-> **Note:** Requires `google-genai>=1.0.0` in the server environment — uv install: `uv tool install openviking --upgrade --with "google-genai>=1.0.0"`; pip install: `pip install "google-genai>=1.0.0"`. For async batching use the extra instead: `uv tool install "openviking[gemini-async]" --upgrade` or `pip install "openviking[gemini-async]"`.
+Version 1.39.0 is the minimum SDK version with the client context managers and close methods used to keep asynchronous embedding requests on their owning event loop. Upgrade older SDK pins before enabling this provider.
+
+> **Note:** Requires `google-genai>=1.39.0` in the server environment — uv install: `uv tool install openviking --upgrade --with "google-genai>=1.39.0"`; pip install: `pip install "google-genai>=1.39.0"`. For async batching use the extra instead: `uv tool install "openviking[gemini-async]" --upgrade` or `pip install "openviking[gemini-async]"`.
 
 ```json
 {
@@ -755,8 +757,8 @@ Vision Language Model for semantic extraction (L0/L1 generation).
 
 When resources are added, VLM generates:
 
-1. **L0 (Abstract)**: ~100 token summary
-2. **L1 (Overview)**: ~2k token overview with navigation
+1. **L0 (Abstract)**: file or directory summary, with a default limit of 256 characters
+2. **L1 (Overview)**: directory overview with navigation, with a default limit of 4000 characters
 
 If VLM is not configured, L0/L1 will be generated from content directly (less semantic), and multimodal resources may have limited descriptions.
 
@@ -804,7 +806,9 @@ Common use cases:
 
 **Custom Request Body**
 
-For OpenAI-compatible providers that accept provider-specific JSON body fields, add them via `extra_request_body`. OpenViking merges these fields into the `extra_body` sent by the OpenAI SDK or LiteLLM:
+Use `extra_request_body` for provider-specific JSON body fields. OpenAI-compatible routes use SDK `extra_body`. LiteLLM Anthropic routes pass native options such as `thinking` and `output_config` directly to LiteLLM, so they reach the top-level request body. LiteLLM still validates model support for these options. On Anthropic routes, LiteLLM control names (including `api_key`, `api_base`, `metadata`, and `mock_response`) and call-owned fields (`model`, `messages`, `tools`, `tool_choice`, `stream`, `timeout`, and headers) are rejected instead of overriding the call. Configure credentials and routing through their dedicated settings.
+
+For example, to disable thinking on Ollama:
 
 ```json
 {
@@ -845,6 +849,8 @@ Audio and video understanding is an optional capability of the configured VLM. I
 }
 ```
 
+`vlm.extra_request_body` also applies to the Ark Responses request for audio/video, for example `{"service_tier": "flex", "thinking": {"type": "disabled"}}`. Use fields supported by the selected model and Responses API. Explicit extra body fields override generated request fields through the SDK, including `store`; response storage defaults to `false` unless you explicitly override it. These fields are not forwarded to file upload, status, or deletion requests.
+
 The VLM `model` value is the corresponding Ark model endpoint ID. `video_fps` applies only to video and controls the frame sampling rate sent to Ark.
 
 The recommended starting models for audio and video understanding are `doubao-seed-2-0-lite-260428` and `doubao-seed-2-0-mini-260428`. These are recommended examples, not an exhaustive compatibility list; Ark continues to update its models and input capabilities. See Ark's official [video input capability list](https://console.volcengine.com/ark/region:cn-beijing/docs/82379/1330310?lang=zh#ff5ef604) and [audio input capability list](https://console.volcengine.com/ark/region:cn-beijing/docs/82379/1330310?lang=zh#9619c0ba) for other supported models. If `model` is an `ep-*` inference endpoint ID, verify that its underlying foundation model supports the corresponding media input. OpenViking does not validate audio or video model capabilities while loading configuration.
@@ -858,7 +864,7 @@ The recommended starting models for audio and video understanding are `doubao-se
 
 Formats outside the understanding column continue to follow the existing parser and storage behavior; OpenViking does not transcode them or send them to the understanding model. When such a file is recognized as an audio or video leaf, an empty media summary is indexed using its filename.
 
-For a supported file, OpenViking uploads the media to the Ark Files API without explicitly setting `expire_at`, so file retention follows Ark's default policy. After processing completes, OpenViking references the file's `file_id` from the Responses API with response storage disabled, then attempts to delete the Ark file under a short cleanup deadline. Remote deletion is best-effort and does not replace an otherwise successful result if cleanup fails; a file whose deletion fails or times out continues to follow Ark's default retention policy. Local temporary files are removed independently even when remote cleanup fails or is cancelled.
+For a supported file, OpenViking uploads the media to the Ark Files API without explicitly setting `expire_at`, so file retention follows Ark's default policy. After processing completes, OpenViking references the file's `file_id` from the Responses API with response storage disabled by default, then attempts to delete the Ark file under a short cleanup deadline. Remote deletion is best-effort and does not replace an otherwise successful result if cleanup fails; a file whose deletion fails or times out continues to follow Ark's default retention policy. Local temporary files are removed independently even when remote cleanup fails or is cancelled.
 
 - A successful summary for a directory containing exactly one audio or video file becomes that directory's L1 directly, with L0 derived through the existing semantic path. No second generic VLM summarization is performed.
 - Media in a mixed directory contributes its summary to the existing generic VLM aggregation.
@@ -1066,10 +1072,21 @@ Notes for Vercel:
 - `api_base` must include the `/typesafe` suffix. `https://ai-gateway.vercel.sh/v1`
   is Vercel's own evaluate protocol and is not supported by the adapter.
 
-The Jev adapter sends the query and candidate documents as structured System One
-`state`, then asks one independent Noul relevance question per candidate. Each returned
-yes probability becomes that document's rerank score. All questions are evaluated in
-parallel in one request, and scores do not compete or have to sum to 1.
+The Jev adapter sends the query and candidate documents as shared System One `state`
+and supports two modes:
+
+- `noul` (default): one independent relevance question per document, using its returned yes
+  probability as the score. All questions are sent in one HTTP request, and document
+  scores do not have to sum to 1.
+- `choice`: one question compares all candidate documents, with `candidate_{index}`
+  mapped to input indices. Scores come from `probabilities` in document order.
+
+Select the mode with `rerank.mode`; omitting it or setting it to `null` keeps the
+default `noul` behavior. Choice scores are relative probabilities summing to 1 within
+the candidate pool, not absolute relevance probabilities, so they are unsuitable for
+absolute score filtering. When enabling Choice, set `"threshold": 0`. The MCP `find`
+and `search` `min_score` argument overrides that setting, so pass `min_score=0` when
+using Choice through MCP.
 
 **Parameters**
 
@@ -1082,6 +1099,7 @@ parallel in one request, and scores do not compete or have to sum to 1.
 | `api_key` | str | API key (for `openai`, `cohere`, or `jev` providers) |
 | `api_base` | str | Endpoint URL (for `openai` or `jev`; Jev defaults to `https://api.typesafe.ai`, Vercel uses `https://ai-gateway.vercel.sh/typesafe`) |
 | `model` | str | Model name for OpenAI-compatible, LiteLLM, or Jev providers |
+| `mode` | `"noul"`, `"choice"`, or `null` | Jev rerank mode. `null` and omission use `"noul"` |
 | `timeout` | float | HTTP request timeout in seconds for HTTP rerank providers, including Jev. Default: `30.0` |
 | `max_input_tokens` | int | Maximum estimated raw-text tokens in each query-document pair sent to the reranker. Oversized inputs retain their beginning and end. `0` disables. Default: `0` |
 | `log_payloads` | bool | Log complete rerank request and response payloads. May expose query and document content. Default: `false` |
@@ -1093,19 +1111,18 @@ parallel in one request, and scores do not compete or have to sum to 1.
 - `cohere`: Cohere Rerank API
 - `openai`: OpenAI-compatible Rerank API
 - `litellm`: LiteLLM Rerank API
-- `jev`: Jev (TypeSafe System One) structured-decision API; each document receives an independent Noul relevance score
+- `jev`: Jev (TypeSafe System One) structured-decision API with Choice comparison and independent Noul scoring
 
 If rerank is not configured, search uses vector similarity only.
 
 ### retrieval
 
-Retrieval ranking configuration for final search scores.
+Configuration for session intent analysis and context assembly timeouts.
 
 ```json
 {
   "retrieval": {
-    "hotness_alpha": 0.0,
-    "score_propagation_alpha": 1.0,
+    "enable_intent": true,
     "recall_intent_timeout_s": 5.0,
     "recall_rewrite_timeout_s": 30.0
   }
@@ -1114,10 +1131,7 @@ Retrieval ranking configuration for final search scores.
 
 | Parameter | Type | Description | Default |
 |-----------|------|-------------|---------|
-| `hotness_alpha` | float | Weight for blending hotness into final retrieval scores. `0.0` disables the hotness boost and keeps scores equal to semantic similarity; `1.0` uses only hotness. Valid range: `0.0` to `1.0`. | `0.0` |
-| `score_propagation_alpha` | float | Weight for each child result's own score when blending with its parent score during hierarchical retrieval. `1.0` ignores the parent score (semantic similarity only); `0.5` is an equal blend with the parent score; `0.0` uses only the parent score. Valid range: `0.0` to `1.0`. | `1.0` |
-
-Keep `hotness_alpha` at `0.0` when you need scores to reflect pure vector similarity. Set it above `0.0` only when frequently accessed or recently updated contexts should receive a ranking boost.
+| `enable_intent` | bool | Run intent analysis and query planning when `search()` receives a `session_id`. | `true` |
 
 The `mode="context"` assembly face on `/search` uses two timeout fuses:
 
@@ -2066,8 +2080,7 @@ For detailed encryption explanations, see [Data Encryption](../concepts/10-encry
     "extra_headers": {}
   },
   "retrieval": {
-    "hotness_alpha": 0.0,
-    "score_propagation_alpha": 1.0
+    "enable_intent": true
   },
   "encryption": {
     "enabled": false,

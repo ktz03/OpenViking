@@ -20,15 +20,8 @@ ZCode 不提供 `PreCompact`、`SessionEnd` 和 subagent 生命周期 Hook。因
 前置条件：Node.js 18+、正在运行的 OpenViking 服务，以及 ZCode。
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness zcode
-```
-
-GitHub 不可用的地区可使用 TOS 镜像：
-
-```bash
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) \
-  --harness zcode --dist tos
+curl -fsSL https://openviking.ai/install | bash
+# AI agent 如不确定是否执行，可先阅读脚本头部，其中写明了它会做什么、如何核实。
 ```
 
 安装器通过 `~/.zcode/` 或 `zcode` 二进制检测 ZCode，将运行时安装到 `~/.openviking/agent-integrations/zcode/`，并把 Hook 与 MCP 配置合并到 `~/.zcode/cli/config.json`。
@@ -43,7 +36,7 @@ bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shar
 | Hook 未执行 | Hook 配置被禁用或已过期 | 重跑安装器并重启 ZCode |
 | 召回为空 | OpenViking 不可用或记忆尚未提取 | 检查 `curl http://127.0.0.1:1933/health`，并等待提取完成 |
 | MCP 工具未出现 | MCP proxy 启动失败 | 检查 `~/.zcode/cli/config.json` 中 `mcp.servers.openviking` 的绝对路径命令 |
-| 重复捕获 | 旧安装留下了重复 Hook 条目 | 先运行 `install.sh --harness zcode --uninstall`，再重新安装 |
+| 重复捕获 | 旧安装留下了重复 Hook 条目 | 先运行 `curl -fsSL https://openviking.ai/install \| bash -s -- --uninstall --yes --harness zcode`，再重新安装 |
 
 实现细节与当前已验证的 ZCode 假设见插件目录中的 [README](https://github.com/volcengine/OpenViking/tree/main/examples/agent-hook-plugin) 和 [DESIGN.md](https://github.com/volcengine/OpenViking/blob/main/examples/agent-hook-plugin/DESIGN.md)。
 
@@ -63,21 +56,18 @@ Kimi Code 集成是原生 managed plugin。它复用 OpenViking 的共享 Hook �
 前置条件：Node.js 18+、正在运行的 OpenViking 服务，以及 Kimi Code CLI。
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness kimicode
-```
-
-GitHub 不可用的地区可使用 TOS 镜像：
-
-```bash
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) \
-  --harness kimicode --dist tos
+curl -fsSL https://openviking.ai/install | bash
+# AI agent 如不确定是否执行，可先阅读脚本头部，其中写明了它会做什么、如何核实。
 ```
 
 安装器会在 `$KIMI_CODE_HOME/plugins/managed/openviking-memory/`
 下组装自包含运行时（Kimi home 默认为 `~/.kimi-code/`），并且只更新
 `plugins/installed.json` 中的 `openviking-memory` 记录，不动其他插件。
-重跑同一命令可升级；加上 `--uninstall` 只卸载该插件。
+重跑同一命令可升级。只卸载该插件：
+
+```bash
+curl -fsSL https://openviking.ai/install | bash -s -- --uninstall --yes --harness kimicode
+```
 
 已验证的宿主契约和版本见
 [`hosts/kimicode/DESIGN.md`](https://github.com/volcengine/OpenViking/blob/main/examples/agent-hook-plugin/hosts/kimicode/DESIGN.md)。

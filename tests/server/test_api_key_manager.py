@@ -16,6 +16,7 @@ from openviking.server.api_keys.legacy import ACCOUNTS_PATH, USERS_PATH_TEMPLATE
 from openviking.server.identity import Role
 from openviking_cli.exceptions import (
     AlreadyExistsError,
+    FailedPreconditionError,
     InvalidArgumentError,
     NotFoundError,
     PermissionDeniedError,
@@ -644,6 +645,48 @@ async def test_default_account_exists(manager: APIKeyManager):
     """Default account should be created on load."""
     accounts = manager.get_accounts()
     assert any(a["account_id"] == "default" for a in accounts)
+
+
+@pytest.mark.parametrize("operation", ["create", "delete", "trusted"])
+async def test_account_mutation_preserves_registry_when_baseline_is_missing(
+    manager: APIKeyManager, monkeypatch: pytest.MonkeyPatch, operation: str
+):
+    survivor = _uid()
+    key = await manager.create_account(survivor, "alice")
+    target = _uid()
+    if operation == "delete":
+        await manager.create_account(target, "bob")
+    read = manager._legacy._async_agfs.read
+    before = await read(ACCOUNTS_PATH)
+    missing_reads = 0
+
+    async def missing_once(path, *args, **kwargs):
+        nonlocal missing_reads
+        if path == ACCOUNTS_PATH and missing_reads == 0:
+            missing_reads += 1
+            raise AGFSNotFoundError("injected missing registry read")
+        return await read(path, *args, **kwargs)
+
+    monkeypatch.setattr(manager._legacy._async_agfs, "read", missing_once)
+
+    async def mutate():
+        if operation == "create":
+            return await manager.create_account(target, "bob")
+        if operation == "delete":
+            return await manager.delete_account(target)
+        return await manager.ensure_trusted_identities({target: {"bob"}})
+
+    with pytest.raises(FailedPreconditionError, match="Account registry"):
+        await mutate()
+    assert missing_reads == 1
+    assert await read(ACCOUNTS_PATH) == before
+    assert manager.resolve(key).account_id == survivor
+    await manager.reload()
+    assert manager.resolve(key).account_id == survivor
+    # The failed mutation must also release its lease and leave retries usable.
+    await mutate()
+    await manager.reload()
+    assert manager.resolve(key).account_id == survivor
 
 
 # ---- User lifecycle tests ----

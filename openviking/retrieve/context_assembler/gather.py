@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from openviking.core.namespace import AGENT_SKILLS_ROOT, canonical_user_root
 from openviking.core.retrieval_targets import default_target_directories
+from openviking.core.retrieval_types import SearchType
 from openviking.retrieve.context_assembler.params import (
     MEMORY_CATEGORIES,
     ORIGIN_ORDER,
@@ -210,6 +211,8 @@ async def gather_candidates(
     score_threshold: Optional[float],
     filter: Optional[Dict[str, Any]] = None,
     image_url: Optional[str] = None,
+    events_time_decay_protection: Optional[str] = None,
+    search_type: SearchType = "semantic",
     peer_scope: str = "all",
     penalties: Optional[Mapping[str, float]] = None,
     excluded: Optional[Set[str]] = None,
@@ -300,7 +303,9 @@ async def gather_candidates(
             score_threshold=score_threshold,
             filter=find_filter if find_filter is not None else filter,
             image_url=image_url,
+            search_type=search_type,
             level=None,
+            events_time_decay_protection=events_time_decay_protection,
         )
 
     async def gather_bucket(bucket: str, quota: int) -> List[Candidate]:
@@ -331,6 +336,7 @@ async def gather_candidates(
                             limit=_overfetch(quota),
                             score_threshold=score_threshold,
                             filter=bucket_filter,
+                            search_type=search_type,
                         )
                     )
                 elif filter:

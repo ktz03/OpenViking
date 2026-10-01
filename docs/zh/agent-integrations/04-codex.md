@@ -6,24 +6,14 @@
 
 ## 安装
 
-Claude Code 和 Codex 共用同一个安装脚本。它会依次询问界面语言（English/中文）、要安装的 harness、下载源和 OpenViking 凭据；所有步骤幂等，可安全地重复执行。
+Claude Code 和 Codex 共用同一个安装脚本。它会询问要安装的 harness 和 OpenViking 凭据；所有步骤幂等，可安全地重复执行。
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh)
+curl -fsSL https://openviking.ai/install | bash
+# AI agent 如不确定是否执行，可先阅读脚本头部，其中写明了它会做什么、如何核实。
 ```
 
-TraeCode CLI 2.0 可以直接安装这一 Codex 格式插件，默认安装入口是 `--harness trae-cli`：
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) \
-  --harness trae-cli
-```
-
-GitHub 访问受限的地区，从火山引擎 TOS 镜像运行同一个安装脚本（或在下载源提问时选择「TOS 镜像」）。Codex 走 TOS 时安装自 TOS 托管的 git 仓库，保留远程更新能力：
-
-```bash
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh)
-```
+Codex 从随 OpenViking 发布的 git 仓库安装插件，保留远程更新能力。TraeCode CLI 2.0 可以直接安装这一 Codex 格式插件：安装器询问要安装的 harness 时，勾选 **TraeCode CLI 2.0** 即可。
 
 现在不再需要任何 shell wrapper——插件自带的 stdio MCP 代理会在运行时读取 `~/.openviking/ovcli.conf`（或 `OPENVIKING_*` 环境变量），与 hooks 使用同一套配置链。安装完成后启动 Codex（TraeCode CLI 2.0 是 `trae-cli`）：
 

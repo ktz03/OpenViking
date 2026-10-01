@@ -43,7 +43,7 @@ def _service(rerank_config):
     fs = SimpleNamespace(
         _ensure_retrieval_scope=ensure_scope,
         _get_vector_store=lambda: object(),
-        _get_embedder=lambda: object(),
+        _get_embedder=lambda _ctx: object(),
         rerank_config=rerank_config,
         retrieval_config=None,
     )
@@ -65,6 +65,17 @@ async def test_find_skills_forwards_the_filter_as_the_retrieval_scope(seen):
     )
 
     assert seen["retrieve"]["scope_dsl"] == TAG_FILTER
+
+
+async def test_find_skills_forwards_keywords_search_type(seen):
+    await _service(None).find_skills(
+        query="deploy",
+        ctx=_ctx(),
+        target_uri=SKILLS,
+        search_type="keywords",
+    )
+
+    assert seen["retrieve"]["search_type"] == "keywords"
 
 
 @pytest.mark.parametrize("query", ["", "  "])

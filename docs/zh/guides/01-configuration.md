@@ -355,7 +355,7 @@ OpenAI 已于 2026 年 8 月 31 日[停止在 ChatGPT 登录的 Codex 中提供 
 - `voyage`: Voyage AI Embedding API
 - `minimax`: MiniMax Embedding API
 - `cohere`: Cohere Embedding API
-- `gemini`: Google Gemini Embedding API（仅文本；需安装 `google-genai>=1.0.0`）
+- `gemini`: Google Gemini Embedding API（仅文本；需安装 `google-genai>=1.39.0`）
 - `dashscope`: DashScope（阿里通义）Embedding API
 - `litellm`: LiteLLM Embedding API
 - `local`: 本地 GGUF embedding 模型
@@ -498,7 +498,9 @@ OpenAI 已于 2026 年 8 月 31 日[停止在 ChatGPT 登录的 Codex 中提供 
 
 **gemini provider 配置示例:**
 
-> **注意：** 需要在服务端环境安装 `google-genai>=1.0.0`——uv 安装：`uv tool install openviking --upgrade --with "google-genai>=1.0.0"`；pip 安装：`pip install "google-genai>=1.0.0"`。异步批量嵌入改用 extra：`uv tool install "openviking[gemini-async]" --upgrade` 或 `pip install "openviking[gemini-async]"`。
+SDK 1.39.0 起提供所需的客户端上下文管理器和关闭方法，用于在所属事件循环内完成异步嵌入请求及清理。启用此 provider 前，请升级固定在旧版本的 SDK。
+
+> **注意：** 需要在服务端环境安装 `google-genai>=1.39.0`——uv 安装：`uv tool install openviking --upgrade --with "google-genai>=1.39.0"`；pip 安装：`pip install "google-genai>=1.39.0"`。异步批量嵌入改用 extra：`uv tool install "openviking[gemini-async]" --upgrade` 或 `pip install "openviking[gemini-async]"`。
 
 ```json
 {
@@ -721,8 +723,8 @@ provider，并设置 `storage.vectordb.sparse_weight > 0`。自托管模型的�
 
 添加资源时，VLM 生成：
 
-1. **L0（摘要）**：~100 token 摘要
-2. **L1（概览）**：~2k token 概览，包含导航信息
+1. **L0（摘要）**：文件或目录摘要，默认字符上限为 256
+2. **L1（概览）**：目录概览，包含导航信息，默认字符上限为 4000
 
 如果未配置 VLM，L0/L1 将直接从内容生成（语义性较弱），多模态资源的描述可能有限。
 
@@ -769,7 +771,9 @@ LiteLLM 的 Bedrock bearer-token API-key 鉴权，请设置 `forward_api_key=tru
 
 **自定义请求 Body**
 
-对于接受 provider 专有 JSON body 字段的 OpenAI 兼容 provider，可以通过 `extra_request_body` 配置。OpenViking 会把这些字段合并到 OpenAI SDK 或 LiteLLM 发送的 `extra_body` 中：
+通过 `extra_request_body` 配置 provider 专有 JSON body 字段。OpenAI 兼容路由使用 SDK 的 `extra_body`；LiteLLM Anthropic 路由将 `thinking`、`output_config` 等原生选项直接传给 LiteLLM，使其进入请求 body 顶层。LiteLLM 仍会校验模型是否支持这些选项。在 Anthropic 路由中，LiteLLM 控制参数名（包括 `api_key`、`api_base`、`metadata`、`mock_response`）以及调用自身管理的字段（`model`、`messages`、`tools`、`tool_choice`、`stream`、`timeout` 和请求头）会报错，不会覆盖调用。凭据和路由请使用各自的专用配置。
+
+例如，关闭 Ollama 的思考模式：
 
 ```json
 {
@@ -810,6 +814,8 @@ LiteLLM 的 Bedrock bearer-token API-key 鉴权，请设置 `forward_api_key=tru
 }
 ```
 
+`vlm.extra_request_body` 也适用于音视频的方舟 Responses 请求，例如 `{"service_tier": "flex", "thinking": {"type": "disabled"}}`。请使用所选模型和 Responses API 支持的字段。显式配置的额外字段通过 SDK 覆盖自动生成的请求字段，包括 `store`；响应存储默认设为 `false`，仅在显式配置时覆盖。这些字段不会传给文件上传、状态查询或删除请求。
+
 VLM 的 `model` 填写对应的方舟模型 endpoint ID。`video_fps` 仅用于视频，控制发送给方舟的视频采样帧率。
 
 推荐使用 `doubao-seed-2-0-lite-260428` 或 `doubao-seed-2-0-mini-260428` 作为音视频理解模型。它们是可直接采用的推荐示例，并非完整的支持模型列表；方舟会持续更新模型及其输入能力。视频理解的可选模型请参考方舟官方[视频输入能力列表](https://console.volcengine.com/ark/region:cn-beijing/docs/82379/1330310?lang=zh#ff5ef604)，音频理解的可选模型请参考方舟官方[音频输入能力列表](https://console.volcengine.com/ark/region:cn-beijing/docs/82379/1330310?lang=zh#9619c0ba)。如果 `model` 填写的是 `ep-*` 推理接入点 ID，请确认该接入点背后的基础模型支持对应的媒体输入。OpenViking 不会在配置加载时校验模型的音频或视频能力。
@@ -823,7 +829,7 @@ VLM 的 `model` 填写对应的方舟模型 endpoint ID。`video_fps` 仅用于�
 
 不在“可理解”列中的格式继续沿用现有 Parser 和存储行为；OpenViking 不会对这些文件转码，也不会把它们发送给理解模型。当文件被识别为音频或视频叶子节点时，空媒体摘要会使用文件名入库。
 
-对于支持的文件，OpenViking 将媒体上传到方舟 Files API，且不显式指定 `expire_at`，因此文件保留时间遵循方舟的默认策略。文件处理完成后，OpenViking 通过禁用响应存储的 Responses API 请求引用其 `file_id`，最后在较短的清理超时内尝试删除方舟文件。远端删除属于 best-effort；如果删除失败或超时，不会覆盖已经成功的理解结果，文件将继续遵循方舟的默认保留策略。本地临时文件独立清理，即使远端清理失败或请求被取消也会删除。
+对于支持的文件，OpenViking 将媒体上传到方舟 Files API，且不显式指定 `expire_at`，因此文件保留时间遵循方舟的默认策略。文件处理完成后，OpenViking 通过默认禁用响应存储的 Responses API 请求引用其 `file_id`，最后在较短的清理超时内尝试删除方舟文件。远端删除属于 best-effort；如果删除失败或超时，不会覆盖已经成功的理解结果，文件将继续遵循方舟的默认保留策略。本地临时文件独立清理，即使远端清理失败或请求被取消也会删除。
 
 - 目录中只有一个音频或视频文件且理解成功时，该摘要直接成为目录 L1，并通过现有语义链路派生 L0，不再调用通用 VLM 做第二次总结。
 - 媒体位于混合目录时，其摘要仍参与现有通用 VLM 聚合。
@@ -1030,9 +1036,18 @@ PDF 解析配置。支持三种策略：`local`（本地 pdfplumber）、`mineru
 - `api_base` 必须带 `/typesafe` 后缀；`https://ai-gateway.vercel.sh/v1` 是
   Vercel 自有的 evaluate 协议，适配器不支持。
 
-Jev 适配器将 query 和候选文档作为结构化 System One `state`，并为每个候选
-提出一个独立的 Noul 相关性问题。每个问题返回的 yes 概率就是该文档的 rerank
-分数。所有问题在一次请求中并行计算，各文档分数互不竞争，也不要求总和为 1。
+Jev 适配器将 query 和候选文档作为共享的 System One `state`，支持两种模式：
+
+- `noul`（默认）：为每篇文档提出独立的相关性问题，返回的 yes 概率作为分数。
+  所有问题放在一次 HTTP 请求中，各文档分数不要求总和为 1。
+- `choice`：用一个问题横向比较所有候选文档，以 `candidate_{index}` 对应输入
+  下标，并按原文档顺序读取 `probabilities` 作为分数。
+
+通过 `rerank.mode` 选择模式；未配置或配置为 `null` 时默认使用 `noul`。Choice
+返回候选池内总和为 1 的相对概率，不是绝对相关概率，不适合使用绝对分数阈值。
+启用 Choice 时建议同时设置 `"threshold": 0`。MCP `find` 和 `search` 的
+`min_score` 会覆盖该配置，因此通过 MCP 使用 Choice 时还需要显式传入
+`min_score=0`。
 
 **参数**
 
@@ -1045,6 +1060,7 @@ Jev 适配器将 query 和候选文档作为结构化 System One `state`，并�
 | `api_key` | str | API Key（用于 `openai`、`cohere` 或 `jev` 提供方） |
 | `api_base` | str | 接口地址（用于 `openai` 或 `jev`；Jev 默认为 `https://api.typesafe.ai`，Vercel 使用 `https://ai-gateway.vercel.sh/typesafe`） |
 | `model` | str | 模型名称（用于 OpenAI 兼容、LiteLLM 或 `jev` 提供方） |
+| `mode` | `"noul"`、`"choice"` 或 `null` | Jev Rerank 模式；省略或 `null` 时使用 `"noul"` |
 | `timeout` | float | HTTP Rerank provider（包括 Jev）的请求超时时间，单位为秒。默认：`30.0` |
 | `max_input_tokens` | int | 每个 query-document 对发送给 reranker 的最大估算原始文本 token 数；超长输入会保留开头和结尾。`0` 表示不截断。默认：`0` |
 | `log_payloads` | bool | 记录完整 rerank 请求和响应；日志可能包含 query 和文档内容。默认：`false` |
@@ -1056,19 +1072,18 @@ Jev 适配器将 query 和候选文档作为结构化 System One `state`，并�
 - `cohere`: Cohere Rerank API
 - `openai`: OpenAI 兼容的 Rerank 接口
 - `litellm`: LiteLLM Rerank 接口
-- `jev`: Jev (TypeSafe System One) 结构化判定接口，为每篇文档独立计算 Noul 相关性分数
+- `jev`: Jev (TypeSafe System One) 结构化判定接口，支持 Choice 横向比较和 Noul 独立评分
 
 如果未配置 Rerank，搜索仅使用向量相似度。
 
 ### retrieval
 
-最终搜索分数的召回排序配置。
+会话意图分析和上下文组装的超时配置。
 
 ```json
 {
   "retrieval": {
-    "hotness_alpha": 0.0,
-    "score_propagation_alpha": 1.0,
+    "enable_intent": true,
     "recall_intent_timeout_s": 5.0,
     "recall_rewrite_timeout_s": 30.0
   }
@@ -1077,10 +1092,7 @@ Jev 适配器将 query 和候选文档作为结构化 System One `state`，并�
 
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
-| `hotness_alpha` | float | hotness 分数在最终召回分数中的混合权重。`0.0` 表示关闭 hotness boost，最终分数等于语义相似度；`1.0` 表示只使用 hotness。有效范围：`0.0` 到 `1.0`。 | `0.0` |
-| `score_propagation_alpha` | float | 层级检索中，子节点自身分数与父节点传播分数混合时，子节点自身分数的权重。`1.0` 表示忽略父节点分数（仅使用语义相似度）；`0.5` 表示与父节点分数等权混合；`0.0` 表示只使用父节点分数。有效范围：`0.0` 到 `1.0`。 | `1.0` |
-
-如果需要分数严格反映向量相似度，保持 `hotness_alpha` 为 `0.0`。只有当希望高频访问或最近更新的上下文获得排序提升时，才将它设置为大于 `0.0`。
+| `enable_intent` | bool | `search()` 收到 `session_id` 时是否执行意图分析和查询规划。 | `true` |
 
 `/search` 的 `mode="context"` 组装面用到两个超时熔断：
 
@@ -2032,8 +2044,7 @@ Task 记录文件位于所属账号的系统目录：
     "extra_headers": {}
   },
   "retrieval": {
-    "hotness_alpha": 0.0,
-    "score_propagation_alpha": 1.0
+    "enable_intent": true
   },
   "encryption": {
     "enabled": false,

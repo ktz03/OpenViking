@@ -3,10 +3,12 @@
 """Semantic retrieval mixin for VikingFS."""
 
 import asyncio
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
 
 from openviking.core.context import ContextLevel
 from openviking.core.retrieval_targets import resolve_retrieval_targets
+from openviking.core.retrieval_types import SearchType
 from openviking.server.error_mapping import is_not_found_error, map_exception
 from openviking.server.identity import RequestContext
 from openviking.storage.abstract_overview import (
@@ -24,7 +26,8 @@ from openviking.storage.viking_fs._base import (
 )
 from openviking.telemetry import get_current_telemetry
 from openviking.utils.image_search import build_multimodal_embedding_input
-from openviking_cli.exceptions import NotFoundError
+from openviking.utils.time_decay import parse_duration_ms
+from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
 
 
 class _SemanticMixin:
@@ -199,6 +202,8 @@ class _SemanticMixin:
         ctx: Optional[RequestContext] = None,
         level: Optional[List[int]] = None,
         image_url: Optional[str] = None,
+        events_time_decay_protection: Optional[str] = None,
+        search_type: SearchType = "semantic",
     ):
         """Semantic search.
 
@@ -223,8 +228,19 @@ class _SemanticMixin:
         filter_only = is_filter_only_query(query, image_url)
         if filter_only:
             _ensure_filter_present(filter)
+            if events_time_decay_protection is not None:
+                raise InvalidArgumentError(
+                    "events_time_decay_protection requires a semantic query or image"
+                )
         else:
             _ensure_non_empty_search_query(query, image_url)
+        if events_time_decay_protection is not None:
+            parse_duration_ms(
+                events_time_decay_protection, parameter_name="events_time_decay_protection"
+            )
+        request_now = (
+            datetime.now(timezone.utc) if events_time_decay_protection is not None else None
+        )
 
         telemetry = get_current_telemetry()
         from openviking.retrieve.hierarchical_retriever import (
@@ -257,14 +273,13 @@ class _SemanticMixin:
             raise RuntimeError("Vector store not initialized. Call OpenViking.initialize() first.")
 
         embedder = self._get_embedder(real_ctx)
-        if not embedder:
+        if search_type == "semantic" and not embedder:
             raise RuntimeError("Embedder not configured.")
 
         retriever = HierarchicalRetriever(
             storage=storage,
             embedder=embedder,
             rerank_config=self.rerank_config,
-            retrieval_config=self.retrieval_config,
         )
 
         typed_query = TypedQuery(
@@ -291,6 +306,9 @@ class _SemanticMixin:
             score_threshold=score_threshold,
             scope_dsl=filter,
             level=level,
+            events_time_decay_protection=events_time_decay_protection,
+            request_now=request_now,
+            search_type=search_type,
         )
 
         # Convert QueryResult to FindResult
@@ -382,6 +400,8 @@ class _SemanticMixin:
         ctx: Optional[RequestContext] = None,
         level: Optional[List[int]] = None,
         image_url: Optional[str] = None,
+        events_time_decay_protection: Optional[str] = None,
+        search_type: SearchType = "semantic",
     ):
         """Complex search with session context.
 
@@ -396,6 +416,13 @@ class _SemanticMixin:
             FindResult
         """
         _ensure_non_empty_search_query(query, image_url)
+        if events_time_decay_protection is not None:
+            parse_duration_ms(
+                events_time_decay_protection, parameter_name="events_time_decay_protection"
+            )
+        request_now = (
+            datetime.now(timezone.utc) if events_time_decay_protection is not None else None
+        )
         telemetry = get_current_telemetry()
         from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever
         from openviking.retrieve.intent_analyzer import IntentAnalyzer
@@ -486,7 +513,6 @@ class _SemanticMixin:
             storage=storage,
             embedder=embedder,
             rerank_config=self.rerank_config,
-            retrieval_config=self.retrieval_config,
         )
 
         async def _execute(tq: TypedQuery):
@@ -501,6 +527,9 @@ class _SemanticMixin:
                 score_threshold=score_threshold,
                 scope_dsl=filter,
                 level=level,
+                events_time_decay_protection=events_time_decay_protection,
+                request_now=request_now,
+                search_type=search_type,
             )
 
         query_results = await asyncio.gather(*[_execute(tq) for tq in typed_queries])

@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from openviking.models.rerank import JevRerankClient, RerankClient
+from openviking.models.rerank.jev_rerank import MODE_CHOICE, MODE_NOUL
 from openviking_cli.utils.config.rerank_config import RerankConfig
 
 
@@ -41,6 +42,7 @@ class TestJevRerankClient:
         client = JevRerankClient(api_key="test-key")
         scores = client.rerank_batch("What is UCW?", ["doc A", "doc B", "doc C"])
 
+        assert client.mode == MODE_NOUL
         assert scores == [0.97, 0.04, 0.07]
         body = mock_client.post.call_args[1]["json"]
         assert body["model"] == "jev-latest"
@@ -64,6 +66,7 @@ class TestJevRerankClient:
             api_key="vercel-key",
             api_base="https://ai-gateway.vercel.sh/typesafe",
             model_name="typesafe-ai/jev",
+            mode=MODE_NOUL,
         )
         assert client.rerank_batch("query", ["first", "second"]) == [0.91, 0.08]
 
@@ -80,7 +83,7 @@ class TestJevRerankClient:
         mock_client_class.return_value = mock_client
         mock_client.post.return_value = _mock_response(_systemone_payload([0.9]))
 
-        client = JevRerankClient(api_key="secret-key", log_payloads=True)
+        client = JevRerankClient(api_key="secret-key", log_payloads=True, mode=MODE_NOUL)
         assert client.rerank_batch("query", ["document"]) == [0.9]
 
         messages = [str(call) for call in mock_log.call_args_list]
@@ -95,7 +98,7 @@ class TestJevRerankClient:
         mock_client_class.return_value = mock_client
         mock_client.post.return_value = _mock_response(_systemone_payload([0.9]))
 
-        client = JevRerankClient(api_key="secret-key")
+        client = JevRerankClient(api_key="secret-key", mode=MODE_NOUL)
         assert client.rerank_batch("query", ["document"]) == [0.9]
         mock_log.assert_not_called()
 
@@ -111,7 +114,7 @@ class TestJevRerankClient:
         error = httpx.HTTPStatusError("401", request=MagicMock(), response=MagicMock())
         mock_client.post.return_value = _mock_response({}, status_error=error)
 
-        client = JevRerankClient(api_key="bad-key")
+        client = JevRerankClient(api_key="bad-key", mode=MODE_NOUL)
         assert client.rerank_batch("query", ["doc"]) is None
 
     @patch("openviking.models.rerank.jev_rerank.httpx.Client")
@@ -122,7 +125,7 @@ class TestJevRerankClient:
             {"answers": {}, "usage": {"input_tokens": 1, "output_tokens": 1}}
         )
 
-        client = JevRerankClient(api_key="key")
+        client = JevRerankClient(api_key="key", mode=MODE_NOUL)
         assert client.rerank_batch("q", ["doc"]) is None
 
     @patch("openviking.models.rerank.jev_rerank.httpx.Client")
@@ -131,7 +134,7 @@ class TestJevRerankClient:
         mock_client_class.return_value = mock_client
         mock_client.post.return_value = _mock_response(_systemone_payload([0.2, 0.8, 0.4]))
 
-        client = JevRerankClient(api_key="key")
+        client = JevRerankClient(api_key="key", mode=MODE_NOUL)
         scores = client.rerank_batch("q", ["a", "b", "c"])
 
         assert scores == [0.2, 0.8, 0.4]
@@ -144,7 +147,7 @@ class TestJevRerankClient:
         mock_client_class.return_value = mock_client
         mock_client.post.return_value = _mock_response(_systemone_payload([1.1]))
 
-        client = JevRerankClient(api_key="key")
+        client = JevRerankClient(api_key="key", mode=MODE_NOUL)
         assert client.rerank_batch("q", ["doc"]) is None
 
     @patch("openviking.models.rerank.jev_rerank.httpx.Client")
@@ -156,11 +159,141 @@ class TestJevRerankClient:
         mock_client.close.assert_called_once()
 
 
+class TestChoiceRerank:
+    @patch("openviking.models.rerank.jev_rerank.httpx.Client")
+    def test_choice_preserves_document_order(self, mock_client_class):
+        mock_client = mock_client_class.return_value
+        mock_client.post.return_value = _mock_response(
+            {
+                "answers": {
+                    "relevance": {
+                        "type": "choice",
+                        "choice": "candidate_1",
+                        "confidence": 0.55,
+                        "probabilities": {
+                            "candidate_2": 0.2,
+                            "candidate_1": 0.7,
+                            "candidate_0": 0.1,
+                        },
+                    }
+                },
+                "usage": {"input_tokens": None, "output_tokens": 1},
+            }
+        )
+        client = JevRerankClient(api_key="key", mode=MODE_CHOICE)
+        assert client.mode == MODE_CHOICE
+        assert client.rerank_batch("query", ["first", "second", "third"]) == [0.1, 0.7, 0.2]
+        body = mock_client.post.call_args.kwargs["json"]
+        assert body["state"] == {
+            "query": "query",
+            "candidate_documents": ["first", "second", "third"],
+        }
+        assert body["questions"] == {
+            "relevance": {
+                "type": "choice",
+                "instructions": (
+                    "Which candidate document best answers or matches the retrieval intent of query?"
+                ),
+                "criteria": {
+                    "candidate_0": (
+                        "candidate_documents[0] directly answers or is relevant to the query"
+                    ),
+                    "candidate_1": (
+                        "candidate_documents[1] directly answers or is relevant to the query"
+                    ),
+                    "candidate_2": (
+                        "candidate_documents[2] directly answers or is relevant to the query"
+                    ),
+                },
+            }
+        }
+        mock_client.post.assert_called_once_with("https://api.typesafe.ai/v1/systemone", json=body)
+
+    @pytest.mark.parametrize("count", [1, 30])
+    @patch("openviking.models.rerank.jev_rerank.httpx.Client")
+    def test_choice_does_not_impose_candidate_limit(self, mock_client_class, count):
+        probabilities = {f"candidate_{index}": 1 / count for index in range(count)}
+        mock_client_class.return_value.post.return_value = _mock_response(
+            {"answers": {"relevance": {"type": "choice", "probabilities": probabilities}}}
+        )
+        client = JevRerankClient(api_key="key", mode=MODE_CHOICE)
+        assert client.rerank_batch("query", ["doc"] * count) == [1 / count] * count
+        criteria = mock_client_class.return_value.post.call_args.kwargs["json"]["questions"][
+            "relevance"
+        ]["criteria"]
+        assert list(criteria) == list(probabilities)
+
+    @patch("openviking.models.rerank.jev_rerank.httpx.Client")
+    def test_choice_empty_input_does_not_send_request(self, mock_client_class):
+        client = JevRerankClient(api_key="key", mode=MODE_CHOICE)
+        assert client.rerank_batch("query", []) == []
+        mock_client_class.return_value.post.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            None,
+            {"type": "noul", "noul": 0.8},
+            {"type": "choice", "choice": "candidate_0", "confidence": 0.8},
+            {"type": "choice", "probabilities": []},
+            {"type": "choice", "probabilities": {"candidate_0": 0.8}},
+            {
+                "type": "choice",
+                "probabilities": {"candidate_0": 0.8, "candidate_1": "0.2"},
+            },
+            {"type": "choice", "probabilities": {"candidate_0": 0.8, "candidate_1": True}},
+            {"type": "choice", "probabilities": {"candidate_0": 0.8, "candidate_1": -0.1}},
+            {"type": "choice", "probabilities": {"candidate_0": 0.8, "candidate_1": 1.1}},
+            {
+                "type": "choice",
+                "probabilities": {"candidate_0": 0.8, "candidate_1": float("nan")},
+            },
+        ],
+    )
+    @patch("openviking.models.rerank.jev_rerank.httpx.Client")
+    def test_invalid_choice_answer_returns_none(self, mock_client_class, answer):
+        mock_client_class.return_value.post.return_value = _mock_response(
+            {"answers": {"relevance": answer}}
+        )
+        client = JevRerankClient(api_key="key", mode=MODE_CHOICE)
+        assert client.rerank_batch("query", ["first", "second"]) is None
+        mock_client_class.return_value.post.assert_called_once()
+
+    @patch("openviking.models.rerank.jev_rerank.httpx.Client")
+    def test_unknown_mode_rejected_before_client_creation(self, mock_client_class):
+        with pytest.raises(ValueError, match="Unknown Jev rerank mode"):
+            JevRerankClient(api_key="key", mode="unknown")
+        mock_client_class.assert_not_called()
+
+
 class TestJevRerankConfig:
     def test_explicit_jev_provider(self):
         config = RerankConfig(provider="jev", api_key="key")
         assert config._effective_provider() == "jev"
         assert config.is_available() is True
+        assert config.mode == MODE_NOUL
+
+    @pytest.mark.parametrize("mode", [MODE_CHOICE, "CHOICE"])
+    def test_explicit_choice_mode(self, mode):
+        config = RerankConfig(provider="jev", api_key="key", mode=mode)
+        assert config.mode == MODE_CHOICE
+
+    def test_null_mode_uses_client_default(self):
+        config = RerankConfig(provider="jev", api_key="key", mode=None)
+        assert config.mode is None
+
+    def test_unknown_mode_rejected(self):
+        with pytest.raises(ValueError, match="Jev rerank mode"):
+            RerankConfig(provider="jev", api_key="key", mode="unknown")
+
+    def test_non_jev_provider_does_not_validate_jev_mode(self):
+        config = RerankConfig(
+            provider="openai",
+            api_key="key",
+            api_base="https://example.com/rerank",
+            mode="listwise",
+        )
+        assert config.mode == "listwise"
 
     def test_jev_auto_detected_from_api_base(self):
         config = RerankConfig(api_key="key", api_base="https://api.typesafe.ai")
@@ -191,6 +324,14 @@ class TestJevDispatch:
         assert isinstance(client, JevRerankClient)
         assert client.api_key == "jev-key"
         assert client.model_name == "jev-latest"
+        assert client.mode == MODE_NOUL
+
+    @pytest.mark.parametrize("mode", [MODE_CHOICE, None])
+    @patch("openviking.models.rerank.jev_rerank.httpx.Client")
+    def test_from_config_resolves_mode(self, mock_client_class, mode):
+        config = RerankConfig(provider="jev", api_key="key", mode=mode)
+        client = RerankClient.from_config(config)
+        assert client.mode == (mode or MODE_NOUL)
 
     @patch("openviking.models.rerank.jev_rerank.httpx.Client")
     def test_from_config_uses_custom_model(self, mock_client_class):

@@ -2,6 +2,8 @@ import pytest
 import requests
 from volcengine.base.Request import Request
 
+from openviking.storage.errors import ConnectionError
+from openviking.storage.vectordb.collection.collection import Collection
 from openviking.storage.vectordb.collection.volcengine_clients import (
     ClientForConsoleApi,
     ClientForDataApi,
@@ -233,6 +235,29 @@ def test_volcengine_collection_get_meta_data_returns_empty_on_signature_error(mo
     assert collection.get_meta_data() == {}
 
 
+def test_volcengine_collection_get_meta_data_raises_in_strict_mode(monkeypatch):
+    from openviking.storage.vectordb.collection.collection import Collection
+
+    class _Response:
+        status_code = 503
+        text = "service unavailable"
+
+        @staticmethod
+        def json():
+            return {"ResponseMetadata": {"Error": {"Code": "InternalError"}}}
+
+    collection = VolcengineCollection(
+        ak="test-ak",
+        sk="test-sk",
+        region="cn-beijing",
+        meta_data={"ProjectName": "default", "CollectionName": "context"},
+    )
+    monkeypatch.setattr(collection.console_client, "do_req", lambda *args, **kwargs: _Response())
+
+    with pytest.raises(ConnectionError, match="service unavailable"):
+        Collection(collection).get_meta_data(raise_on_error=True)
+
+
 def test_volcengine_collection_get_meta_data_returns_empty_on_collection_not_found(
     monkeypatch,
 ):
@@ -339,7 +364,7 @@ def test_volcengine_collection_update_data_sanitizes_uri_fields(monkeypatch):
     }
 
 
-def test_volcengine_collection_uses_date_time_filter_operator(monkeypatch):
+def test_volcengine_query_preserves_time_filters_and_applies_decay(monkeypatch):
     captured = {}
 
     class _Response:
@@ -347,7 +372,13 @@ def test_volcengine_collection_uses_date_time_filter_operator(monkeypatch):
 
         @staticmethod
         def json():
-            return {"result": {"agg": {"_total": 1}}}
+            return {
+                "result": {
+                    "data": [
+                        {"id": "event", "score": 0.4, "origin_score": 0.8, "addition_score": 0.5}
+                    ]
+                }
+            }
 
     collection = VolcengineCollection(
         ak="test-ak",
@@ -363,11 +394,22 @@ def test_volcengine_collection_uses_date_time_filter_operator(monkeypatch):
 
     monkeypatch.setattr(collection.data_client, "do_req", _fake_do_req)
 
+    adapter = VolcengineCollectionAdapter.from_config(
+        VectorDBBackendConfig(
+            backend="volcengine",
+            name="context",
+            volcengine=VolcengineConfig(ak="test-ak", sk="test-sk", region="cn-beijing"),
+        )
+    )
+    adapter._collection = Collection(collection)
     # Both date_time fields (created_at, updated_at) must be normalized to
     # time_range, while numeric range nodes are left untouched.
-    collection.aggregate_data(
-        index_name="default",
-        filters={
+    result = adapter.query(
+        query_vector=[1.0],
+        limit=10,
+        offset=2,
+        advance={"time_decay": {"protection": "0", "origin": "2026-08-17T00:00:00Z"}},
+        filter={
             "op": "and",
             "conds": [
                 {
@@ -386,7 +428,32 @@ def test_volcengine_collection_uses_date_time_filter_operator(monkeypatch):
         },
     )
 
-    assert captured["path"] == "/api/vikingdb/data/agg"
+    assert captured["path"] == "/api/vikingdb/data/search/vector"
+    assert result == [{"id": "event", "_score": 0.4, "_origin_score": 0.8, "_time_score": 0.5}]
+    body = captured["req_body"]
+    assert (body["limit"], body["offset"]) == (10, 2)
+    assert body["return_detail_info"] is True
+    assert body["advance"] == {
+        "post_process_ops": [
+            {
+                "op": "score_fusion",
+                "fusion_by": "multiply",
+                "normalize_for_origin_score": {"enable": False},
+                "normalize_for_addition_score": {"enable": False},
+                "addition_score": [
+                    {
+                        "factor": 1,
+                        "base_value_from": "decay_func",
+                        "field": "updated_at",
+                        "func": "exp",
+                        "origin": "2026-08-17T00:00:00.000Z",
+                        "scale": "7d",
+                        "decay": 0.5,
+                    }
+                ],
+            }
+        ]
+    }
     assert captured["req_body"]["filter"] == {
         "op": "and",
         "conds": [

@@ -73,16 +73,11 @@ Agent Plugins 1.0 只覆盖 skills 和 MCP servers；hooks、commands、agents �
 
 **如果你的 harness 支持 hooks 机制，推荐使用专属插件。** hook 驱动的召回与捕获不需要模型花费工具调用、也不依赖模型「想起来要记」，比技能驱动的闭环更省 token、也更可靠。本 Agent Plugins 包适用于没有 hooks 的 harness，或你希望用同一个包覆盖多个客户端的场景。
 
-Claude Code、Codex、Cursor、TRAE / TRAE CN、ZCode、OpenCode、pi 共用同一个安装脚本。它会依次询问界面语言、要安装的 harness、下载源和 OpenViking 凭据，所有步骤幂等，重复运行安全：
+Claude Code、Codex、Cursor、TRAE / TRAE CN、ZCode、OpenCode、pi 共用同一个安装脚本。它会询问要安装的 harness 和 OpenViking 凭据，所有步骤幂等，重复运行安全：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh)
-```
-
-GitHub 访问受限的地区，从火山引擎 TOS 镜像运行同一个脚本：
-
-```bash
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh)
+curl -fsSL https://openviking.ai/install | bash
+# AI agent 如不确定是否执行，可先阅读脚本头部，其中写明了它会做什么、如何核实。
 ```
 
 | Harness | 专属集成 |

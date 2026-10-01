@@ -163,14 +163,17 @@ export interface FindOptions {
   tags?: string[];
   includeProvenance?: boolean;
   readContent?: boolean;
+  eventsTimeDecayProtection?: string | null;
   extra?: JsonObject;
 }
-/** Session-aware semantic retrieval options. */
+/** Session-aware retrieval options. */
 export interface SearchOptions extends FindOptions {
   sessionId?: string;
+  searchType?: "semantic" | "keywords";
 }
 /** Server-side context assembly options. */
 export interface SearchContextOptions {
+  searchType?: "semantic" | "keywords";
   image?: string;
   sessionId?: string;
   limit?: number;
@@ -183,6 +186,7 @@ export interface SearchContextOptions {
   since?: string;
   until?: string;
   timeField?: string;
+  eventsTimeDecayProtection?: string | null;
   queryExpansion?: "off" | "auto";
   maxTokens?: number;
   quotas?: Record<string, number>;
@@ -218,12 +222,16 @@ export interface ListOptions {
   recursive?: boolean;
   output?: string;
   absLimit?: number;
+  includeAbstract?: boolean;
+  includeOverview?: boolean;
+  overviewLimit?: number;
   showAllHidden?: boolean;
   nodeLimit?: number;
   offset?: number;
   limit?: number;
   sortBy?: "name" | "mtime";
   sortOrder?: "asc" | "desc";
+  extraFields?: Array<"locked" | "id" | "count">;
   tags?: string[];
   includeTags?: boolean;
 }
@@ -240,8 +248,19 @@ export interface TreeOptions {
   levelLimit?: number;
   offset?: number;
   limit?: number;
+  extraFields?: Array<"locked" | "id" | "count">;
   tags?: string[];
   includeTags?: boolean;
+}
+/** Directory listing page with pagination metadata. */
+export interface ListPage {
+  result: unknown[];
+  hasMore: boolean;
+}
+/** Directory tree page with pagination metadata. */
+export interface TreePage {
+  result: JsonObject[];
+  hasMore: boolean;
 }
 /** Session message payload. */
 export interface Message {
@@ -355,6 +374,8 @@ export interface MatchedContext {
   level?: number;
   abstract?: string;
   score?: number;
+  origin_score?: number | null;
+  time_score?: number | null;
   tags?: string[];
   [key: string]: unknown;
 }
@@ -391,6 +412,7 @@ export interface APIErrorInfo {
 export interface ResponseEnvelope<T> {
   status?: string;
   result?: T;
+  has_more?: boolean;
   error?: APIErrorInfo;
   telemetry?: unknown;
   profile?: string[];

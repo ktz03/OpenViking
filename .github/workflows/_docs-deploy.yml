@@ -36,6 +36,9 @@ jobs:
           DOCS_BASE: /
           VITE_COUNTER_URL: ${{ vars.VITE_COUNTER_URL }}
 
+      - name: Build plugin downloads
+        run: bash .github/scripts/build-plugin-downloads.sh docs/.vitepress/dist/dl https://docs.openviking.ai/dl
+
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v6
 

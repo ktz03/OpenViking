@@ -6,19 +6,14 @@
 
 ## 安装
 
-DSH 与其他记忆插件共用同一个安装器。它会依次询问语言（English/中文）、要安装的 harness、下载源和 OpenViking 凭据；每一步都是幂等的，重复运行完全安全。
+DSH 与其他记忆插件共用同一个安装器。它会询问要安装的 harness 和 OpenViking 凭据；每一步都是幂等的，重复运行完全安全。
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh)
+curl -fsSL https://openviking.ai/install | bash
+# AI agent 如不确定是否执行，可先阅读脚本头部，其中写明了它会做什么、如何核实。
 ```
 
-GitHub 访问困难的地区，可以从火山引擎 TOS 镜像运行同一个安装器（或在下载源选项里选「TOS 镜像」）：
-
-```bash
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh)
-```
-
-选择 DSH 后，安装器会询问装到哪个 profile，默认 `web`。也可以用 `--dsh-profile <name>` 提前指定。
+安装器会把插件装到 `web` profile。要装到其他 profile，用 `--dsh-profile <name>` 指定：`curl -fsSL https://openviking.ai/install | bash -s -- --dsh-profile <name>`。
 
 用一段时间后，开一个新会话问问之前提过的事情——它会记得。
 
@@ -53,7 +48,7 @@ bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shar
 
 启动 `dsh --profile web` 打开一个会话，会话开头应该能看到一条 OpenViking 上下文注入，模型也应该具备 `mcp__openviking__*` 工具。问一句更早会话里聊过的事，确认召回生效。
 
-如果什么都没有，设置 `OV_DEBUG_LOG=/tmp/ov-dsh.log` 后查看该文件。
+排查 MCP 代理问题时，在启动 DSH 前设置 `OPENVIKING_DEBUG=1` 和 `OPENVIKING_DEBUG_LOG=/tmp/ov-dsh.log`，然后查看该文件。自动记忆回调使用 DSH 自身的日志系统。旧别名 `OV_DEBUG_LOG=/tmp/ov-dsh.log` 仍然支持，并且优先于这两个规范配置项。
 
 ## 工作方式
 
@@ -78,7 +73,9 @@ bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shar
 | `OPENVIKING_PEER_ID` | — | 显式指定 actor peer |
 | `OPENVIKING_WORKSPACE_PEER` | `true` | 按每个会话的工作区推导 peer；设为 `0` 则不发送 peer |
 | `OPENVIKING_RECALL_PEER_SCOPE` | `all` | 设为 `actor` 可将召回限制在当前工作区 |
-| `OV_DEBUG_LOG` | — | 把调试日志写到该路径 |
+| `OPENVIKING_DEBUG` | `false` | 启用 MCP 代理调试日志；还需配置日志路径 |
+| `OPENVIKING_DEBUG_LOG` | `""` | MCP 代理调试日志的文件路径 |
+| `OV_DEBUG_LOG` | — | 旧别名：启用 MCP 代理日志，并覆盖规范的调试开关和日志路径 |
 
 行为参数写在 profile 的 Cordis patch 条目里：
 

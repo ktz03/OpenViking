@@ -200,7 +200,7 @@ function checkInstall(report, { cliOnPath }) {
       const mine = rows.filter((r) => r?.pluginId === PLUGIN_ID);
       const others = rows.filter((r) => r?.pluginId !== PLUGIN_ID && r?.name === PLUGIN_NAME && r?.installed);
       if (!mine.length) report.fail(`codex plugin list does not show ${PLUGIN_ID}`, others.length ? `found: ${others.map((r) => r.pluginId).join(", ")}` : "",
-        "bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) --harness codex");
+        "curl -fsSL https://openviking.ai/install | bash -s -- --harness codex");
       else {
         listed = mine[0];
         const path = listed.source?.path || "";
