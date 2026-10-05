@@ -148,19 +148,26 @@ def main():
 
         def do_POST(self):
             self.rfile.read(int(self.headers["Content-Length"]))
-            if self.path != "/v1/chat/completions" or self.headers.get("Authorization") not in {
-                "Bearer isolated-static-test-key", "Bearer updated-isolated-static-key"
-            }:
+            anthropic = self.path == "/anthropic/v1/messages"
+            key = (self.headers.get("x-api-key") if anthropic
+                   else self.headers.get("Authorization", "").removeprefix("Bearer "))
+            if (self.path not in {"/v1/chat/completions", "/anthropic/v1/messages"}
+                    or key not in {"isolated-static-test-key", "updated-isolated-static-key"}):
                 self.send_error(401)
                 return
             llm_requests.append(self.path)
             if preflight_errors:
                 self.send_error(preflight_errors.pop(0), "private provider response")
                 return
-            body = json.dumps({"id": "setup-test", "object": "chat.completion", "model": "test-model",
-                               "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"},
-                                            "finish_reason": "stop"}],
-                               "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}).encode()
+            body = json.dumps(
+                {"id": "msg-test", "type": "message", "role": "assistant", "model": "claude-test",
+                 "content": [{"type": "text", "text": "OK"}], "stop_reason": "end_turn",
+                 "usage": {"input_tokens": 1, "output_tokens": 1}} if anthropic else
+                {"id": "setup-test", "object": "chat.completion", "model": "test-model",
+                 "choices": [{"index": 0, "message": {"role": "assistant", "content": "OK"},
+                              "finish_reason": "stop"}],
+                 "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+            ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -234,23 +241,31 @@ def main():
                         root / "transport-config", ql, server.paths.runtime_python
                     )
                     evidence["llm_preflight"] = []
-                    for errors in ([401], [404], [429], [500], [429, 429]):
-                        preflight_errors[:] = errors
-                        count = len(llm_requests)
-                        log_path = home / "logs/openviking-server.log"
-                        log_size = log_path.stat().st_size
-                        failed = False
-                        try:
-                            ql._validate_vlm(server.paths, server.paths.server_config)
-                        except ql.QuickLocalSetupError as error:
-                            failed = True
-                            assert f"HTTP {errors[-1]}" in str(error), str(error)
-                            assert "private provider response" not in str(error)
-                        assert failed == (errors[0] in {401, 404} or len(errors) == 2)
-                        expected = 1 if errors[0] in {401, 404} else 2
-                        assert len(llm_requests) - count == expected
-                        assert "private provider response" not in log_path.read_bytes()[log_size:].decode()
-                        evidence["llm_preflight"].append({"errors": errors, "requests": expected, "failed": failed})
+                    for route in ("openai", "anthropic"):
+                        check_config = json.loads(server.paths.server_config.read_text())
+                        if route == "anthropic":
+                            check_config["vlm"].update(provider="litellm", model="anthropic/claude-test",
+                                                       api_base=f"http://127.0.0.1:{llm_server.server_port}/anthropic")
+                        check_path = root / "preflight-check.json"
+                        check_path.write_text(json.dumps(check_config), encoding="utf-8")
+                        for errors in ([401], [403], [404], [429], [500], [503], [429, 429]):
+                            preflight_errors[:] = errors
+                            count = len(llm_requests)
+                            log_path = home / "logs/openviking-server.log"
+                            log_size = log_path.stat().st_size
+                            failed = False
+                            try:
+                                ql._validate_vlm(server.paths, check_path)
+                            except ql.QuickLocalSetupError as error:
+                                failed = True
+                                assert f"HTTP {errors[-1]}" in str(error), str(error)
+                                assert "private provider response" not in str(error)
+                            assert failed == (errors[0] in {401, 403, 404} or len(errors) == 2)
+                            expected = 1 if errors[0] in {401, 403, 404} else 2
+                            assert len(llm_requests) - count == expected
+                            assert "private provider response" not in log_path.read_bytes()[log_size:].decode()
+                            evidence["llm_preflight"].append({"route": route, "errors": errors,
+                                                              "requests": expected, "failed": failed})
                     assert not preflight_errors
                 provider.initialize("local-smoke-" + name, hermes_home=str(home), platform="cli")
                 assert provider._client is not None

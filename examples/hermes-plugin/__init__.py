@@ -1426,6 +1426,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         # snapshot+reset of the turn counter and the session-id rotation must be atomic against a concurrent
         # increment. See hermes-agent#28296 review.
         self._inflight_writers: Dict[str, Set[threading.Thread]] = {}
+        self._upload_tails: Dict[str, threading.Event] = {}  # guarded by _inflight_lock
         self._deferred_commit_threads: Set[threading.Thread] = set()
         self._commit_scope: Optional[_CommitScope] = None
         self._profile_prefetched_sessions: Set[str] = set()
@@ -2521,26 +2522,26 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 _preview(user_content), _preview(assistant_content),
             )
 
-        def drop_empty() -> None:
-            if not self._inflight_writers.get(sid):
-                self._inflight_writers.pop(sid, None)
-
         cfg, env = self._profile_config_and_env()
         threshold = self._setting("commit_token_threshold", cfg, env=env)
 
-        def upload_and_check() -> None:
+        def upload_and_check(upload_finished: threading.Event) -> None:
             # Serialize writes with commits on the workers, so a slow commit never
             # blocks sync_turn. A write after a commit re-arms its recovery marker.
-            with self._writer_commit_lock:
-                with self._session_state_lock:
-                    if self._session_id == sid and self._commit_scope is scope and self._client is scope.client:
-                        self._turn_count += 1
-                        turn_count = self._turn_count
-                    else:
-                        turn_count = 1
-                self._mark_session_committed(sid, committed=False, scope=scope)
-                self._mark_session_pending(sid, scope=scope)
-                client = upload.run()
+            try:
+                with self._writer_commit_lock:
+                    with self._session_state_lock:
+                        if self._session_id == sid and self._commit_scope is scope and self._client is scope.client:
+                            self._turn_count += 1
+                            turn_count = self._turn_count
+                        else:
+                            turn_count = 1
+                    self._mark_session_committed(sid, committed=False, scope=scope)
+                    self._mark_session_pending(sid, scope=scope)
+                    client = upload.run()
+            finally:
+                # The next turn need not wait for this turn's metadata request.
+                upload_finished.set()
             if client is not None:
                 self._maybe_commit_live_session(sid, turn_count, threshold, client, scope)
 
@@ -2549,10 +2550,47 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if not sid:
             return
         upload = _TurnUpload(client, sid, batch_messages, user_content, assistant_content, assistant_peer_id, user_peer_id)
-        self._spawn_tracked("openviking-sync", upload_and_check, self._inflight_lock, lambda: self._inflight_writers.setdefault(sid, set()),
-                            after_discard=drop_empty)
+        self._spawn_upload(sid, upload_and_check)
 
     # -- tracked worker threads ---------------------------------------------
+
+    def _spawn_upload(self, sid: str, body: Callable[[threading.Event], None]) -> None:
+        """Order each session's uploads before taking the shared write/commit lock.
+
+        Keep metadata checks concurrent and retain every worker for commit drains.
+        Publish a successor only after its thread starts, so a failed start cannot
+        strand later turns or let them bypass an earlier upload.
+        """
+        finished = threading.Event()
+
+        def _run() -> None:
+            try:
+                if previous is not None:
+                    previous.wait()
+                body(finished)
+            finally:
+                finished.set()
+                with self._inflight_lock:
+                    writers.discard(thread)
+                    if not writers:
+                        self._inflight_writers.pop(sid, None)
+                    if self._upload_tails.get(sid) is finished:
+                        self._upload_tails.pop(sid, None)
+
+        thread = spawn_context_thread(_run, name="openviking-sync")
+        with self._inflight_lock:
+            previous = self._upload_tails.get(sid)
+            writers = self._inflight_writers.setdefault(sid, set())
+            writers.add(thread)
+            try:
+                thread.start()
+            except Exception as exc:
+                writers.discard(thread)
+                if not writers:
+                    self._inflight_writers.pop(sid, None)
+                logger.warning("OpenViking upload worker failed to start: %s", exc)
+            else:
+                self._upload_tails[sid] = finished
 
     def _spawn_tracked(self, name: str, body: Callable[[], None], lock: threading.Lock, workers: Callable[[], Set[threading.Thread]],
                        *, after_discard: Callable[[], None] = None, skip_if: Callable[[], bool] = None) -> None:
