@@ -653,6 +653,25 @@ def _validate_vlm(paths: QuickLocalPaths, config_path: Path) -> None:
 import json, sys, time
 import httpx, openai
 from openviking.models.vlm import VLMFactory
+
+def failure_details(exc):
+    # LiteLLM can replace an Anthropic HTTP/transport error with synthetic 500.
+    # Stop at the first HTTPX error: its context may contain an older failure.
+    error, current, seen = exc, exc, set()
+    while isinstance(current, BaseException) and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (httpx.HTTPError, TimeoutError)):
+            error = current
+            break
+        # Suppression hides traceback text, not the structured HTTP metadata.
+        current = current.__cause__ or current.__context__
+    timed_out = isinstance(error, (TimeoutError, httpx.TimeoutException, openai.APITimeoutError))
+    connection = not timed_out and isinstance(error, (httpx.TransportError, openai.APIConnectionError))
+    status = getattr(getattr(error, "response", None), "status_code", getattr(error, "status_code", None))
+    status = status if type(status) is int and 100 <= status <= 599 and not (timed_out or connection) else None
+    return {"error": type(exc).__name__, "status": status,
+            "timeout": timed_out, "connection": connection}
+
 for attempt in (1, 2):
     try:
         config = json.load(open(sys.argv[1], encoding="utf-8"))["vlm"]
@@ -662,15 +681,13 @@ for attempt in (1, 2):
             raise ValueError("Empty completion")
         break
     except Exception as exc:
-        status = getattr(exc, "status_code", None)
-        status = status if type(status) is int and 100 <= status <= 599 else None
-        timed_out = isinstance(exc, (TimeoutError, httpx.TimeoutException, openai.APITimeoutError))
-        retry = status == 429 or (status is not None and 500 <= status <= 599) or timed_out
+        failure = failure_details(exc)
+        status = failure["status"]
+        retry = status == 429 or (status is not None and 500 <= status <= 599) or failure["timeout"]
         if attempt == 1 and retry:
             time.sleep(1)
             continue
-        print(json.dumps({"error": type(exc).__name__, "status": status,
-                          "timeout": timed_out, "attempts": attempt}))
+        print(json.dumps({**failure, "attempts": attempt}))
         sys.exit(1)
 """
     try:
@@ -722,7 +739,7 @@ def _vlm_check_failure(paths: QuickLocalPaths, failure: Any) -> QuickLocalSetupE
             guidance = "The provider is rate-limiting requests. Wait, then retry setup."
         elif status is not None and status >= 500:
             guidance = "The provider reported a temporary server error. Retry setup later."
-        elif name == "APIConnectionError":
+        elif failure.get("connection") is True or name == "APIConnectionError":
             guidance = "Check the endpoint and network connection, then retry setup."
         else:
             guidance = "Check the model and endpoint. The model must support Chat Completions or Anthropic Messages."
