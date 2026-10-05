@@ -1,4 +1,6 @@
-# 配置
+# 配置模型与服务
+
+本文用于选择模型、组合配置示例和理解生效范围。只查字段时，请看[服务端配置字段](../configuration/01-server.md)或[客户端配置字段](../configuration/02-client.md)；首次部署从[部署路径](00-overview.md)开始。
 
 OpenViking 使用 JSON 配置文件（`ov.conf`）进行设置。配置文件支持 Embedding、VLM、Rerank、存储、解析器等多个模块的配置。
 
@@ -14,24 +16,6 @@ openviking-server doctor
 ```
 
 `openviking-server init` 会分别引导你填写 Embedding 和 VLM 的配置。对于 `OpenAI`、`Volcengine`、`Kimi`、`GLM` 这类 API 型 VLM，按提示填写对应的 VLM API Key；如果要使用 Codex 作为 VLM，请选择 `OpenAI Codex`，向导会自动帮你处理已有 Codex 鉴权的导入，或直接引导你完成登录。
-
-## Account Embedding 与 VectorDB
-
-ROOT 可在创建 Account 时配置 `settings.embedding` 和 `settings.vectordb`，
-两者使用 Account 专用白名单模型。Account 与 Cluster 配置分别保存，向量业务
-resolver 为 Account 未设置的值应用 Cluster 默认。Provider 连接只能通过完整
-`credentials` binding 提交，不能跨 Account/Cluster 拼接。配置查询只返回
-Account 配置。
-
-VectorDB 创建后不可修改。新旧 Account 均可轮换完整 Embedding
-credentials/deployment binding，并更新重试、并发、failback 和熔断参数；
-外层 model 身份及其他向量空间字段仅创建时可设。兼容 endpoint 更新不打断
-在途调用，也不会自动重建历史向量。
-
-Account 独立配置的 VectorDB 仅支持远端 backend；Account 不能选择 local/cuvs，
-也不能设置本地路径、cuVS 调优或自定义 adapter 参数。未设置 VectorDB 的
-Account 复用 Cluster 连接并保留数据过滤。远端资源由外部控制面提前创建。权限与 PATCH 规则见
-[Admin 配置 API](../api/08-admin.md#runtime-configuration)。
 
 ## 快速开始
 
@@ -135,6 +119,24 @@ PATCH 采用三态语义：字段缺失表示不修改，具体值表示设置�
 的配置，不返回业务组合后的有效配置。声明式 `fallback` 已废弃，只支持整段
 配置，且仅用于兼容旧行为；新功能需要在业务解析器中实现 Cluster 默认值。
 详见 [Admin API - 运行时配置](../api/08-admin.md#runtime-configuration)。
+
+## Account Embedding 与 VectorDB
+
+ROOT 可在创建 Account 时配置 `settings.embedding` 和 `settings.vectordb`，
+两者使用 Account 专用白名单模型。Account 与 Cluster 配置分别保存，向量业务
+resolver 为 Account 未设置的值应用 Cluster 默认。Provider 连接只能通过完整
+`credentials` binding 提交，不能跨 Account/Cluster 拼接。配置查询只返回
+Account 配置。
+
+VectorDB 创建后不可修改。新旧 Account 均可轮换完整 Embedding
+credentials/deployment binding，并更新重试、并发、failback 和熔断参数；
+外层 model 身份及其他向量空间字段仅创建时可设。兼容 endpoint 更新不打断
+在途调用，也不会自动重建历史向量。
+
+Account 独立配置的 VectorDB 仅支持远端 backend；Account 不能选择 local/cuvs，
+也不能设置本地路径、cuVS 调优或自定义 adapter 参数。未设置 VectorDB 的
+Account 复用 Cluster 连接并保留数据过滤。远端资源由外部控制面提前创建。权限与 PATCH 规则见
+[Admin 配置 API](../api/08-admin.md#runtime-configuration)。
 
 ## 配置示例
 
@@ -618,6 +620,18 @@ SDK 1.39.0 起提供所需的客户端上下文管理器和关闭方法，用于
 
 支持的 task type: `RETRIEVAL_QUERY`、`RETRIEVAL_DOCUMENT`、`SEMANTIC_SIMILARITY`、`CLASSIFICATION`、`CLUSTERING`、`CODE_RETRIEVAL_QUERY`、`QUESTION_ANSWERING`、`FACT_VERIFICATION`。
 
+#### 本地 provider（`local`）
+
+未配置 `dense`、`sparse` 或 `hybrid` embedding 时（包括省略 `embedding`），OpenViking 默认选择 `dense: {"provider": "local", "model": "bge-small-zh-v1.5-f16"}`。该 GGUF 模型输出 512 维向量，无需 API Key。
+
+安装本地推理依赖：
+
+```bash
+pip install "openviking[local-embed]"
+```
+
+首次使用时，OpenViking 将模型下载到 `~/.cache/openviking/models`；已有缓存则复用。通过 `embedding.dense.cache_dir` 修改缓存目录，或用 `embedding.dense.model_path` 指定已有 GGUF 文件以跳过下载。显式指定的文件不存在时会报错，不会转为下载。该模型的维度固定为 512。
+
 #### Sparse Embedding
 
 > 以下示例使用 `doubao-embedding-vision-251215`。所选模型是否支持文本 sparse 输出，请核对方舟[向量化文档](https://docs.volcengine.com/docs/ark/vectorization?lang=zh&redirect=1)。
@@ -984,6 +998,26 @@ PDF 解析配置。支持三种策略：`local`（本地 pdfplumber）、`mineru
 
 **MinerU 协议**：同步调用 `POST {mineru_endpoint}/file_parse`，multipart 文件字段为 `files`，form 参数由 `mineru_bodys` 透传。
 
+### 外部解析 API（`parser_api`） {#parser-api}
+
+顶层 `parser_api` 配置将指定格式交给外部 Understanding files/responses API。它只替换 Parser 阶段；TreeBuilder、持久化和语义处理仍由 OpenViking 完成。路由与异步行为见[资源处理流程](../api/02-resources.md#资源处理流程)。
+
+| 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `enable` | `false` | 启用外部解析。 |
+| `extensions` | `[]` | 交给外部解析的扩展名；转为小写并去掉开头的点。 |
+| `host` | `""` | 带协议的 API 地址，如 `https://parser.example.com`；启用时必填。 |
+| `api_key` | `""` | 外部 API 凭证；启用时必填。 |
+| `enable_feishu_url` | `false` | 有可用凭证时允许直接解析飞书 URL。已由 Accessor 归一化为 Markdown 的飞书文档跳过外部解析；文件附件仍按扩展名路由。 |
+| `enable_resumable_upload` | `false` | 启用断点续传。 |
+| `upload_simple_max_bytes` | `536870912`（512 MiB） | 简单上传的大小阈值。 |
+| `upload_part_size_bytes` | `8388608`（8 MiB） | 分片上传的分片大小。 |
+| `http_timeout_seconds` | `10.0` | 单次 HTTP 请求超时秒数。 |
+| `response_timeout_seconds` | `1800` | 等待解析结果的超时秒数。 |
+| `poll_interval_ms` | `3000` | 结果轮询间隔，单位毫秒。 |
+
+大小、超时和轮询参数都必须大于零。
+
 ### rerank
 
 用于搜索结果精排的 Rerank 模型。支持 VikingDB（火山引擎）、Cohere、OpenAI
@@ -1200,8 +1234,8 @@ Glob 引擎配置，用于路径模式匹配。这些设置为服务端配置，
 |------|------|------|--------|
 | `backend` | str | `"local"`、`"s3"` 或 `"memory"` | `"local"` |
 | `timeout` | float | 请求超时时间（秒） | `10.0` |
-| `backups` | object | 多写存储配置。配置后顶层 `backend` 作为 primary，`backups.items[]` 作为 backup | `null` |
-| `redirects` | array | 多写存储的文件重定向策略。命中后文件写入指定 backup，而不是 primary | `[]` |
+| `backups` | object | 主备存储配置。配置后顶层 `backend` 作为 primary，`backups.items[]` 作为 backup | `null` |
+| `redirects` | array | 主备存储的文件重定向策略。命中后文件写入指定 backup，而不是 primary | `[]` |
 | `queuefs` | object | QueueFS 配置。控制 `/queue` 的命名空间模式、后端和运行时参数 | `{ "mode": "shared", "backend": "sqlite", "recover_stale_sec": 0, "busy_timeout_ms": 5000 }` |
 | `queue_db_path` | str（可选）| 旧版兼容字段，用于覆盖 QueueFS 的 sqlite 数据库文件路径。已被 `storage.agfs.queuefs.db_path` 取代。未设置时默认为 `{storage.workspace}/_system/queue/queue.db`。适用于 workspace 卷不支持 sqlite 的场景（例如某些网络文件系统） | `null` |
 | `s3` | object | S3 后端配置（`backend=s3` 时使用） | - |
@@ -1214,9 +1248,9 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 > [!WARNING]
 > `storage.agfs` 已不再支持 AGFS HTTP client 模式，也无需再配置旧的 HTTP client 入口。当前 AGFS / RAGFS 文件系统访问仅通过 Rust binding（`RAGFSBindingClient`）在进程内完成。这不影响 OpenViking server 的 HTTP API、`ov` CLI，或 `AsyncHTTPClient` / `SyncHTTPClient` 访问 OpenViking 服务端的能力。
 
-##### 多写存储配置
+##### 主备存储配置
 
-`storage.agfs.backups` 用于启用多写存储。未配置时，OpenViking 保持单 backend 模式。
+`storage.agfs.backups` 用于启用主备存储。未配置时，OpenViking 保持单 backend 模式。
 
 ```json
 {
@@ -1257,7 +1291,7 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
-| `sync_type` | str | 多写同步模式，支持 `"async"` 或 `"sync"` | `"async"` |
+| `sync_type` | str | 主备同步模式，支持 `"async"` 或 `"sync"` | `"async"` |
 | `write_ack_count` | int | `sync` 模式下返回前需要的 backup 确认数 | 全部 backup |
 | `write_ack_timeout_ms` | int | `sync` 模式下等待 backup 确认的超时时间，单位毫秒 | `null` |
 | `write_concurrency` | int | 异步 backup 写入并发上限 | `null` |
@@ -1288,7 +1322,7 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 - `target` 必须引用 `backups.items[]` 中已经定义的 backup `name`。
 - 命中 redirect 的文件仍会通过普通文件系统 API 呈现为可读、可列举的文件。
 
-更多配置示例见 [多写存储指南](./13-multi-write-storage.md)。
+更多配置示例见 [主备存储指南](./13-multi-write-storage.md)。
 
 ##### 全局 Cache Provider、CacheFS 与 PathLock 配置
 
@@ -1553,7 +1587,7 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 |------|------|------|--------|
 | `backend` | str | VectorDB 后端类型: 'local'（基于文件）, 'http'（远程服务）, 'volcengine'（云上 VikingDB）, 'vikingdb'（私有部署）或 'cuvs'（本地存储 + GPU dense search） | "local" |
 | `name` | str | VectorDB 的集合名称 | "context" |
-| `url` | str | 'http' 类型的远程服务 URL（例如 'http://localhost:5000'） | null |
+| `url` | str | 'http' 类型的远程服务 URL（例如 `http://localhost:5000`） | null |
 | `project_name` | str | 项目名称（别名 project） | "default" |
 | `distance_metric` | str | 向量相似度搜索的距离度量（例如 'cosine', 'l2', 'ip'） | "cosine" |
 | `dimension` | int | 向量嵌入的维度 | 0 |
@@ -1671,7 +1705,13 @@ openviking-server --config /path/to/ov.conf
 | `extraction_enabled` | session commit 时是否执行长期记忆抽取。 | `true` |
 | `session_skill_extraction_enabled` | session commit 时是否同时抽取可复用 skill 到当前用户的 skill 目录。 | `false` |
 | `link_enabled` | 记忆抽取是否写入和解析 memory links。 | `false` |
-| `session_auto_commit` | 服务端 session 自动 commit 的全局控制项。该配置属于 `memory` 段，不属于 `server` 段；详见 [Session Auto Commit 配置](#session-auto-commit-配置)。 | 见上文 |
+| `session_auto_commit` | 服务端 session 自动 commit 的全局控制项。该配置属于 `memory` 段，不属于 `server` 段；详见 [Session Auto Commit 配置](#session-auto-commit-配置)。 | 见下文 |
+
+#### 记忆链接（`memory.link_enabled`）
+
+`memory.link_enabled` 默认为 `false`。启用后，抽取流程将临时 page ID 解析为 URI，并把链接存入记忆元数据。每条链接包含 `from_uri`、`to_uri`、`link_type`（默认 `related_to`）、`weight`（默认 `0.5`，抽取时限制在 0–1）、`match_text`（对话中的一个词或 `null`）、`description` 和 `created_at`。
+
+`link_type` 是关系标签，不是封闭枚举。抽取时将其归一化为小写 snake_case，允许一到三个字母单词；无效标签回退为 `related_to`。这些链接描述记忆间的关系；当前检索流程不遍历链接，也不使用链接权重排序。
 
 #### Session Auto Commit 配置
 
@@ -1841,6 +1881,39 @@ ov add-resource ./docs --exclude "*.tmp"
 - `skill_uri` 作为 `add_skill` 的默认目标根目录使用。v1 只允许 `viking://~/skills` 和 `viking://agent/skills`；不支持显式写成 `viking://user/{user_id}/skills`。
 - 旧写法兼容：早期配置中的 `viking://user/resources` 和 `viking://user/skills` 会在配置加载时自动归一化为 `viking://~/resources` 和 `viking://~/skills`，并打印一条 info 日志。新配置请直接使用 `viking://~/...`；在 `add_targets` 之外，无 uid 的写法会在请求入口被拒绝。
 
+### 运行时配置来源 {#runtime-configuration-source}
+
+顶层 `runtime_config` 在启动时选择运行时配置来源，不放在 `server` 内。
+
+| 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `source` | `"file"` | `file` 通过 AGFS 存储配置；`memory` 只保存在当前进程中；也可填写已注册的自定义来源名称。 |
+| `module` | `null` | 用于注册自定义来源的 Python 模块。来源也可通过 `openviking.config_source` entry-point group 注册。 |
+| `params` | `{}` | 通过 `ConfigSourceContext.params` 传给自定义来源工厂的参数。 |
+
+自定义来源实现 `ConfigSource.load(scope)`、`update(scope, mutate)` 和 `delete(scope)`。来源必须防止并发读改写丢失更新，包括跨线程和事件循环的调用。更新回调可能被重试，因此不能有副作用。
+
+文件来源在 AGFS 中把 Account 配置写入 `/local/{account_id}/_system/setting.json`，把 Cluster 配置写入 `/local/_system/runtime_config/cluster.json`。前一版本的字节保存在同目录的 `setting.backup.json` 和 `cluster.backup.json`；主文件丢失或无效时可读取备份。原有 Account 配置继续使用原路径。
+
+管理器每 30 秒刷新 Cluster 和已缓存的 Account。24 小时未使用的 Account 从缓存移除并停止轮询，已存储的配置仍保留。刷新失败时继续使用上一次有效配置。Admin settings GET 返回已存储的覆盖值，不是合并后的生效配置，也不能证明所有派生客户端都已切换。修改配置使用 [Admin API](../api/08-admin.md)，各消费者的行为见[配置重载边界](#配置重载边界)。
+
+### 工具输出外置 {#tool-output-externalization}
+
+`server.tool_output_externalization` 将会话中过大的工具输出存入该会话的 `tool-results/`，消息保留预览 stub 和 `tool_output_ref`。完整输出可通过[会话管理](../api/05-sessions.md)中的 tool-result read、search、list API 回读。
+
+| 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `enabled` | `true` | 启用工具输出外置。 |
+| `threshold_chars` | `20000` | 单条输出超过此字符数时外置。 |
+| `preview_chars` | `2000` | 单条输出的预览字符目标。 |
+| `assistant_turn_inline_budget_chars` | `100000` | 同一 assistant turn 中工具输出的内联预算。 |
+| `assistant_turn_preview_budget_chars` | `10000` | 在该轮各输出之间分配的预览预算。 |
+| `min_preview_chars` | `1000` | 分配单条预览时的下限。 |
+| `aggregate_selection_strategy` | `"largest_first"` | 目前唯一支持的策略：需要缩减该轮内联大小时优先外置较大输出。 |
+| `failure_mode` | `"preserve_raw"` | 存储失败时：`preserve_raw` 保留原文；`reject` 抛出错误；`preview_only` 只保留预览，不提供可恢复原文的引用。 |
+
+这些预算用于选择外置输出和分配预览。预览元数据和最小预览大小可能使结果超出预算；`preserve_raw` 在写入失败时也可能使该轮超出预算。
+
 ### Usage Reporter
 
 可选的 Usage Reporter 从已 commit session 的 tool parts 中抽取记忆使用事件。内置文件日志 Sink 将每个事件写成一行扁平 JSON，并按小时滚动专用日志文件：
@@ -1880,6 +1953,18 @@ ov add-resource ./docs --exclude "*.tmp"
 ```
 
 `event_time` 使用 UTC 时间。`tenant_id` 由部署 resource ID、事件所属的 account、user 和 Experience URI 拼接。`memory.recalled` 映射为 `experience.recall.count`，`memory.injected` 映射为 `experience.inject.count`。`object_id` 是稳定的 Usage Event ID。下游必须使用 `(tenant_id, object_id)` 复合键去重，不能跨 tenant 仅按 `object_id` 全局去重。查询时按 `tenant_id`、`event_name` 和 `event_time` 范围过滤，再通过 `sum(count)` 汇总。文件采集和下游投递仍为 best-effort。
+
+#### 自定义 Sink
+
+在 `server.usage_reporter.sinks` 中添加：
+
+```json
+{"type": "custom", "class_path": "my_app.usage.MySink", "config": {}}
+```
+
+该类必须能被服务端导入。`config` 作为关键字参数传给构造函数。类需实现 `async def write(self, *, events: list[UsageEvent]) -> None`；`UsageEvent` 定义于 `openviking.usage_reporter.models`，提供 `event_id` 和 `to_dict()`。输入是事件对象列表，不是 `file_log` 输出的扁平 JSON 行。
+
+投递采用 best-effort：Sink 错误和超时会记录到日志，phase-2 重放可能再次发送同一事件。自定义 Sink 需定义重试和去重策略。若输出文件日志格式，应设置 `object_id = event.event_id`，并按上述部署/account/user/resource 范围内的 `(tenant_id, object_id)` 去重。这不是 exactly-once 投递协议。
 
 启动方式和部署详情见 [服务部署](./03-deployment.md)，认证详情见 [认证](./04-authentication.md)。
 

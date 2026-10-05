@@ -1,4 +1,4 @@
-# ovcli 配置
+# 客户端配置字段
 
 `ovcli.conf` 是 `ov` CLI 的客户端配置文件，用于保存服务端连接、鉴权身份和命令默认行为。
 
@@ -218,6 +218,8 @@ peer 是用户空间下的一段路径前缀——`viking://user/<you>/peers/<pe
 
 规则由 `peer.source` 决定。同一项配置在环境变量中写作 `OPENVIKING_PEER_SOURCE`，在 `ovcli.conf` 中写作 `plugin.peerSource` 或 `plugin.<harness>.peerSource`。
 
+远端身份只取 `origin`，不回退到 `upstream`，避免添加 upstream 时悄悄改变记忆空间。也不使用 root-commit SHA：Fork 共享祖先，浅克隆或新拉取的历史又会改变可见的根提交。Git 仓库没有 `origin` 时使用仓库根路径。需要多个仓库共享记忆，或希望移动目录后身份不变时，应显式配置 `peer.id`。非 Git 目录默认仍不派生 peer。
+
 #### 让一个目录拥有独立记忆
 
 在该目录下创建 `.openviking/config.json`：
@@ -324,7 +326,7 @@ Agent 插件读取 `OPENVIKING_AUTO_RECALL`、`OPENVIKING_RECALL_LIMIT`、`OPENV
 ~/.openviking/ovcli.conf
 ```
 
-交互式管理器以及 `ov config list`、`switch`、`add`、`edit`、`delete` 始终管理默认配置仓库。该仓库中的命名配置与默认 Active 文件位于同一目录：
+交互式管理器以及 `ov config list`、`switch`、`add`、`edit`、`delete` 使用相同的实际配置路径。命名配置与 Active 文件位于同一目录；未设置覆盖路径时为：
 
 ```text
 ~/.openviking/ovcli.conf.<name>
@@ -350,6 +352,6 @@ ov config validate
 ov config show
 ```
 
-`ov config switch <name>` 会把命名配置复制为默认 Active 文件。如果仍设置了 `OPENVIKING_CLI_CONFIG_FILE`，普通 `ov` 命令会继续读取环境变量指定的文件；需要取消该变量后才会使用刚切换的默认配置。新的 `ov` 命令会重新读取实际配置文件；已经运行的 Agent 客户端需要重启后才会读取变更。
+`ov config switch <name>` 会把命名配置复制到实际 Active 文件，包括 `OPENVIKING_CLI_CONFIG_FILE` 指定的路径。这会覆盖所选文件；如果要切换默认的 `~/.openviking/ovcli.conf`，请先取消该环境变量。直接选中的 `ovcli.conf.<name>` 会显示为当前配置，即使另一个配置的内容完全相同；选中期间不能删除或重命名该文件。新的 `ov` 命令会重新读取实际配置文件；已经运行的 Agent 客户端需要重启后才会读取变更。
 
 交互式配置和 Agent 辅助配置步骤见[OpenViking CLI 配置指南](../getting-started/05-cli-setup.md)。

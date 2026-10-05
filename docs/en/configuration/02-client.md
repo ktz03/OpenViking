@@ -1,4 +1,4 @@
-# ovcli Configuration
+# Client configuration fields
 
 `ovcli.conf` is the client configuration file for the `ov` CLI. It stores the server connection, authentication identity, and command defaults.
 
@@ -221,6 +221,8 @@ A peer is a path prefix under your own user space — `viking://user/<you>/peers
 
 `peer.source` decides the rule. The same setting is spelled `OPENVIKING_PEER_SOURCE` in the environment and `plugin.peerSource` or `plugin.<harness>.peerSource` in `ovcli.conf`.
 
+Remote identity comes only from `origin`; there is no fallback to `upstream`, because adding an upstream remote must not silently change the memory namespace. Root-commit hashes are not used either: forks share ancestry, and shallow clones or newly fetched histories can change which roots are visible. Without `origin`, a Git repository uses its root path. Use an explicit `peer.id` when repositories should share memories or when path-based identity must survive a move. Non-Git directories still have no derived peer by default.
+
 #### Give a Directory Its Own Peer
 
 Create `.openviking/config.json` in the directory:
@@ -327,7 +329,7 @@ Normal `ov` commands, plus `ov config show` and `ov config validate`, resolve th
 ~/.openviking/ovcli.conf
 ```
 
-The interactive manager and `ov config list`, `switch`, `add`, `edit`, and `delete` always manage the default store. Named configurations in that store live next to the default active file:
+The interactive manager and `ov config list`, `switch`, `add`, `edit`, and `delete` use the same effective path. Named configurations live next to that active file. Without an override, their paths are:
 
 ```text
 ~/.openviking/ovcli.conf.<name>
@@ -353,6 +355,6 @@ ov config validate
 ov config show
 ```
 
-`ov config switch <name>` copies the named configuration to the default active file. If `OPENVIKING_CLI_CONFIG_FILE` remains set, normal `ov` commands continue to use the environment-selected file; unset it to use the switched default. New `ov` commands reread the effective file, while already-running Agent clients must restart before reading changes.
+`ov config switch <name>` copies the named configuration to the effective active file, including the path selected by `OPENVIKING_CLI_CONFIG_FILE`. This overwrites the selected file; unset the variable first if you intend to switch the default `~/.openviking/ovcli.conf` instead. A directly selected `ovcli.conf.<name>` is shown as active even when another profile has identical contents, and cannot be deleted or renamed while selected. New `ov` commands reread the effective file, while already-running Agent clients must restart before reading changes.
 
 See [OpenViking CLI Setup](../getting-started/05-cli-setup.md) for interactive and agent-assisted configuration workflows.

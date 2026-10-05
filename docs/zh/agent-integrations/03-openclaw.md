@@ -1,4 +1,4 @@
-# OpenClaw 插件
+# OpenClaw
 
 为 [OpenClaw](https://github.com/openclaw/openclaw) 添加长效记忆。安装完成后，OpenClaw 会自动记住对话中的重要信息，并在每次回复前召回相关上下文。
 
@@ -117,6 +117,26 @@ OV 无数据、无归档且消息数少于宿主输入、转换后为空或读�
 - `ownsCompaction: true` 表示插件负责压缩。正常 `compact()` 提交 OV session（`wait=true`、保留数为 `0`），读取 overview 作为压缩摘要；下一次主 assemble 用摘要和 active messages 重建历史。被 bypass 的会话尝试委托宿主压缩器，宿主 bridge 不可用时返回跳过。
 
 这里的 **session commit** 负责会话归档和记忆处理，与保存资源文件版本的 [snapshot commit](../guides/15-snapshot.md) 是不同操作。
+
+## Agent experience 召回配置
+
+插件配置仍接受 `agentExperience`，默认值如下：
+
+```json
+{
+  "agentExperience": {
+    "enabled": false,
+    "recallLimit": 3,
+    "scoreThreshold": 0.35,
+    "maxInjectedChars": 6000,
+    "minQueryChars": 12
+  }
+}
+```
+
+这些字段仍在配置 Schema 中，但当前 assemble 链路不读取它们。召回使用统一的 `searchContext` 路径，以及通用的 `autoRecall`、`recallLimit`、`recallScoreThreshold` 和 `recallMaxInjectedChars` 配置。设置 `agentExperience.enabled` 不会启用独立的经验检索，也不会生成单独的经验区块。
+
+代码保留的 `shouldRecallAgentExperience` 函数会对执行、写操作、失败、工程对象等词，以及“经验”“踩坑”“best practice”“pitfall”等意图词打分，但当前召回链路没有调用它。不能把这些关键词规则和 `minQueryChars` 当作生效的召回控制项。注入内容使用 `<openviking-context>` 包裹；捕获用户文本时会剥离该标记及其内容，避免把召回材料再次当作用户输入保存。
 
 ## 验证
 

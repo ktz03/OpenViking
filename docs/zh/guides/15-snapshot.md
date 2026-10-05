@@ -1,4 +1,4 @@
-# 多版本管理（快照）指南
+# 版本管理指南
 
 快照将指定范围内的文件树保存为不可变版本。使用 `commit` 保存、`log` 查看历史、`show` 读取旧版文件、`restore` 恢复已保存的内容。快照不保存未提交的改动或提交时被排除的文件，ACL 和向量索引也不保存历史版本。恢复会比较来源快照与 HEAD，因此受影响路径上的未提交改动可能被覆盖。
 
@@ -359,4 +359,4 @@ curl -X DELETE "http://localhost:1933/api/v1/snapshot/ignore" \
 
 - [多版本管理 API](../api/11-snapshot.md)：命令参数与响应的完整参考
 - [配置说明](01-configuration.md)：`ov.conf` 完整配置项
-- [多写存储指南](13-multi-write-storage.md)：资源数据的多后端复制
+- [主备存储指南](13-multi-write-storage.md)：资源数据的多后端复制
