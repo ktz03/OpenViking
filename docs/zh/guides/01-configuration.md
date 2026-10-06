@@ -1,6 +1,12 @@
-# 配置
+# 配置模型与服务
+
+本文用于选择模型、组合配置示例和理解生效范围。只查字段时，请看[服务端配置字段](../configuration/01-server.md)或[客户端配置字段](../configuration/02-client.md)；首次部署从[部署路径](00-overview.md)开始。
 
 OpenViking 使用 JSON 配置文件（`ov.conf`）进行设置。配置文件支持 Embedding、VLM、Rerank、存储、解析器等多个模块的配置。
+
+本页供配置服务端时查阅。只连接已有服务端时，使用 [CLI 配置指南](../getting-started/05-cli-setup.md)，无需在客户端配置模型或存储。
+
+首次配置可以运行下面的向导。已有配置时，按要调整的能力查找对应段落，将示例字段合并到现有 JSON 对象中；不要用一个局部示例覆盖整份文件。修改 `ov.conf` 后需重启服务，运行时可修改的少数字段见下文。
 
 首次配置推荐优先使用：
 
@@ -10,24 +16,6 @@ openviking-server doctor
 ```
 
 `openviking-server init` 会分别引导你填写 Embedding 和 VLM 的配置。对于 `OpenAI`、`Volcengine`、`Kimi`、`GLM` 这类 API 型 VLM，按提示填写对应的 VLM API Key；如果要使用 Codex 作为 VLM，请选择 `OpenAI Codex`，向导会自动帮你处理已有 Codex 鉴权的导入，或直接引导你完成登录。
-
-## Account Embedding 与 VectorDB
-
-ROOT 可在创建 Account 时配置 `settings.embedding` 和 `settings.vectordb`，
-两者使用 Account 专用白名单模型。Account 与 Cluster 配置分别保存，向量业务
-resolver 为 Account 未设置的值应用 Cluster 默认。Provider 连接只能通过完整
-`credentials` binding 提交，不能跨 Account/Cluster 拼接。配置查询只返回
-Account 配置。
-
-VectorDB 创建后不可修改。新旧 Account 均可轮换完整 Embedding
-credentials/deployment binding，并更新重试、并发、failback 和熔断参数；
-外层 model 身份及其他向量空间字段仅创建时可设。兼容 endpoint 更新不打断
-在途调用，也不会自动重建历史向量。
-
-Account 独立配置的 VectorDB 仅支持远端 backend；Account 不能选择 local/cuvs，
-也不能设置本地路径、cuVS 调优或自定义 adapter 参数。未设置 VectorDB 的
-Account 复用 Cluster 连接并保留数据过滤。远端资源由外部控制面提前创建。权限与 PATCH 规则见
-[Admin 配置 API](../api/08-admin.md#runtime-configuration)。
 
 ## 快速开始
 
@@ -131,6 +119,24 @@ PATCH 采用三态语义：字段缺失表示不修改，具体值表示设置�
 的配置，不返回业务组合后的有效配置。声明式 `fallback` 已废弃，只支持整段
 配置，且仅用于兼容旧行为；新功能需要在业务解析器中实现 Cluster 默认值。
 详见 [Admin API - 运行时配置](../api/08-admin.md#runtime-configuration)。
+
+## Account Embedding 与 VectorDB
+
+ROOT 可在创建 Account 时配置 `settings.embedding` 和 `settings.vectordb`，
+两者使用 Account 专用白名单模型。Account 与 Cluster 配置分别保存，向量业务
+resolver 为 Account 未设置的值应用 Cluster 默认。Provider 连接只能通过完整
+`credentials` binding 提交，不能跨 Account/Cluster 拼接。配置查询只返回
+Account 配置。
+
+VectorDB 创建后不可修改。新旧 Account 均可轮换完整 Embedding
+credentials/deployment binding，并更新重试、并发、failback 和熔断参数；
+外层 model 身份及其他向量空间字段仅创建时可设。兼容 endpoint 更新不打断
+在途调用，也不会自动重建历史向量。
+
+Account 独立配置的 VectorDB 仅支持远端 backend；Account 不能选择 local/cuvs，
+也不能设置本地路径、cuVS 调优或自定义 adapter 参数。未设置 VectorDB 的
+Account 复用 Cluster 连接并保留数据过滤。远端资源由外部控制面提前创建。权限与 PATCH 规则见
+[Admin 配置 API](../api/08-admin.md#runtime-configuration)。
 
 ## 配置示例
 
@@ -306,7 +312,7 @@ OpenAI 已于 2026 年 8 月 31 日[停止在 ChatGPT 登录的 Codex 中提供 
 | `provider` | str | `"openai"`、`"azure"`、`"volcengine"`、`"vikingdb"`、`"jina"`、`"ollama"`、`"gemini"`、`"voyage"`、`"dashscope"`、`"minimax"`、`"cohere"`、`"litellm"` 或 `"local"` |
 | `api_key` | str | API Key |
 | `model` | str | 模型名称 |
-| `dimension` | int | 向量维度 |
+| `dimension` | int | 向量维度；Voyage 对应 `output_dimension` |
 | `input` | str | 输入类型：`"text"` 或 `"multimodal"` |
 | `batch_size` | int | 批量请求大小 |
 | `encoding_format` | str | （仅 OpenAI / Azure）Embedding 值的传输格式：`"float"` 或 `"base64"`。留空时使用 OpenAI Python SDK 默认值；当上游网关无法正确处理 base64 embedding payload 时，可设置为 `"float"`。 |
@@ -478,6 +484,26 @@ OpenAI 已于 2026 年 8 月 31 日[停止在 ChatGPT 登录的 Codex 中提供 
 - `jina-embeddings-v5-text-small`: 677M 参数, 1024 维, 最大序列长度 32768 (默认)
 - `jina-embeddings-v5-text-nano`: 239M 参数, 768 维, 最大序列长度 8192
 
+**Voyage provider 配置示例：**
+
+```json
+{
+  "embedding": {
+    "dense": {
+      "provider": "voyage",
+      "api_key": "pa-xxx",
+      "api_base": "https://api.voyageai.com/v1",
+      "model": "voyage-4-lite",
+      "dimension": 1024
+    }
+  }
+}
+```
+
+可使用 `voyage-4-lite`、`voyage-4`、`voyage-4-large` 等文本模型。可用模型与维度见 [Voyage 文本 Embedding 文档](https://docs.voyageai.com/docs/embeddings)。
+
+省略 `dimension` 时，OpenViking 按内置模型表（`voyage-3`、`voyage-3-large`、`voyage-3.5`、`voyage-3.5-lite`、`voyage-4`、`voyage-4-lite`、`voyage-4-large`、`voyage-code-3`、`voyage-context-3`、`voyage-finance-2`、`voyage-law-2`）选择维度；未识别的模型回退为 1024。使用新模型时，请显式填写其支持的输出维度。当前适配器发送普通文本 `input`，不传递 Voyage 的 `input_type`，也不支持量化输出或需要专用上下文接口的调用方式。
+
 **本地部署 (GGUF/MLX):** Jina 嵌入模型是开源的, 在 [Hugging Face](https://huggingface.co/jinaai) 上提供 GGUF 和 MLX 格式。可以使用任何 OpenAI 兼容的推理服务器 (如 llama.cpp、MLX、vLLM) 本地运行, 并将 `api_base` 指向本地端点:
 
 ```json
@@ -594,9 +620,21 @@ SDK 1.39.0 起提供所需的客户端上下文管理器和关闭方法，用于
 
 支持的 task type: `RETRIEVAL_QUERY`、`RETRIEVAL_DOCUMENT`、`SEMANTIC_SIMILARITY`、`CLASSIFICATION`、`CLUSTERING`、`CODE_RETRIEVAL_QUERY`、`QUESTION_ANSWERING`、`FACT_VERIFICATION`。
 
+#### 本地 provider（`local`）
+
+未配置 `dense`、`sparse` 或 `hybrid` embedding 时（包括省略 `embedding`），OpenViking 默认选择 `dense: {"provider": "local", "model": "bge-small-zh-v1.5-f16"}`。该 GGUF 模型输出 512 维向量，无需 API Key。
+
+安装本地推理依赖：
+
+```bash
+pip install "openviking[local-embed]"
+```
+
+首次使用时，OpenViking 将模型下载到 `~/.cache/openviking/models`；已有缓存则复用。通过 `embedding.dense.cache_dir` 修改缓存目录，或用 `embedding.dense.model_path` 指定已有 GGUF 文件以跳过下载。显式指定的文件不存在时会报错，不会转为下载。该模型的维度固定为 512。
+
 #### Sparse Embedding
 
-> **注意：** 火山引擎的 Sparse embedding 从 `doubao-embedding-vision-251215` 模型版本起支持。
+> 以下示例使用 `doubao-embedding-vision-251215`。所选模型是否支持文本 sparse 输出，请核对方舟[向量化文档](https://docs.volcengine.com/docs/ark/vectorization?lang=zh&redirect=1)。
 
 ```json
 {
@@ -635,7 +673,7 @@ provider，并设置 `storage.vectordb.sparse_weight > 0`。自托管模型的�
     "hybrid": {
       "provider": "volcengine",
       "api_key": "your-api-key",
-      "model": "doubao-embedding-hybrid",
+      "model": "doubao-embedding-vision-251215",
       "dimension": 1024
     }
   }
@@ -726,7 +764,7 @@ provider，并设置 `storage.vectordb.sparse_weight > 0`。自托管模型的�
 1. **L0（摘要）**：文件或目录摘要，默认字符上限为 256
 2. **L1（概览）**：目录概览，包含导航信息，默认字符上限为 4000
 
-如果未配置 VLM，L0/L1 将直接从内容生成（语义性较弱），多模态资源的描述可能有限。
+VLM 配置返回 `is_available() == false` 时，通用文件摘要会返回空内容，目录概览会退回“尚未就绪”的占位内容；可由本地解析器提取的代码骨架等仍按各自路径处理。这种状态不能视为已完成语义索引，应检查模型配置和对应处理任务。
 
 **支持的 provider：**
 - `volcengine`：火山引擎 VLM API
@@ -756,14 +794,14 @@ LiteLLM 的 Bedrock bearer-token API-key 鉴权，请设置 `forward_api_key=tru
     "api_base": "https://openrouter.ai/api/v1",
     "extra_headers": {
       "HTTP-Referer": "https://your-site.com",
-      "X-Title": "Your App Name"
+      "X-OpenRouter-Title": "Your App Name"
     }
   }
 }
 ```
 
 常见使用场景：
-- **OpenRouter**: 需要 `HTTP-Referer` 和 `X-Title` 来标识应用
+- **OpenRouter**：可选的 `HTTP-Referer` 和 `X-OpenRouter-Title` 用于[应用归属与展示](https://openrouter.ai/docs/app-attribution)，不作为 API 认证凭据；`X-Title` 仍可兼容
 - **Kimi Coding**: 需要自定义 user agent 或追加订阅请求头时可以在这里覆盖
 - **OpenCode Go**（`https://opencode.ai/zen/go/v1`）: 请求不带 `x-opencode-session` 会返回 HTTP 400 `MissingSessionID`。配置一个固定值即可，例如 `"extra_headers": {"x-opencode-session": "openviking-<your-host>"}`。OpenCode Go 只用这个 id 做路由和 prompt cache 优化，固定值不影响使用
 - **自定义代理**: 添加认证头或追踪头
@@ -839,7 +877,7 @@ VLM 的 `model` 填写对应的方舟模型 endpoint ID。`video_fps` 仅用于�
 
 ### query_planner
 
-可选的轻量模型配置，用于检索前的意图分析和 query 规划/改写。配置结构与 `vlm` 相同，但只影响 `search()` 的意图分析和 query expansion。未配置或配置为空时，OpenViking 会回退到 `vlm`，保持向后兼容。
+可选的轻量模型配置，用于检索前的意图分析和 query 规划/改写。配置结构与 `vlm` 相同，用于 `search()` 的意图分析、query expansion，以及可选的服务端 recall 摘要重写。未配置或配置为空时，OpenViking 会回退到 `vlm`，保持向后兼容。
 
 > 在 `openviking-server init` 里可勾选启用本地轻量 query planner，向导会自动拉取 Ollama 模型并写入 `query_planner` 配置。对于已知的 query planner 模型，`search()` 会在运行时自动选择匹配的内置 prompt；不在映射表中的模型继续使用 `retrieval.intent_analysis`。
 
@@ -870,7 +908,7 @@ ollama pull guoxuter/ov_intent_analysis_sft:v7_q8
 
 对于 `ollama/guoxuter/ov_intent_analysis_sft:v7_q8`（以及 `v4_q8`），OpenViking 会在 search 阶段自动使用对应的内置 prompt（分别为 `retrieval.ov_intent_analysis_sft_v7` 和 `retrieval.ov_intent_analysis_sft_v4`），不需要替换 prompt 文件，也不需要设置 `prompts.templates_dir`。如果使用未映射的模型，OpenViking 会继续使用默认的 `retrieval.intent_analysis` prompt。
 
-这样可以用小模型承担检索规划，降低延迟，同时保留更强的 `vlm` 处理语义提取、记忆提取和多模态内容。
+这样可以用小模型承担检索规划，同时保留更强的 `vlm` 处理语义提取、记忆提取和多模态内容。延迟需按模型、硬件和请求负载测量。
 
 
 ### feishu
@@ -909,7 +947,7 @@ ollama pull guoxuter/ov_intent_analysis_sft:v7_q8
 
 #### 远程资源网络防护
 
-通过 URL 拉取资源时，OpenViking 会拒绝环回、链路本地、私有及其他非公网目标，以及不在代码托管白名单中的主机，并抛出 `PermissionDeniedError`。要从自建 GitHub Enterprise / GitLab / Azure DevOps 拉取代码，请将主机加入 `code` 下对应的白名单：
+通过 URL 拉取资源时，默认网络检查会拒绝解析到非公网地址的目标。普通公网 URL 无需加入代码托管白名单；列入白名单的可信代码主机会跳过地址范围检查。接入自建 GitHub Enterprise / GitLab / Azure DevOps 时，可将主机加入 `code` 下对应的平台列表：
 
 | 字段 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
@@ -918,11 +956,11 @@ ollama pull guoxuter/ov_intent_analysis_sft:v7_q8
 | `azure_devops_domains` | list[str] | 允许的 Azure DevOps 主机 | `["dev.azure.com", "ssh.dev.azure.com", "vs-ssh.visualstudio.com"]` |
 | `code_hosting_domains` | list[str] | 允许的通用代码托管主机 | `["github.com", "gitlab.com", "gitcode.com", "gitee.com", "bitbucket.org", "codeberg.org", "gitea.com", "atomgit.com", "git.sr.ht"]` |
 
-要从私有/内网地址（例如内部镜像）拉取，请将顶层的 `allow_private_networks` 设为 `true`（默认关闭，因此仅允许公网地址）：
+如果需要允许其他私有网络目标（例如内部镜像），可将顶层 `allow_private_networks` 设为 `true`。该开关默认关闭；`localhost` 及其子域等本地主机名仍会被拒绝。下面同时演示启用私有网络访问和添加代码主机：
 
 ```json
 {
-  "allow_private_networks": false,
+  "allow_private_networks": true,
   "code": {
     "github_domains": ["github.com", "github.example.com"]
   }
@@ -959,6 +997,26 @@ PDF 解析配置。支持三种策略：`local`（本地 pdfplumber）、`mineru
 | `mineru_bodys` | dict | MinerU API multipart form 参数 |
 
 **MinerU 协议**：同步调用 `POST {mineru_endpoint}/file_parse`，multipart 文件字段为 `files`，form 参数由 `mineru_bodys` 透传。
+
+### 外部解析 API（`parser_api`） {#parser-api}
+
+顶层 `parser_api` 配置将指定格式交给外部 Understanding files/responses API。它只替换 Parser 阶段；TreeBuilder、持久化和语义处理仍由 OpenViking 完成。路由与异步行为见[资源处理流程](../api/02-resources.md#资源处理流程)。
+
+| 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `enable` | `false` | 启用外部解析。 |
+| `extensions` | `[]` | 交给外部解析的扩展名；转为小写并去掉开头的点。 |
+| `host` | `""` | 带协议的 API 地址，如 `https://parser.example.com`；启用时必填。 |
+| `api_key` | `""` | 外部 API 凭证；启用时必填。 |
+| `enable_feishu_url` | `false` | 有可用凭证时允许直接解析飞书 URL。已由 Accessor 归一化为 Markdown 的飞书文档跳过外部解析；文件附件仍按扩展名路由。 |
+| `enable_resumable_upload` | `false` | 启用断点续传。 |
+| `upload_simple_max_bytes` | `536870912`（512 MiB） | 简单上传的大小阈值。 |
+| `upload_part_size_bytes` | `8388608`（8 MiB） | 分片上传的分片大小。 |
+| `http_timeout_seconds` | `10.0` | 单次 HTTP 请求超时秒数。 |
+| `response_timeout_seconds` | `1800` | 等待解析结果的超时秒数。 |
+| `poll_interval_ms` | `3000` | 结果轮询间隔，单位毫秒。 |
+
+大小、超时和轮询参数都必须大于零。
 
 ### rerank
 
@@ -1101,7 +1159,7 @@ Jev 适配器将 query 和候选文档作为共享的 System One `state`，支�
 | `recall_intent_timeout_s` | float | 会话感知查询扩展的超时；超时后回退为用户原查询 | `5.0` |
 | `recall_rewrite_timeout_s` | float | digest 重写的超时；超时后 `digest` 为空并照常返回 `rendered` | `30.0` |
 
-两个 LLM 环节都是纯 opt-in：查询扩展需要传 `session_id`，重写需要传 `rewrite`。任一环节失败都优雅降级，不会阻塞召回。
+查询扩展需要传入有内容的 `session_id` 并启用意图分析，重写需要传入 `rewrite`。这些模型调用受各自超时限制；失败后回退到未扩展的查询或未重写的结果。
 
 ### grep
 
@@ -1176,11 +1234,11 @@ Glob 引擎配置，用于路径模式匹配。这些设置为服务端配置，
 |------|------|------|--------|
 | `backend` | str | `"local"`、`"s3"` 或 `"memory"` | `"local"` |
 | `timeout` | float | 请求超时时间（秒） | `10.0` |
-| `backups` | object | 多写存储配置。配置后顶层 `backend` 作为 primary，`backups.items[]` 作为 backup | `null` |
-| `redirects` | array | 多写存储的文件重定向策略。命中后文件写入指定 backup，而不是 primary | `[]` |
+| `backups` | object | 主备存储配置。配置后顶层 `backend` 作为 primary，`backups.items[]` 作为 backup | `null` |
+| `redirects` | array | 主备存储的文件重定向策略。命中后文件写入指定 backup，而不是 primary | `[]` |
 | `queuefs` | object | QueueFS 配置。控制 `/queue` 的命名空间模式、后端和运行时参数 | `{ "mode": "shared", "backend": "sqlite", "recover_stale_sec": 0, "busy_timeout_ms": 5000 }` |
 | `queue_db_path` | str（可选）| 旧版兼容字段，用于覆盖 QueueFS 的 sqlite 数据库文件路径。已被 `storage.agfs.queuefs.db_path` 取代。未设置时默认为 `{storage.workspace}/_system/queue/queue.db`。适用于 workspace 卷不支持 sqlite 的场景（例如某些网络文件系统） | `null` |
-| `s3` | object | S3 backend configuration (when backend is 's3') | - |
+| `s3` | object | S3 后端配置（`backend=s3` 时使用） | - |
 
 
 **配置示例**
@@ -1190,9 +1248,9 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 > [!WARNING]
 > `storage.agfs` 已不再支持 AGFS HTTP client 模式，也无需再配置旧的 HTTP client 入口。当前 AGFS / RAGFS 文件系统访问仅通过 Rust binding（`RAGFSBindingClient`）在进程内完成。这不影响 OpenViking server 的 HTTP API、`ov` CLI，或 `AsyncHTTPClient` / `SyncHTTPClient` 访问 OpenViking 服务端的能力。
 
-##### 多写存储配置
+##### 主备存储配置
 
-`storage.agfs.backups` 用于启用多写存储。未配置时，OpenViking 保持单 backend 模式。
+`storage.agfs.backups` 用于启用主备存储。未配置时，OpenViking 保持单 backend 模式。
 
 ```json
 {
@@ -1233,7 +1291,7 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
-| `sync_type` | str | 多写同步模式，支持 `"async"` 或 `"sync"` | `"async"` |
+| `sync_type` | str | 主备同步模式，支持 `"async"` 或 `"sync"` | `"async"` |
 | `write_ack_count` | int | `sync` 模式下返回前需要的 backup 确认数 | 全部 backup |
 | `write_ack_timeout_ms` | int | `sync` 模式下等待 backup 确认的超时时间，单位毫秒 | `null` |
 | `write_concurrency` | int | 异步 backup 写入并发上限 | `null` |
@@ -1264,7 +1322,7 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 - `target` 必须引用 `backups.items[]` 中已经定义的 backup `name`。
 - 命中 redirect 的文件仍会通过普通文件系统 API 呈现为可读、可列举的文件。
 
-更多配置示例见 [多写存储指南](./13-multi-write-storage.md)。
+更多配置示例见 [主备存储指南](./13-multi-write-storage.md)。
 
 ##### 全局 Cache Provider、CacheFS 与 PathLock 配置
 
@@ -1410,55 +1468,6 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 }
 ```
 
-##### Session Auto Commit 配置
-
-`memory.session_auto_commit` 用于控制服务端 session 自动 commit 的全局行为。
-
-```json
-{
-  "memory": {
-    "session_auto_commit": {
-      "enabled": false,
-      "check_interval_seconds": 600.0,
-      "scan_rate_limit_files_per_second": 2.0
-    }
-  }
-}
-```
-
-| 参数 | 类型 | 说明 | 默认值 |
-|------|------|------|--------|
-| `enabled` | bool | 自动 commit 总开关。开启后：未显式传入 `auto_commit_policy` 的新 session 会套用默认 policy，同时启动后台 idle 扫描器；关闭后两者都不发生 | `false` |
-| `check_interval_seconds` | float | 两轮 idle 扫描之间的最小间隔，单位秒，必须大于 `0` | `600.0` |
-| `scan_rate_limit_files_per_second` | float | idle 扫描时每秒最多读取的 session `.meta.json` 文件数，必须大于 `0`，用于限制大量 session 扫描时的存储 IO 压力 | `2.0` |
-
-说明：
-
-- `memory.session_auto_commit` 是服务端全局配置，不是单个 session 的业务 policy。
-- session 级别的自动触发参数通过 session 级 `auto_commit_policy` 设置（见下表）。可以在创建 session 时通过 `POST /api/v1/sessions` 设置，也可以通过 `PATCH /api/v1/sessions/{session_id}/config` 部分更新。PATCH 时省略 `auto_commit_policy` 会保留现有策略，传 `null` 会禁用自动 commit；通过 `GET /api/v1/sessions/{session_id}` 查看生效策略。
-- `enabled=false` 时：既无显式 policy、也无 `server.user_config_defaults.auto_commit_policy` 的新 Session 保持 auto commit 关闭，并返回 `auto_commit_policy: null`；同时不启动 `SessionAutoCommitScheduler`。
-- `enabled=true` 时：
-  - 既无显式 policy、也无部署级默认 policy 的新 Session 会带上下方内置 policy。
-  - `SessionAutoCommitScheduler` 启动后立即开始一轮扫描，之后每轮结束后至少等待 `check_interval_seconds` 再开始下一轮；若一轮耗时已超过该值，则立即开始下一轮。
-  - 扫描过程中以 `scan_rate_limit_files_per_second` 为上限串行读取 session `.meta.json`，避免瞬时 IO 洪峰。
-  - 不会做单独的启动恢复扫描，idle 检查只发生在周期扫描时。
-- token 和 message-count 自动触发在消息写入后内联执行，不依赖 scheduler，但同样以 session 是否带有 `auto_commit_policy` 为前提。
-
-###### 单 session 自动 commit 策略
-
-当 session 带有 `auto_commit_policy` 时，未传的字段会回退到下方推荐默认值。没有存储 policy 的 session 保持 auto commit 关闭。取值会被 clamp 到 `[0, 上限]`，未知字段会以 `InvalidArgumentError` 拒绝。设置和查看方式见 [Sessions API](../api/05-sessions.md#create-session)。
-
-| 字段 | 类型 | 默认值 | 上限 | 说明 |
-|------|------|--------|------|------|
-| `pending_token_threshold` | int | 150000 | 1000000 | 当未提交的 pending token 超过该值（严格大于）时，会在消息写入后触发一次自动 commit。 |
-| `message_count_threshold` | int | 100 | 1000 | 当未提交的 live message 数量超过该值（严格大于）时，会在消息写入后触发一次自动 commit。 |
-| `idle_timeout_seconds` | int | 86400 | 604800 | 有未提交内容的 session 在空闲这么多秒后，进入服务端 idle scheduler 的处理范围。idle 触发的 commit 会归档全部积压消息，并忽略 `keep_recent_count`。 |
-| `keep_recent_count` | int | 0 | 500 | 阈值触发的自动 commit 后保留（不归档）的最近 live message 数量。idle 超时触发的 commit 会忽略该值并归档所有消息。 |
-| `min_commit_interval_seconds` | int | 0 | 604800 | 两次自动 commit 之间的最小间隔秒数（节流）。 |
-
-代码入口：`openviking/session/auto_commit_policy.py:AutoCommitPolicy`。
-
-
 ##### S3 后端配置
 
 | 参数 | 类型 | 说明 | 默认值 |
@@ -1578,7 +1587,7 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 |------|------|------|--------|
 | `backend` | str | VectorDB 后端类型: 'local'（基于文件）, 'http'（远程服务）, 'volcengine'（云上 VikingDB）, 'vikingdb'（私有部署）或 'cuvs'（本地存储 + GPU dense search） | "local" |
 | `name` | str | VectorDB 的集合名称 | "context" |
-| `url` | str | 'http' 类型的远程服务 URL（例如 'http://localhost:5000'） | null |
+| `url` | str | 'http' 类型的远程服务 URL（例如 `http://localhost:5000`） | null |
 | `project_name` | str | 项目名称（别名 project） | "default" |
 | `distance_metric` | str | 向量相似度搜索的距离度量（例如 'cosine', 'l2', 'ip'） | "cosine" |
 | `dimension` | int | 向量嵌入的维度 | 0 |
@@ -1692,11 +1701,65 @@ openviking-server --config /path/to/ov.conf
 | 字段 | 说明 | 默认值 |
 |------|------|--------|
 | `version` | 已废弃且会被忽略。OpenViking 始终使用 v3 记忆抽取链路；已有配置中保留该字段仍可正常加载，不会报错。 | `"v3"` |
-| `custom_templates_dir` | 自定义 memory templates 目录。设置后会在内置模板之外加载该目录中的模板。 | `""` |
+| `custom_templates_dir` | 自定义 memory schema 目录。后加载的同名 `memory_type` 会覆盖内置定义，新类型会追加；详见 [Prompt 指南](10-prompt-guide.md)。 | `""` |
 | `extraction_enabled` | session commit 时是否执行长期记忆抽取。 | `true` |
 | `session_skill_extraction_enabled` | session commit 时是否同时抽取可复用 skill 到当前用户的 skill 目录。 | `false` |
 | `link_enabled` | 记忆抽取是否写入和解析 memory links。 | `false` |
-| `session_auto_commit` | 服务端 session 自动 commit 的全局控制项。该配置属于 `memory` 段，不属于 `server` 段；详见 [Session Auto Commit 配置](#session-auto-commit-配置)。 | 见上文 |
+| `session_auto_commit` | 服务端 session 自动 commit 的全局控制项。该配置属于 `memory` 段，不属于 `server` 段；详见 [Session Auto Commit 配置](#session-auto-commit-配置)。 | 见下文 |
+
+#### 记忆链接（`memory.link_enabled`）
+
+`memory.link_enabled` 默认为 `false`。启用后，抽取流程将临时 page ID 解析为 URI，并把链接存入记忆元数据。每条链接包含 `from_uri`、`to_uri`、`link_type`（默认 `related_to`）、`weight`（默认 `0.5`，抽取时限制在 0–1）、`match_text`（对话中的一个词或 `null`）、`description` 和 `created_at`。
+
+`link_type` 是关系标签，不是封闭枚举。抽取时将其归一化为小写 snake_case，允许一到三个字母单词；无效标签回退为 `related_to`。这些链接描述记忆间的关系；当前检索流程不遍历链接，也不使用链接权重排序。
+
+#### Session Auto Commit 配置
+
+`memory.session_auto_commit` 用于控制服务端 session 自动 commit 的全局行为。
+
+```json
+{
+  "memory": {
+    "session_auto_commit": {
+      "enabled": false,
+      "check_interval_seconds": 600.0,
+      "scan_rate_limit_files_per_second": 2.0
+    }
+  }
+}
+```
+
+| 参数 | 类型 | 说明 | 默认值 |
+|------|------|------|--------|
+| `enabled` | bool | 自动 commit 总开关。开启后：未显式传入 `auto_commit_policy` 的新 session 会套用默认 policy，同时启动后台 idle 扫描器；关闭后两者都不发生 | `false` |
+| `check_interval_seconds` | float | 两轮 idle 扫描之间的最小间隔，单位秒，必须大于 `0` | `600.0` |
+| `scan_rate_limit_files_per_second` | float | idle 扫描时每秒最多读取的 session `.meta.json` 文件数，必须大于 `0`，用于限制大量 session 扫描时的存储 IO 压力 | `2.0` |
+
+说明：
+
+- `memory.session_auto_commit` 是服务端全局配置，不是单个 session 的业务 policy。
+- session 级别的自动触发参数通过 session 级 `auto_commit_policy` 设置（见下表）。可以在创建 session 时通过 `POST /api/v1/sessions` 设置，也可以通过 `PATCH /api/v1/sessions/{session_id}/config` 部分更新。PATCH 时省略 `auto_commit_policy` 会保留现有策略，传 `null` 会禁用自动 commit；通过 `GET /api/v1/sessions/{session_id}` 查看生效策略。
+- `enabled=false` 时：既无显式 policy、也无 `server.user_config_defaults.auto_commit_policy` 的新 Session 保持 auto commit 关闭，并返回 `auto_commit_policy: null`；同时不启动 `SessionAutoCommitScheduler`。
+- `enabled=true` 时：
+  - 既无显式 policy、也无部署级默认 policy 的新 Session 会带上下方内置 policy。
+  - `SessionAutoCommitScheduler` 启动后立即开始一轮扫描，之后每轮结束后至少等待 `check_interval_seconds` 再开始下一轮；若一轮耗时已超过该值，则立即开始下一轮。
+  - 扫描过程中以 `scan_rate_limit_files_per_second` 为上限串行读取 session `.meta.json`，避免瞬时 IO 洪峰。
+  - 不会做单独的启动恢复扫描，idle 检查只发生在周期扫描时。
+- token 和 message-count 自动触发在消息写入后内联执行，不依赖 scheduler，但同样以 session 是否带有 `auto_commit_policy` 为前提。
+
+##### 单 session 自动 commit 策略
+
+当 session 带有 `auto_commit_policy` 时，未传的字段会回退到下方内置默认值。没有存储 policy 的 session 保持 auto commit 关闭。取值会被 clamp 到 `[0, 上限]`，未知字段会以 `InvalidArgumentError` 拒绝。设置和查看方式见 [Sessions API](../api/05-sessions.md#create-session)。
+
+| 字段 | 类型 | 默认值 | 上限 | 说明 |
+|------|------|--------|------|------|
+| `pending_token_threshold` | int | 150000 | 1000000 | 当未提交的 pending token 超过该值（严格大于）时，会在消息写入后触发一次自动 commit。 |
+| `message_count_threshold` | int | 100 | 1000 | 当未提交的 live message 数量超过该值（严格大于）时，会在消息写入后触发一次自动 commit。 |
+| `idle_timeout_seconds` | int | 86400 | 604800 | 有未提交内容的 session 在空闲这么多秒后，进入服务端 idle scheduler 的处理范围。idle 触发的 commit 会归档全部积压消息，并忽略 `keep_recent_count`。 |
+| `keep_recent_count` | int | 0 | 500 | 阈值触发的自动 commit 后保留（不归档）的最近 live message 数量。idle 超时触发的 commit 会忽略该值并归档所有消息。 |
+| `min_commit_interval_seconds` | int | 0 | 604800 | 两次自动 commit 之间的最小间隔秒数（节流）。 |
+
+代码入口：`openviking/session/auto_commit_policy.py:AutoCommitPolicy`。
 
 ### ovcli.conf
 
@@ -1723,7 +1786,8 @@ HTTP 客户端（`SyncHTTPClient` / `AsyncHTTPClient`）和 CLI 工具连接远�
 | 字段 | 说明 | 默认值 |
 |------|------|--------|
 | `url` | 服务端地址 | （必填） |
-| `api_key` | API Key 认证（root key 或 user key） | `null`（无认证） |
+| `api_key` | 通常填写用于数据访问的 user/admin key。API Key 模式下，这里填 root key 只能调用管理 API | `null`（无认证） |
+| `root_api_key` | `ov` CLI 带 `--sudo` 时使用的 root key；CLI 在 `api_key` 未设置时也会回退到它。Python HTTP SDK 不使用该回退 | `null` |
 | `account` | 可选的 trusted 模式 account 身份 header | `null` |
 | `user` | 可选的 trusted 模式 user 身份 header | `null` |
 | `profile` | 是否默认给 HTTP 请求追加 `profile=1`。对 Python HTTP client 和 `ov` CLI 都生效；也可通过 CLI 的 `--profile` 单次开启。是否真正生效还取决于服务端是否开启 `server.profile_enabled`。 | `false` |
@@ -1811,6 +1875,45 @@ ov add-resource ./docs --exclude "*.tmp"
 
 `user_config_defaults` 提供添加目标和记忆抽取的部署级默认配置。添加操作中，显式请求目标仍然优先：`add_resource.to` / `add_resource.parent` 优先于用户默认值，`add_skill.target_uri` 优先于用户默认值。记忆策略优先级为 Session 策略 > User `settings/user_config.json` 策略 > `server.user_config_defaults.memory_policy` > 内核默认策略。`server.agent_evolution.enabled` 提供启动默认值，运行时优先级为 Account 覆盖 > Cluster 运行时覆盖 > 启动值。无需重启的修改应使用 Admin settings 接口；直接编辑 `ov.conf` 需要重启后生效。
 
+支持的 add target URI：
+
+- `resource_uri` 作为 `add_resource` 的默认父目录使用，等价于 `parent=<uri>, create_parent=true`。它必须是当前请求用户可写的 resource 目录 URI，支持 `viking://resources` 或 `viking://resources/...`、`viking://~/resources` 或 `viking://~/resources/...`、`viking://user/{user_id}/resources` 或 `viking://user/{user_id}/resources/...`、`viking://user/{user_id}/peers/{peer_id}/resources` 或 `viking://user/{user_id}/peers/{peer_id}/resources/...`。`viking://~/...` 家目录别名会按请求用户解析。
+- `skill_uri` 作为 `add_skill` 的默认目标根目录使用。v1 只允许 `viking://~/skills` 和 `viking://agent/skills`；不支持显式写成 `viking://user/{user_id}/skills`。
+- 旧写法兼容：早期配置中的 `viking://user/resources` 和 `viking://user/skills` 会在配置加载时自动归一化为 `viking://~/resources` 和 `viking://~/skills`，并打印一条 info 日志。新配置请直接使用 `viking://~/...`；在 `add_targets` 之外，无 uid 的写法会在请求入口被拒绝。
+
+### 运行时配置来源 {#runtime-configuration-source}
+
+顶层 `runtime_config` 在启动时选择运行时配置来源，不放在 `server` 内。
+
+| 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `source` | `"file"` | `file` 通过 AGFS 存储配置；`memory` 只保存在当前进程中；也可填写已注册的自定义来源名称。 |
+| `module` | `null` | 用于注册自定义来源的 Python 模块。来源也可通过 `openviking.config_source` entry-point group 注册。 |
+| `params` | `{}` | 通过 `ConfigSourceContext.params` 传给自定义来源工厂的参数。 |
+
+自定义来源实现 `ConfigSource.load(scope)`、`update(scope, mutate)` 和 `delete(scope)`。来源必须防止并发读改写丢失更新，包括跨线程和事件循环的调用。更新回调可能被重试，因此不能有副作用。
+
+文件来源在 AGFS 中把 Account 配置写入 `/local/{account_id}/_system/setting.json`，把 Cluster 配置写入 `/local/_system/runtime_config/cluster.json`。前一版本的字节保存在同目录的 `setting.backup.json` 和 `cluster.backup.json`；主文件丢失或无效时可读取备份。原有 Account 配置继续使用原路径。
+
+管理器每 30 秒刷新 Cluster 和已缓存的 Account。24 小时未使用的 Account 从缓存移除并停止轮询，已存储的配置仍保留。刷新失败时继续使用上一次有效配置。Admin settings GET 返回已存储的覆盖值，不是合并后的生效配置，也不能证明所有派生客户端都已切换。修改配置使用 [Admin API](../api/08-admin.md)，各消费者的行为见[配置重载边界](#配置重载边界)。
+
+### 工具输出外置 {#tool-output-externalization}
+
+`server.tool_output_externalization` 将会话中过大的工具输出存入该会话的 `tool-results/`，消息保留预览 stub 和 `tool_output_ref`。完整输出可通过[会话管理](../api/05-sessions.md)中的 tool-result read、search、list API 回读。
+
+| 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `enabled` | `true` | 启用工具输出外置。 |
+| `threshold_chars` | `20000` | 单条输出超过此字符数时外置。 |
+| `preview_chars` | `2000` | 单条输出的预览字符目标。 |
+| `assistant_turn_inline_budget_chars` | `100000` | 同一 assistant turn 中工具输出的内联预算。 |
+| `assistant_turn_preview_budget_chars` | `10000` | 在该轮各输出之间分配的预览预算。 |
+| `min_preview_chars` | `1000` | 分配单条预览时的下限。 |
+| `aggregate_selection_strategy` | `"largest_first"` | 目前唯一支持的策略：需要缩减该轮内联大小时优先外置较大输出。 |
+| `failure_mode` | `"preserve_raw"` | 存储失败时：`preserve_raw` 保留原文；`reject` 抛出错误；`preview_only` 只保留预览，不提供可恢复原文的引用。 |
+
+这些预算用于选择外置输出和分配预览。预览元数据和最小预览大小可能使结果超出预算；`preserve_raw` 在写入失败时也可能使该轮超出预算。
+
 ### Usage Reporter
 
 可选的 Usage Reporter 从已 commit session 的 tool parts 中抽取记忆使用事件。内置文件日志 Sink 将每个事件写成一行扁平 JSON，并按小时滚动专用日志文件：
@@ -1851,11 +1954,17 @@ ov add-resource ./docs --exclude "*.tmp"
 
 `event_time` 使用 UTC 时间。`tenant_id` 由部署 resource ID、事件所属的 account、user 和 Experience URI 拼接。`memory.recalled` 映射为 `experience.recall.count`，`memory.injected` 映射为 `experience.inject.count`。`object_id` 是稳定的 Usage Event ID。下游必须使用 `(tenant_id, object_id)` 复合键去重，不能跨 tenant 仅按 `object_id` 全局去重。查询时按 `tenant_id`、`event_name` 和 `event_time` 范围过滤，再通过 `sum(count)` 汇总。文件采集和下游投递仍为 best-effort。
 
-支持的 add target URI：
+#### 自定义 Sink
 
-- `resource_uri` 作为 `add_resource` 的默认父目录使用，等价于 `parent=<uri>, create_parent=true`。它必须是当前请求用户可写的 resource 目录 URI，支持 `viking://resources` 或 `viking://resources/...`、`viking://~/resources` 或 `viking://~/resources/...`、`viking://user/{user_id}/resources` 或 `viking://user/{user_id}/resources/...`、`viking://user/{user_id}/peers/{peer_id}/resources` 或 `viking://user/{user_id}/peers/{peer_id}/resources/...`。`viking://~/...` 家目录别名会按请求用户解析。
-- `skill_uri` 作为 `add_skill` 的默认目标根目录使用。v1 只允许 `viking://~/skills` 和 `viking://agent/skills`；不支持显式写成 `viking://user/{user_id}/skills`。
-- 旧写法兼容：早期配置中的 `viking://user/resources` 和 `viking://user/skills` 会在配置加载时自动归一化为 `viking://~/resources` 和 `viking://~/skills`，并打印一条 info 日志。新配置请直接使用 `viking://~/...`；在 `add_targets` 之外，无 uid 的写法会在请求入口被拒绝。
+在 `server.usage_reporter.sinks` 中添加：
+
+```json
+{"type": "custom", "class_path": "my_app.usage.MySink", "config": {}}
+```
+
+该类必须能被服务端导入。`config` 作为关键字参数传给构造函数。类需实现 `async def write(self, *, events: list[UsageEvent]) -> None`；`UsageEvent` 定义于 `openviking.usage_reporter.models`，提供 `event_id` 和 `to_dict()`。输入是事件对象列表，不是 `file_log` 输出的扁平 JSON 行。
+
+投递采用 best-effort：Sink 错误和超时会记录到日志，phase-2 重放可能再次发送同一事件。自定义 Sink 需定义重试和去重策略。若输出文件日志格式，应设置 `object_id = event.event_id`，并按上述部署/account/user/resource 范围内的 `(tenant_id, object_id)` 去重。这不是 exactly-once 投递协议。
 
 启动方式和部署详情见 [服务部署](./03-deployment.md)，认证详情见 [认证](./04-authentication.md)。
 
@@ -1863,7 +1972,7 @@ ov add-resource ./docs --exclude "*.tmp"
 
 ## encryption 段
 
-启用静态数据加密，确保多租户环境下的数据安全与隔离。加密功能对用户完全透明，API 无变化。
+启用静态数据加密后，存储层按账户加密新写入的文件，客户端沿用现有 API。已有明文文件不会自动加密，需单独迁移或重写。
 
 ```json
 {
@@ -1995,7 +2104,7 @@ ov add-resource ./docs --exclude "*.tmp"
 
 ## Task Tracker 持久化
 
-任务跟踪器记录异步任务状态，适用于返回 `task_id` 的接口（任务类型包括 `session_commit`、`add_resource`、`add_skill`、`admin_reindex`）。Task 记录始终持久化到 AGFS，因此一个实例返回的 `task_id` 可以在另一个实例上查询，任务历史也能在重启后继续访问。
+任务跟踪器记录异步任务状态，适用于返回 `task_id` 的接口（任务类型包括 `session_commit`、`add_resource`、`add_skill`、`admin_reindex`）。Task 记录写入 AGFS，共享同一持久化存储的实例可以查询同一个 `task_id`，任务历史可在重启后访问，但仍受保留清理策略影响。使用 `memory` 文件存储后端时，记录不能跨进程重启保留。
 
 无需配置 `storage.task_tracker`。如果旧配置里仍包含 `storage.task_tracker`，OpenViking 会记录 warning 并忽略它。
 
@@ -2005,7 +2114,9 @@ Task 记录文件位于所属账号的系统目录：
 /local/{account_id}/_system/tasks/{user_id}/{task_id}.json
 ```
 
-## 完整 Schema
+## 配置结构示意
+
+下面展示主要配置段的结构，不是可直接运行的完整配置或 JSON Schema。`string` 和用 `|` 连接的选项需要替换为实际值；没有列出的字段见前文各模块。
 
 ```json
 {
@@ -2069,10 +2180,11 @@ Task 记录文件位于所属账号的系统目录：
     "workspace": "string",
     "agfs": {
       "backend": "local|s3|memory",
-      "timeout": 10
-    },
-    "transaction": {
-      "lock_expire": 300.0
+      "timeout": 10,
+      "pathlock": {
+        "provider": "filesystem",
+        "lock_expire_secs": 30.0
+      }
     },
     "vectordb": {
       "backend": "local|cuvs|http|volcengine|vikingdb",
@@ -2128,7 +2240,7 @@ Error: VLM request timeout
 Error: Rate limit exceeded
 ```
 
-火山引擎有速率限制。考虑批量处理时添加延迟或升级套餐。
+先从 provider 返回的错误中确认限制的是请求数、token 用量还是账户配额，再调整请求节奏或申请相应额度。
 - 优先降低 `embedding.max_concurrent` / `vlm.max_concurrent`
 - 对偶发 `429` 可保留少量 `max_retries`；若希望快速失败，可将其设为 `0`
 

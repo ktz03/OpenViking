@@ -117,6 +117,15 @@ context under such presets with no error. Pre-step injection also makes each
 injection a session event that replays, is visible to compaction, and never
 reaches `request/header`.
 
+### What triggers recall
+
+Recall runs on a pre-step whose entering batch contains user-authored input.
+The query is built only from those messages: user-role messages with
+`source.kind` absent or `user`. Messages that DSH or other plugins inject
+(`time-context`, `plugin:*` notices, this plugin's own blocks) and tool results
+are excluded, using the same rule capture uses. A batch made only of injected
+context sends no search request.
+
 ### How the tool surface is mounted
 
 `mcp.mjs` mounts `@deepseek-ai/dsh-mcp-client` on `servers/mcp-proxy.mjs`, the
@@ -185,7 +194,7 @@ The profile's `cordis.patch.yml` can also carry plugin config:
     endpoint: http://127.0.0.1:1933
     recallMaxTokens: 2000
     scoreThreshold: 0.35
-    captureToolResults: false
+    captureToolResults: true
     skipSubagentSessions: true
     commitTokenThreshold: 20000
     mcpToolCallTimeoutMs: 60000
@@ -228,7 +237,7 @@ The older size settings apply to fallback recall, not the primary context reques
 - `tools/pre-execute` denies a DSH filesystem tool (`read`, `glob`, `grep`, `edit`, `write`, `str_replace_editor`) whose path argument is a `viking://` URI, pointing the model at the bridged `mcp__openviking__*` tools instead. A `write` or `edit` under a skill directory (`viking://~/skills/...`, `viking://user/<id>/skills/...`, `viking://agent/skills/...`) points at `mcp__openviking__add_skill` instead, which creates or replaces a whole skill from its `SKILL.md` text. A `grep` whose pattern is `viking://` text still runs.
 - `tools/post-execute` lets a `bash` command that carries a `viking://` URI run unchanged and attaches a notice for the model: use the bridged tools if it meant OpenViking content, or ignore the notice when the URI is intentional data such as an `ov` argument or an HTTP payload.
 
-Each DSH session maps to `dsh-<session-id>` in OpenViking. Workspace-derived actor peers are resolved per session and sent on every session-specific request: the peer is the git identity of the session's workspace — the normalized `origin` URL (`git@github.com:volcengine/OpenViking.git` becomes `github.com-volcengine-openviking`), else the repository root path, that fallback keeping the older rule where every non-letter-or-digit character becomes `-`. With the default peer settings, no peer is sent outside a git repository, and what is remembered there goes to the user-level space `viking://user/<you>/memories`. One repository therefore keeps one peer across subdirectories, worktrees, clones and machines, while a fork's different origin keeps it separate. Memories written under the older path-derived peer stay reachable: the default `recallPeerScope: all` sweeps every peer under the user.
+Each DSH session maps to `dsh-<session-id>` in OpenViking. IDs that contain Windows-invalid path characters are normalized to a readable underscore form plus a stable hash, so two native IDs cannot collapse onto the same OpenViking session; already-portable IDs keep their existing mapping. Existing sessions whose native IDs require normalization start a new OpenViking session after this upgrade. Workspace-derived actor peers are resolved per session and sent on every session-specific request: the peer is the git identity of the session's workspace — the normalized `origin` URL (`git@github.com:volcengine/OpenViking.git` becomes `github.com-volcengine-openviking`), else the repository root path, that fallback keeping the older rule where every non-letter-or-digit character becomes `-`. With the default peer settings, no peer is sent outside a git repository, and what is remembered there goes to the user-level space `viking://user/<you>/memories`. One repository therefore keeps one peer across subdirectories, worktrees, clones and machines, while a fork's different origin keeps it separate. Memories written under the older path-derived peer stay reachable: the default `recallPeerScope: all` sweeps every peer under the user.
 
 Workspace peer settings are loaded from `session.header.cwd` when the session first uses memory. A workspace can set `peer.id` to name its project explicitly, or `peer.source` to choose a preset or template chain. For example, `<root>/.openviking/config.json` can contain:
 

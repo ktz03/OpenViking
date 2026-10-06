@@ -1,4 +1,4 @@
-# LangChain 和 LangGraph
+# LangChain / LangGraph
 
 把 OpenViking 接入你的 LangChain 或 LangGraph Agent 作为上下文后端。独立集成包提供
 retriever、chat history、context wrapper、agent tools、LangGraph store 和 middleware，
@@ -209,7 +209,7 @@ docs = retriever.invoke("用户之前对部署方案做了什么决定？")
 ### Context backend
 
 ```python
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_openviking import with_openviking_context
 
@@ -218,7 +218,10 @@ with with_openviking_context(
     url="http://localhost:1933",
     api_key="...",
 ) as chain:
-    result = chain.invoke(...)
+    result = chain.invoke(
+        [HumanMessage(content="Remember that I prefer short answers")],
+        config={"configurable": {"session_id": "support-thread-1"}},
+    )
 ```
 
 ### Agent tools

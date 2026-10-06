@@ -106,6 +106,16 @@ export const SKILL_TARGETS = [
     dir: join(ROOT, "examples", "dsh-memory-plugin", "skills"),
     committed: true,
   },
+  {
+    skill: "openviking-memory",
+    dir: join(ROOT, "examples", "pi-coding-agent-extension", "skills"),
+    committed: true,
+  },
+  {
+    skill: "openviking-memory",
+    dir: join(ROOT, "examples", "opencode-plugin", "skills"),
+    committed: true,
+  },
   // The harnesses that bundle skills. agent-plugins has no hooks, so no
   // session-start catalog: there the skill is the only way the model learns
   // that the skills in OpenViking exist.
@@ -134,9 +144,20 @@ export const SKILL_TARGETS = [
     dir: join(ROOT, "agent-plugins", "skills"),
     committed: true,
   },
-  // The harnesses that ship the experience workflow today. agent-plugins has
-  // no hooks and so no session capture: its copy only retrieves and applies
-  // Experience, and its reads feed no trajectory back to the server.
+  {
+    skill: "openviking-skills",
+    dir: join(ROOT, "examples", "pi-coding-agent-extension", "skills"),
+    committed: true,
+  },
+  {
+    skill: "openviking-skills",
+    dir: join(ROOT, "examples", "opencode-plugin", "skills"),
+    committed: true,
+  },
+  // The harnesses that ship the experience workflow today. Where capture sends
+  // no tool parts (agent-plugins, Cursor; dsh with captureToolResults off),
+  // the copy only retrieves and applies Experience, and its reads feed no
+  // trajectory back to the server.
   {
     skill: "ov-experience-memory",
     dir: join(ROOT, "examples", "codex-memory-plugin", "skills"),
@@ -150,6 +171,26 @@ export const SKILL_TARGETS = [
   {
     skill: "ov-experience-memory",
     dir: join(ROOT, "agent-plugins", "skills"),
+    committed: true,
+  },
+  {
+    skill: "ov-experience-memory",
+    dir: join(ROOT, "examples", "agent-hook-plugin", "hosts", "cursor", "skills"),
+    committed: true,
+  },
+  {
+    skill: "ov-experience-memory",
+    dir: join(ROOT, "examples", "dsh-memory-plugin", "skills"),
+    committed: true,
+  },
+  {
+    skill: "ov-experience-memory",
+    dir: join(ROOT, "examples", "pi-coding-agent-extension", "skills"),
+    committed: true,
+  },
+  {
+    skill: "ov-experience-memory",
+    dir: join(ROOT, "examples", "opencode-plugin", "skills"),
     committed: true,
   },
 ];
@@ -269,6 +310,21 @@ export async function assembledClosure() {
   return sharedClosure([...seeds]);
 }
 
+/**
+ * Whether TypeScript in the plugin imports the shared copies, so they need
+ * their `.d.mts` declarations. TypeScript that imports none of them (a Claude
+ * Code hooks module beside plain `.mjs` hooks) does not make the target typed.
+ */
+async function importsFromTypeScript(files, dir) {
+  for (const file of files) {
+    if (!file.endsWith(".ts") && !file.endsWith(".mts") && !file.endsWith(".tsx")) continue;
+    for (const spec of importSpecifiers(await readFile(file, "utf-8"))) {
+      if (spec.startsWith(".") && resolvePath(dirname(file), spec).startsWith(dir + sep)) return true;
+    }
+  }
+  return false;
+}
+
 /** Every target with the file set its own imports resolve to. */
 export async function resolveTargets() {
   const resolved = [];
@@ -282,7 +338,7 @@ export async function resolveTargets() {
     resolved.push({
       ...target,
       files: await sharedClosure(seeds),
-      typed: own.some((file) => file.endsWith(".ts") || file.endsWith(".mts")),
+      typed: await importsFromTypeScript(own, target.dir),
     });
   }
   return resolved;

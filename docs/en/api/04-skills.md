@@ -88,7 +88,7 @@ Concrete examples of skill invocation.
 | tags | List[str] | Tags for categorization |
 | metadata | object | Preserved extensions such as `metadata.vikingbot.requires`; OpenViking does not install these dependencies |
 
-Use hyphenated **`allowed-tools`** in `SKILL.md`; parsed structured data and API summaries use **`allowed_tools`**. Do not substitute the underscore spelling in frontmatter. An omitted declaration and an explicit empty declaration can have different Harness permissions; a summary with `allowed_tools: []` cannot distinguish them. Read the full definition before execution. See [VikingBot Skills](../../../bot/docs/en/concepts/06-skills.md) for instruction and metadata handling.
+Use hyphenated **`allowed-tools`** in `SKILL.md`; parsed structured data and API summaries use **`allowed_tools`**. Do not substitute the underscore spelling in frontmatter. An omitted declaration and an explicit empty declaration can have different Harness permissions; a summary with `allowed_tools: []` cannot distinguish them. Read the full definition before execution. See [VikingBot Skills](https://github.com/volcengine/OpenViking/blob/main/bot/docs/en/concepts/06-skills.md) for instruction and metadata handling.
 
 ### MCP Format Automatic Conversion
 
@@ -161,7 +161,7 @@ Add a skill to the knowledge base.
 
 #### 1. API Implementation Overview
 
-Skills are a special type of resource that define actions or tools agents can perform.
+This endpoint stores Skill instructions and supporting files, then generates summaries and indexes for retrieval. It does not execute the Skill or register tools.
 
 **Processing Flow**:
 1. Receive skill data or uploaded temporary file
@@ -411,7 +411,7 @@ ov skills add ./skills/code-runner/ -p viking://agent/skills --wait
 ov task status TASK_ID
 
 # Use JSON output format
-ov add-skill ./skills/my-skill/ -o json
+ov -o json add-skill ./skills/my-skill/
 ```
 
 **Response Examples**
@@ -446,12 +446,15 @@ task_id         uuid-xxx
 **CLI response (JSON format, using -o json)**:
 ```json
 {
-  "status": "success",
-  "root_uri": "viking://user/alice/skills/my-skill",
-  "uri": "viking://user/alice/skills/my-skill",
-  "name": "my-skill",
-  "auxiliary_files": 2,
-  "task_id": "uuid-xxx"
+  "ok": true,
+  "result": {
+    "status": "success",
+    "root_uri": "viking://user/alice/skills/my-skill",
+    "uri": "viking://user/alice/skills/my-skill",
+    "name": "my-skill",
+    "auxiliary_files": 2,
+    "task_id": "uuid-xxx"
+  }
 }
 ```
 
@@ -517,7 +520,10 @@ console.log(await client.listSkills());
 
 ```go
 skills, err := client.ListSkills(ctx, nil)
-_ = skills
+if err != nil {
+    return err
+}
+fmt.Println(skills)
 ```
 
 **HTTP API**
@@ -567,7 +573,10 @@ skill, err := client.GetSkill(ctx, "search-web", &openviking.GetSkillOptions{
     IncludeContent: openviking.Bool(true),
     IncludeFiles:   openviking.Bool(true),
 })
-_ = skill
+if err != nil {
+    return err
+}
+fmt.Println(skill)
 ```
 
 **HTTP API**
@@ -607,7 +616,7 @@ The HTTP equivalent is `GET /api/v1/skills/search-web?include_content=true&inclu
 
 The manifest includes `SKILL.md`, summaries, and auxiliary files/directories, but excludes `.source.json`. Integrity limits are **512 entries (including directories), 16 MiB per file, and 64 MiB total file bytes**, with read concurrency 8. Exceeding a limit returns `RESOURCE_EXHAUSTED`. Content, manifest, and revision are obtained under one tree lock, but later downloads can encounter updates; consumers should verify file hashes and recheck revision.
 
-Search and `get_skill` return content and manifests without executing scripts or installing files in an Agent sandbox. A Harness can read text remotely and download resources when a tool requires local paths. See [VikingBot Skills](../../../bot/docs/en/concepts/06-skills.md) for the complete consumer workflow. MCP clients reach the same package-level behavior through the `find` tool with `context_type="skill"`; see [MCP Integration](../guides/06-mcp-integration.md).
+Search and `get_skill` return content and manifests without executing scripts or installing files in an Agent sandbox. A Harness can read text remotely and download resources when a tool requires local paths. See [VikingBot Skills](https://github.com/volcengine/OpenViking/blob/main/bot/docs/en/concepts/06-skills.md) for the complete consumer workflow. MCP clients reach the same package-level behavior through the `find` tool with `context_type="skill"`; see [MCP Integration](../guides/06-mcp-integration.md).
 
 ### Search Skills
 
@@ -663,7 +672,10 @@ console.log(await client.findSkills("database migration"));
 results, err := client.FindSkills(ctx, "search the internet", &openviking.FindSkillsOptions{
     Limit: 5,
 })
-_ = results
+if err != nil {
+    return err
+}
+fmt.Println(results)
 ```
 
 **HTTP API**
@@ -727,8 +739,15 @@ validated, err := client.ValidateSkill(ctx, map[string]any{
     "name":        "search-web",
     "description": "...",
 }, nil)
+if err != nil {
+    return err
+}
+fmt.Println(validated)
 updated, err := client.UpdateSkill(ctx, "search-web", "./skills/search-web", nil)
-_, _ = validated, updated
+if err != nil {
+    return err
+}
+fmt.Println(updated)
 ```
 
 **HTTP API**
@@ -791,7 +810,10 @@ await client.deleteSkill("my-skill");
 
 ```go
 deleted, err := client.DeleteSkill(ctx, "old-skill")
-_ = deleted
+if err != nil {
+    return err
+}
+fmt.Println(deleted)
 ```
 
 **HTTP API**
@@ -818,7 +840,7 @@ Without names, `ov skills update` attempts all installed Skills and reports unsu
 
 ### Skill Management Responses
 
-List and search return a `skills` array and `total`. Without `target_uri`, `root_uris` identifies the private user and shared Agent roots; with a target, the response contains a single `root_uri`.
+List and search return a `skills` array and `total`. Without `target_uri`, `root_uris` identifies the private user and shared Agent roots; with a target, the response contains a single `root_uri`. The following search response uses an L0 hit. A list response uses the package URI and does not include search scores.
 
 ```json
 {
@@ -832,7 +854,7 @@ List and search return a `skills` array and `total`. Without `target_uri`, `root
       {
         "type": "skill",
         "name": "search-web",
-        "uri": "viking://user/default/skills/search-web",
+        "uri": "viking://user/default/skills/search-web/.abstract.md",
         "root_uri": "viking://user/default/skills/search-web",
         "skill_md_uri": "viking://user/default/skills/search-web/SKILL.md",
         "description": "Search the web for current information",
@@ -912,14 +934,9 @@ skill = {
 }
 ```
 
-### Comprehensive Content
+### Execution Conditions and Expected Results
 
-Include in your skill content:
-
-- Clear parameter descriptions with types
-- When to use the skill
-- Concrete examples
-- Edge cases and limitations
+State when the Skill applies, the tools and dependencies it needs, its inputs, and the expected output. Give one concrete example and a way to check the result. Explain what the Agent should do when a dependency is missing or a step fails. OpenViking stores these instructions; the consuming Harness determines which tools can actually run.
 
 ### Consistent Naming
 
@@ -936,4 +953,4 @@ Use kebab-case for skill names:
 - [Context Types](../concepts/02-context-types.md) - Skill concept
 - [Retrieval](06-retrieval.md) - Finding skills
 - [Sessions](05-sessions.md) - Tracking skill usage
-- [VikingBot Skills](../../../bot/docs/en/concepts/06-skills.md) - Local/remote activation, metadata, and execution
+- [VikingBot Skills](https://github.com/volcengine/OpenViking/blob/main/bot/docs/en/concepts/06-skills.md) - Local/remote activation, metadata, and execution

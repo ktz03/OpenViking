@@ -88,7 +88,7 @@ Concrete examples of skill invocation.
 | tags | List[str] | 用于分类的标签 |
 | metadata | object | 原样保留的扩展字段，如 `metadata.vikingbot.requires`；OpenViking 不自动安装这些依赖 |
 
-`SKILL.md` 使用带连字符的 **`allowed-tools`**，解析后的结构化数据和 API 摘要使用 **`allowed_tools`**。不要在 frontmatter 中用下划线拼写替代它。未声明和显式空声明可能在 Harness 中有不同权限含义，摘要里的 `allowed_tools: []` 不能区分二者；执行前应读取完整 `SKILL.md`。正文与扩展字段的消费方式见 [VikingBot Skills](../../../bot/docs/zh/concepts/06-skills.md)。
+`SKILL.md` 使用带连字符的 **`allowed-tools`**，解析后的结构化数据和 API 摘要使用 **`allowed_tools`**。不要在 frontmatter 中用下划线拼写替代它。未声明和显式空声明可能在 Harness 中有不同权限含义，摘要里的 `allowed_tools: []` 不能区分二者；执行前应读取完整 `SKILL.md`。正文与扩展字段的消费方式见 [VikingBot Skills](https://github.com/volcengine/OpenViking/blob/main/bot/docs/zh/concepts/06-skills.md)。
 
 ### MCP 格式自动转换
 
@@ -161,7 +161,7 @@ This tool wraps the MCP tool `search-web`. Call this when the user needs functio
 
 #### 1. API 实现介绍
 
-技能是一种特殊的资源，用于定义智能体可以执行的操作或工具。
+此接口存储 Skill 指令和配套文件，并生成供检索使用的摘要与索引。它不会执行 Skill 或注册工具。
 
 **处理流程**：
 1. 接收技能数据或上传的临时文件
@@ -411,7 +411,7 @@ ov skills add ./skills/code-runner/ -p viking://agent/skills --wait
 ov task status TASK_ID
 
 # 使用 JSON 输出格式
-ov add-skill ./skills/my-skill/ -o json
+ov -o json add-skill ./skills/my-skill/
 ```
 
 **响应示例**：
@@ -446,12 +446,15 @@ task_id         uuid-xxx
 **CLI 响应（JSON 格式，使用 -o json）**：
 ```json
 {
-  "status": "success",
-  "root_uri": "viking://user/alice/skills/my-skill",
-  "uri": "viking://user/alice/skills/my-skill",
-  "name": "my-skill",
-  "auxiliary_files": 2,
-  "task_id": "uuid-xxx"
+  "ok": true,
+  "result": {
+    "status": "success",
+    "root_uri": "viking://user/alice/skills/my-skill",
+    "uri": "viking://user/alice/skills/my-skill",
+    "name": "my-skill",
+    "auxiliary_files": 2,
+    "task_id": "uuid-xxx"
+  }
 }
 ```
 
@@ -517,7 +520,10 @@ console.log(skills);
 
 ```go
 skills, err := client.ListSkills(ctx, nil)
-_ = skills
+if err != nil {
+    return err
+}
+fmt.Println(skills)
 ```
 
 **HTTP API**：
@@ -568,7 +574,10 @@ skill, err := client.GetSkill(ctx, "search-web", &openviking.GetSkillOptions{
     IncludeContent: openviking.Bool(true),
     IncludeFiles:   openviking.Bool(true),
 })
-_ = skill
+if err != nil {
+    return err
+}
+fmt.Println(skill)
 ```
 
 **HTTP API**：
@@ -608,7 +617,7 @@ HTTP 对应查询为 `GET /api/v1/skills/search-web?include_content=true&include
 
 清单包含 `SKILL.md`、摘要和辅助文件/目录，不包含 `.source.json`。完整性 API 上限为 **512 个条目（包含目录）、单文件 16 MiB、总文件字节数 64 MiB**，读取并发为 8；超限返回 `RESOURCE_EXHAUSTED`。正文、清单和 revision 在同一次树锁保护的读取中取得，但后续下载仍可能遇到更新，消费方应校验文件哈希并复查 revision。
 
-检索与 `get_skill` 只返回内容和清单，不会执行脚本或把文件安装到 Agent 沙箱。Harness 可按需远程读文本，在工具需要本地路径时下载资源。VikingBot 的完整流程见 [Skills](../../../bot/docs/zh/concepts/06-skills.md)。MCP 客户端通过 `find` 工具传 `context_type="skill"` 得到同样的包级行为，见 [MCP 集成](../guides/06-mcp-integration.md)。
+检索与 `get_skill` 只返回内容和清单，不会执行脚本或把文件安装到 Agent 沙箱。Harness 可按需远程读文本，在工具需要本地路径时下载资源。VikingBot 的完整流程见 [Skills](https://github.com/volcengine/OpenViking/blob/main/bot/docs/zh/concepts/06-skills.md)。MCP 客户端通过 `find` 工具传 `context_type="skill"` 得到同样的包级行为，见 [MCP 集成](../guides/06-mcp-integration.md)。
 
 ### 搜索技能
 
@@ -665,7 +674,10 @@ console.log(skills);
 results, err := client.FindSkills(ctx, "search the internet", &openviking.FindSkillsOptions{
     Limit: 5,
 })
-_ = results
+if err != nil {
+    return err
+}
+fmt.Println(results)
 ```
 
 **HTTP API**：
@@ -730,8 +742,15 @@ validated, err := client.ValidateSkill(ctx, map[string]any{
     "name":        "search-web",
     "description": "...",
 }, nil)
+if err != nil {
+    return err
+}
+fmt.Println(validated)
 updated, err := client.UpdateSkill(ctx, "search-web", "./skills/search-web", nil)
-_, _ = validated, updated
+if err != nil {
+    return err
+}
+fmt.Println(updated)
 ```
 
 **HTTP API**：
@@ -794,7 +813,10 @@ await client.deleteSkill("my-skill");
 
 ```go
 deleted, err := client.DeleteSkill(ctx, "old-skill")
-_ = deleted
+if err != nil {
+    return err
+}
+fmt.Println(deleted)
 ```
 
 **HTTP API**：
@@ -821,7 +843,7 @@ ov skills remove old-skill -p viking://~/skills --yes
 
 ### 技能管理响应
 
-列出和搜索都返回 `skills` 数组与 `total`。未指定 `target_uri` 时使用 `root_uris` 表示用户私有与 Agent 共享两个检索根；指定后返回单个 `root_uri`。
+列出和搜索都返回 `skills` 数组与 `total`。未指定 `target_uri` 时使用 `root_uris` 表示用户私有与 Agent 共享两个检索根；指定后返回单个 `root_uri`。下面是命中 L0 的搜索响应；列表响应中的 URI 指向包根，且不包含检索分数。
 
 ```json
 {
@@ -835,7 +857,7 @@ ov skills remove old-skill -p viking://~/skills --yes
       {
         "type": "skill",
         "name": "search-web",
-        "uri": "viking://user/default/skills/search-web",
+        "uri": "viking://user/default/skills/search-web/.abstract.md",
         "root_uri": "viking://user/default/skills/search-web",
         "skill_md_uri": "viking://user/default/skills/search-web/SKILL.md",
         "description": "Search the web for current information",
@@ -915,6 +937,10 @@ skill = {
 }
 ```
 
+### 写清执行条件和输出
+
+说明技能适用的任务、需要的工具与依赖、输入和预期输出。给出一个具体例子，以及检查结果的方法。依赖缺失或步骤失败时，也应说明 Agent 下一步怎么做。OpenViking 保存这些指令，实际能调用哪些工具由消费方 Harness 决定。
+
 ### 命名一致性建议
 
 技能名称使用 kebab-case：
@@ -930,4 +956,4 @@ skill = {
 - [上下文类型](../concepts/02-context-types.md) - 技能概念
 - [检索](06-retrieval.md) - 查找技能
 - [会话](05-sessions.md) - 跟踪技能使用情况
-- [VikingBot Skills](../../../bot/docs/zh/concepts/06-skills.md) - 本地/远程 Skill 的激活、metadata 与执行
+- [VikingBot Skills](https://github.com/volcengine/OpenViking/blob/main/bot/docs/zh/concepts/06-skills.md) - 本地/远程 Skill 的激活、metadata 与执行
