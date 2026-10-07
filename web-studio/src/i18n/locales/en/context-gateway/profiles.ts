@@ -176,12 +176,12 @@ const profiles = {
     softRatio: {
       label: 'Soft reminder at',
       description:
-        'The share of the context window at which the model is reminded to start a new window at a natural break. Sent once per window.',
+        'The share of the context window at which the model is reminded to start a new window once the current step is done. Sent once per window.',
     },
     hardRatio: {
       label: 'Hard reminder at',
       description:
-        'The share of the context window at which the model is told to start a new window now. Sent once per window; must be above the soft reminder.',
+        'The share of the context window at which the model is told to start a new window now. Repeats on every step until it does; must be above the soft reminder.',
     },
   },
   tools: {

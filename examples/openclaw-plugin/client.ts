@@ -554,11 +554,11 @@ export class OpenVikingClient {
     };
   }
 
-  async read(uri: string, actorPeerId?: string): Promise<string> {
+  async read(uri: string, actorPeerId?: string, requestTimeoutMs?: number): Promise<string> {
     return this.request<string>(
       `/api/v1/content/read?uri=${encodeURIComponent(uri)}`,
       {},
-      undefined,
+      requestTimeoutMs,
       actorPeerId,
     );
   }
