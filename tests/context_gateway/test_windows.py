@@ -292,7 +292,7 @@ def test_context_appends_to_tool_results(protocol, message, expected):
     assert message == expected
 
 
-def test_reminders_fire_once_per_window_and_count_cuts():
+def test_soft_reminder_fires_once_per_window_hard_repeats_and_cuts_count():
     policy = Policy()
     records = {(K.INJECTION, "b"): {"text": "x", "reminder": "soft"}}
     request = SimpleNamespace(
@@ -307,7 +307,7 @@ def test_reminders_fire_once_per_window_and_count_cuts():
     request.context_tokens = 90
     assert due(request, policy, -1) == "hard"
     records[K.INJECTION, "d"] = {"text": "x", "reminder": "hard"}
-    assert due(request, policy, -1) == ""
+    assert due(request, policy, -1) == "hard"
     records[K.REPLACEMENT, "b"] = {"source": "compaction", "text": "", "tokens": 0}
     assert active_cut(request) == 1 and window_number(request) == 1
     records[K.REPLACEMENT, "c"] = {"source": "window", "text": "", "tokens": 0}
@@ -408,9 +408,9 @@ async def test_context_remaining_reports_the_window(setup_kernel, credential, po
     prepared.context_window = 100_000
     advice = {
         10_000: "no action needed; keep working.",
-        80_000: "plan a new window: at the next natural boundary, finish or checkpoint the "
-        "current step, then call openviking_new_context.",
-        90_000: "call openviking_new_context now with complete notes.",
+        80_000: "start a new window soon: once the current step is done, call "
+        "openviking_new_context with notes that record your findings so far and what remains.",
+        90_000: "call openviking_new_context now, on its own, with complete notes.",
     }
     for used, expected in advice.items():
         prepared.context_tokens = used
@@ -545,7 +545,7 @@ def tool_round(protocol, number, output):
 
 
 @pytest.mark.parametrize("protocol", ["chat", "anthropic", "responses"])
-async def test_continuation_reminders_append_to_tool_results_once(
+async def test_continuation_reminders_append_to_tool_results(
     setup_kernel, credential, policy, protocol
 ):
     kernel, _, _, _ = setup_kernel
@@ -553,7 +553,8 @@ async def test_continuation_reminders_append_to_tool_results_once(
     upstream = {"id": "u", "context_windows": {"model": 20_000}}
     messages = [{"role": "user", "content": "Read the files"}]
     seen = []
-    for number, (words, expected) in enumerate([(7200, "soft"), (1, ""), (4800, "hard")]):
+    steps = [(7200, "soft"), (1, ""), (4800, "hard"), (1, "hard")]
+    for number, (words, expected) in enumerate(steps):
         messages += tool_round(protocol, number, "data " * words)
         prepared = await windows_request(kernel, credential, policy, messages, upstream, protocol)
         assert prepared.kind == "continuation"
@@ -574,6 +575,7 @@ async def test_continuation_reminders_append_to_tool_results_once(
             seen.append(prepared.records[K.INJECTION, prepared.chain[-1]])
     assert [(r["reminder"], r["tokens"], r["uris"]) for r in seen] == [
         ("soft", 0, []),
+        ("hard", 0, []),
         ("hard", 0, []),
     ]
 

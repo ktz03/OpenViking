@@ -37,7 +37,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: NousResearch/hermes-agent
-          ref: 5bba024d8ddd388f56f354c1f789be825e3d8a3c
+          ref: 7951ddd7297a284d6da48804241ee05a8a0c621c
           path: .ci/hermes-agent
           persist-credentials: false
 
@@ -102,7 +102,7 @@ jobs:
           - os: ubuntu-24.04
             host: release
             python: '3.13'
-            hermes_ref: e3dd27ee2d8b011737a4eea8e3eb3d711ab78690 # v2026.9.24, pre-PM
+            hermes_ref: v2026.9.24
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     defaults:
@@ -116,7 +116,7 @@ jobs:
       - uses: actions/checkout@v6
         with:
           repository: NousResearch/hermes-agent
-          ref: ${{ matrix.hermes_ref || '5bba024d8ddd388f56f354c1f789be825e3d8a3c' }}
+          ref: ${{ matrix.hermes_ref || '7951ddd7297a284d6da48804241ee05a8a0c621c' }}
           path: .ci/hermes-agent
           persist-credentials: false
       - uses: actions/setup-python@v6
@@ -145,6 +145,15 @@ jobs:
             "$GITHUB_WORKSPACE/examples/hermes-plugin/tests/test_quick_local.py" \
             "$GITHUB_WORKSPACE/examples/hermes-plugin/tests/test_quick_local_routes.py" \
             "$GITHUB_WORKSPACE/examples/hermes-plugin/tests/test_quick_local_preflight.py" \
+            --confcutdir="$GITHUB_WORKSPACE/examples/hermes-plugin/tests" -p no:cacheprovider -q
+      - name: Run the complete provider suite on the release host
+        if: matrix.host == 'release'
+        env:
+          HERMES_TEST_FILE_RETRIES: '0'
+          HERMES_TEST_WORKERS: '2'
+        run: |
+          HERMES_PYTHON=$(uv run --no-sync python -c 'import sys; print(sys.executable)') \
+            scripts/run_tests.sh "$GITHUB_WORKSPACE/examples/hermes-plugin/tests" \
             --confcutdir="$GITHUB_WORKSPACE/examples/hermes-plugin/tests" -p no:cacheprovider -q
       - name: Install and run real Quick Local services
         run: |
