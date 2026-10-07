@@ -147,6 +147,8 @@ export OPENVIKING_CLI_CONFIG_FILE=/path/to/ovcli.conf
 
 许多配置项都有对应的 `OPENVIKING_*` 环境变量，例如 `OPENVIKING_RECALL_LIMIT` 对应 `recallLimit`，`OPENVIKING_CAPTURE_ASSISTANT_TURNS` 对应 `captureAssistantTurns`。`OPENVIKING_BYPASS_SESSION` 也有文件配置项 `plugin.bypassSession`；仅需覆盖当前进程时可使用环境变量。完整共享列表由 `examples/memory-plugin-shared/lib/config-schema.mjs` 定义。用法见插件 README：[Claude Code](https://github.com/volcengine/OpenViking/blob/main/examples/claude-code-memory-plugin/README.md#configuration)、[Codex](https://github.com/volcengine/OpenViking/blob/main/examples/codex-memory-plugin/README.md#tuning-the-plugin)。取列表值的配置项（`bypassSessionPatterns`、`recallQueryFilters`、`captureFilters`）在这里是 JSON 数组，而它们的环境变量对应物是逗号分隔的字符串，所以值里带字面逗号的只能写进数组。
 
+共享会话 gate 的 `bypassSessionPatterns` 对 Windows 工作目录支持 `/` 和 `\` 两种分隔符。会话 ID 仍按原字符串匹配，POSIX 路径中的反斜杠保留原语义；匹配仍区分大小写。
+
 优先级从高到低：环境变量 → [工作区各层](#工作区配置) → `plugin.<harness>` → `plugin` → `ov.conf` 里遗留的按 harness 分块 → 内置默认值。独立启动的 hook 进程在每次触发时重新读文件；常驻插件何时重载取决于宿主，不确定时重启 Agent。环境变量改动也需要重启，因为 hook 继承的是 Agent 进程的环境。
 
 采用共享配置加载器的记忆插件会读取这一段；各宿主支持的字段和默认值见对应的 [集成文档](../agent-integrations/01-overview.md)。`ov-memory-doctor` 会打印它解析到的结果，并对不认识的键给出告警和最接近的正确键名。

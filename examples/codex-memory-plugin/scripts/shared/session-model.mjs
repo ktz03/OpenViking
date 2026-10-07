@@ -31,6 +31,11 @@ export function isBypassed(cfg, { sessionId, cwd } = {}) {
   for (const pat of patterns) {
     const re = globToRe(pat);
     if (haystacks.some((h) => re.test(h))) return true;
+    // Directory separators vary on Windows; session IDs remain literal.
+    if (process.platform === "win32" && cwd
+      && globToRe(pat.replace(/\\/g, "/")).test(cwd.replace(/\\/g, "/"))) {
+      return true;
+    }
   }
   return false;
 }
