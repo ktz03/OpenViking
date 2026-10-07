@@ -201,6 +201,177 @@ describe("context-engine assemble()", () => {
     });
   });
 
+  describe("user profile injection", () => {
+    const prompt = "what are my project alias and theme color?";
+    const userProfileUri = "viking://~/memories/profile.md";
+    const profile = "# User\n- Project alias: Basalt-x\n- Preferred theme color: marigold";
+    const memory = "User prefers Rust for backend tasks.";
+
+    function mockProfile(client: ReturnType<typeof makeEngine>["client"], profiles: Record<string, string> = { [userProfileUri]: profile }) {
+      client.read.mockImplementation(async (uri: string) => {
+        if (uri in profiles) return profiles[uri];
+        throw new Error("[NOT_FOUND] File not found");
+      });
+    }
+
+    function mockRecall(client: ReturnType<typeof makeEngine>["client"], text = memory) {
+      client.searchContext.mockResolvedValue({
+        entries: [{ uri: "viking://user/default/memories/preferences/rust", category: "preferences", text, score: 0.93 }],
+        rendered: `<memory>${text}</memory>`,
+        stats: {},
+      });
+    }
+
+    it.each([false, true])("injects profile.md when recall finds nothing (missing session: %s)", async (missing) => {
+      const { engine, client } = makeEngine(undefined, { cfgOverrides: { autoRecall: true } });
+      if (missing) client.getSessionContext.mockRejectedValue(new Error("[NOT_FOUND] Session not found"));
+      mockProfile(client);
+      const messages: [] = [];
+      const result = await engine.assemble({ sessionId: "new-session", messages, prompt });
+      expect(client.read).toHaveBeenCalledWith(userProfileUri, undefined, 3000);
+      expect(result.messages).toBe(messages);
+      expect(result.systemPromptAddition).toContain(`<user-profile uri="${userProfileUri}">`);
+      expect(result.systemPromptAddition).toContain("Basalt-x");
+      expect(result.estimatedTokens).toBeGreaterThanOrEqual(systemPromptTokens(result.systemPromptAddition));
+    });
+
+    it("places the profile between the archive guide and recalled memories on every main turn", async () => {
+      const { engine, client } = makeEngine({
+        latest_archive_overview: "Previously discussed repository setup.",
+        pre_archive_abstracts: [], messages: [], estimatedTokens: 10, stats: makeStats(),
+      }, { cfgOverrides: { autoRecall: true } });
+      mockProfile(client);
+      mockRecall(client);
+      for (const turnPrompt of [prompt, "and which backend language?"]) {
+        const result = await engine.assemble({ sessionId: "archived-session", messages: [], prompt: turnPrompt });
+        const addition = result.systemPromptAddition ?? "";
+        const guideAt = addition.indexOf("Session Context Guide");
+        const profileAt = addition.indexOf("<user-profile");
+        const recallAt = addition.indexOf(memory);
+        expect(guideAt).toBeGreaterThanOrEqual(0);
+        expect(profileAt).toBeGreaterThan(guideAt);
+        expect(recallAt).toBeGreaterThan(profileAt);
+      }
+    });
+
+    it("injects the profile for prompts too short to recall", async () => {
+      const { engine, client } = makeEngine(undefined, { cfgOverrides: { autoRecall: true } });
+      mockProfile(client);
+      const result = await engine.assemble({ sessionId: "session", messages: [], prompt: "hi" });
+      expect(client.searchContext).not.toHaveBeenCalled();
+      expect(result.systemPromptAddition).toContain("Basalt-x");
+    });
+
+    it("keeps recall when the profile is missing, and the profile when recall fails", async () => {
+      const { engine, client } = makeEngine(undefined, { cfgOverrides: { autoRecall: true } });
+      mockProfile(client, {});
+      mockRecall(client);
+      const recallOnly = await engine.assemble({ sessionId: "session", messages: [], prompt });
+      expect(recallOnly.systemPromptAddition).toContain(memory);
+      expect(recallOnly.systemPromptAddition).not.toContain("<user-profile");
+
+      mockProfile(client);
+      client.searchContext.mockRejectedValue(new Error("unavailable"));
+      const profileOnly = await engine.assemble({ sessionId: "session", messages: [], prompt });
+      expect(profileOnly.systemPromptAddition).toContain("Basalt-x");
+      expect(profileOnly.systemPromptAddition).not.toContain(memory);
+    });
+
+    it("reads the actor peer's profile too under peer_role=sender", async () => {
+      const peerProfileUri = "viking://~/peers/telegram_12345/memories/profile.md";
+      const { engine, client } = makeEngine(undefined, { cfgOverrides: { autoRecall: true, peer_role: "sender" } });
+      mockProfile(client, { [userProfileUri]: profile, [peerProfileUri]: "# Peer\n- Timezone: UTC+8" });
+      const result = await engine.assemble({
+        sessionId: "session", messages: [], prompt, runtimeContext: { senderId: "telegram:12345" },
+      });
+      expect(client.read).toHaveBeenCalledWith(userProfileUri, "telegram_12345", 3000);
+      expect(client.read).toHaveBeenCalledWith(peerProfileUri, "telegram_12345", 3000);
+      expect(result.systemPromptAddition).toContain("Basalt-x");
+      expect(result.systemPromptAddition).toContain(`<user-profile uri="${peerProfileUri}">`);
+      expect(result.systemPromptAddition).toContain("Timezone: UTC+8");
+    });
+
+    it("bounds the profile read by the auto-recall timeout", async () => {
+      const { engine, client } = makeEngine(undefined, { cfgOverrides: { autoRecall: true, autoRecallTimeoutMs: 1000 } });
+      mockProfile(client);
+      await engine.assemble({ sessionId: "session", messages: [], prompt: "hi" });
+      expect(client.read).toHaveBeenCalledWith(userProfileUri, undefined, 1000);
+    });
+
+    it("warns when the profile read fails for a reason other than a missing file", async () => {
+      const { engine, client, logger } = makeEngine(undefined, { cfgOverrides: { autoRecall: true } });
+      mockRecall(client);
+      client.read.mockRejectedValue(new Error("OpenViking request failed [PERMISSION_DENIED]: forbidden"));
+      const result = await engine.assemble({ sessionId: "session", messages: [], prompt });
+      expect(result.systemPromptAddition).toContain(memory);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining(`profile read failed (uri=${userProfileUri})`));
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("PERMISSION_DENIED"));
+
+      logger.warn.mockClear();
+      mockProfile(client, {});
+      await engine.assemble({ sessionId: "session", messages: [], prompt });
+      expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining("profile read failed"));
+    });
+
+    it("caps a long profile", async () => {
+      const { engine, client } = makeEngine(undefined, { cfgOverrides: { autoRecall: true } });
+      mockProfile(client, { [userProfileUri]: `${"x".repeat(9000)}TAIL` });
+      const result = await engine.assemble({ sessionId: "session", messages: [], prompt });
+      expect(result.systemPromptAddition).toContain("[profile truncated]");
+      expect(result.systemPromptAddition).not.toContain("TAIL");
+    });
+
+    it("drops recall before the profile when the budget is tight", async () => {
+      const { engine, client } = makeEngine(undefined, { cfgOverrides: { autoRecall: true } });
+      mockProfile(client);
+      const profileOnly = await engine.assemble({ sessionId: "session", messages: [], prompt });
+      mockRecall(client, "long recalled memory ".repeat(200));
+      const tight = await engine.assemble({ sessionId: "session", messages: [], prompt, tokenBudget: profileOnly.estimatedTokens });
+      expect(tight.systemPromptAddition).toBe(profileOnly.systemPromptAddition);
+      const tighter = await engine.assemble({ sessionId: "session", messages: [], prompt, tokenBudget: profileOnly.estimatedTokens - 1 });
+      expect(tighter.systemPromptAddition).toBeUndefined();
+    });
+
+    it("keeps recall when the profile alone does not fit the budget", async () => {
+      const { engine, client } = makeEngine(undefined, { cfgOverrides: { autoRecall: true } });
+      mockProfile(client, {});
+      mockRecall(client);
+      const recallOnly = await engine.assemble({ sessionId: "session", messages: [], prompt });
+      mockProfile(client, { [userProfileUri]: "画像".repeat(3950) });
+      const result = await engine.assemble({ sessionId: "session", messages: [], prompt, tokenBudget: recallOnly.estimatedTokens });
+      expect(result.systemPromptAddition).toBe(recallOnly.systemPromptAddition);
+      expect(result.systemPromptAddition).not.toContain("<user-profile");
+    });
+
+    it.each([
+      { name: "autoRecall off", cfgOverrides: { autoRecall: false }, sessionKey: undefined },
+      { name: "bypassed session", cfgOverrides: { autoRecall: true, bypassSessionPatterns: ["agent:*:cron:**"] }, sessionKey: "agent:main:cron:task" },
+    ])("does not read the profile when $name", async ({ cfgOverrides, sessionKey }) => {
+      const { engine, client } = makeEngine(undefined, { cfgOverrides });
+      mockProfile(client);
+      const result = await engine.assemble({ sessionId: "session", sessionKey, messages: [], prompt });
+      expect(client.read).not.toHaveBeenCalled();
+      expect(result.systemPromptAddition).toBeUndefined();
+    });
+
+    it("does not inject the profile during transformContext", async () => {
+      const { engine, client } = makeEngine(undefined, { cfgOverrides: { autoRecall: true } });
+      mockProfile(client);
+      const result = await engine.assemble({ sessionId: "session", messages: [{ role: "user", content: prompt }] });
+      expect(client.read.mock.calls.some(([uri]) => uri === userProfileUri)).toBe(false);
+      expect(JSON.stringify(result)).not.toContain("Basalt-x");
+    });
+
+    it("logs a missing OV session as skipped history, not a skipped assemble", async () => {
+      const { engine, client, logger } = makeEngine(undefined, { cfgOverrides: { autoRecall: true } });
+      client.getSessionContext.mockRejectedValue(new Error("[NOT_FOUND] Session not found"));
+      await engine.assemble({ sessionId: "new-session", messages: [], prompt });
+      const logged = logger.info.mock.calls.map(([line]) => String(line));
+      expect(logged.some((line) => line.includes("session history not assembled because OV session does not exist"))).toBe(true);
+      expect(logged.some((line) => line.includes("assemble skipped"))).toBe(false);
+    });
+  });
+
   it("prepends auto-recall to the latest user message during transformContext", async () => {
       const { engine, client } = makeEngine(
         {

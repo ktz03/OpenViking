@@ -56,13 +56,13 @@ Long-term memories are extracted from a session only after a **commit**. Capture
 | OpenCode | Yes, session-aware | Profile, memory index, skills, indexed repositories | At 20,000 pending tokens, when idle | Yes, within the host's cleanup time | Commits around compaction |
 | DSH | Yes, session-aware | Profile, memory index, skills, once per session | At 20,000 pending tokens | Yes, with a 3-second budget | Not observed |
 | pi | Yes, session-aware | Profile, memory index, skills, every turn | Takeover on: about 30,000 tokens; off: 20,000 | Takeover on: no; off: yes | Takeover replaces pi's summary |
-| OpenClaw | Yes, not session-aware | None | At half the token budget (64,000 by default) | No | The plugin owns compaction |
+| OpenClaw | Yes, session-aware | Profile, every turn | At half the token budget (64,000 by default) | No | The plugin owns compaction |
 | Hermes (bundled) | Yes, session-aware with a fallback | Profile and memory listings | No; only at session boundaries | Yes, if pending uploads finish within 10 seconds | Commits at fork-style compaction |
 | ov CLI | No | No | Only `ov session commit` | Not applicable | Not applicable |
 
 How to read this table:
 
-- **Session-aware recall** sends the session ID so the server can use the conversation to interpret the query. The shared plugins’ context mode also expands the query and tracks recently injected memories to avoid repeating them. Hermes uses list mode, which has no injection ledger; OpenClaw uses `/find`, which has no session field. See [How recall reaches the server](#how-recall-reaches-the-server) for the request paths and fallbacks.
+- **Session-aware recall** sends the session ID so the server can use the conversation to interpret the query. The shared plugins’ context mode also expands the query and tracks recently injected memories to avoid repeating them. Hermes uses list mode, which has no injection ledger. OpenClaw uses context search with the session ID but turns deduplication off, because its injected context is rebuilt every turn and never stored in the history. See [How recall reaches the server](#how-recall-reaches-the-server) for the request paths and fallbacks.
 - **Pending tokens** are server-side counts of captured but uncommitted messages. Most thresholds are client settings; [the commit table](#when-each-integration-commits) lists them.
 - **Commits at a normal exit** means the integration sends a commit request. Network errors, host exit budgets, or process termination can still interrupt it. [What happens at exit](#what-happens-at-exit) covers Ctrl+C, signals, and crashes.
 
@@ -87,7 +87,7 @@ Every MCP-based integration exposes the same server-defined tools and keeps no c
 
 Behavior to know before relying on a tool:
 
-- **`remember`** creates a one-shot session named `mcp-store-<id>`, adds the messages, and commits it at once. It is the only MCP tool that commits. No MCP tool commits the agent's current conversation; that is the job of the automatic hooks.
+- **`remember`** creates a one-shot session named `mcp-store-<id>`, adds the messages, and commits it at once. It is the only MCP tool that commits. It returns as soon as the commit is accepted, with the `task_id` of the background extraction; extraction then decides which memories to create or update. No MCP tool commits the agent's current conversation; that is the job of the automatic hooks.
 - **`find` and `search`**: `find` is a fast search without session context. `search` can take a `session_id` and run intent analysis (`retrieval.enable_intent`, on by default). `find` with `context_type="skill"` returns one hit per skill package, pointing at its `SKILL.md`, from both the user's and the account's skills.
 - **`write` and `edit`** can write only under `viking://resources`, `viking://user`, and `viking://agent`. A new file must end in `.md`, `.txt`, `.json`, `.yaml`, `.yml`, `.toml`, `.py`, `.js`, or `.ts`. The user's `skills/`, `peers/`, `privacy/`, and `sessions/` directories are read-only. A write under `viking://agent/skills` is accepted but skips skill installation, so use `add_skill` for skills.
 - **`add_resource` with a local path** returns a signed upload URL (valid for 600 seconds by default). The model must upload the file to it, for example with a shell command; ingestion then starts on its own. Remote URLs are ingested directly.
@@ -186,7 +186,7 @@ The table shows the default path. Turning on [recall digests](#recall-digest) ch
 | OpenCode | v1: every `chat.message`; v2: every prompt | Text parts of the message | v1 prepends a synthetic part. v2 stores the result in message metadata and injects it before that message at each model step, without a new request |
 | DSH | `agent/pre-step` | Every message in the claimed batch, minus its own injected content | Appended as a user message |
 | pi | Queued at `before_agent_start`, run in the `context` event | The prompt | Prepended to the last real user message, so this turn's prompt gets this turn's memories |
-| OpenClaw | Context assembly | Last user message, cleaned and cut to 4,000 characters | `<relevant-memories>` prepended to the last user message |
+| OpenClaw | Context assembly | The incoming prompt, cleaned and cut to 4,000 characters | `<relevant-memories>` in the system prompt, rebuilt every turn. On hosts that do not pass the prompt, it is prepended to the last user message |
 | Hermes | Before every model call | User input of 5 characters or more, with skill scaffolding removed | `<memory-context>` appended to the current user message in the request only; never stored |
 
 <a id="_3-2-3-profile-opening-injection"></a>
@@ -220,7 +220,7 @@ When each integration injects it:
 | OpenCode | The first message of each session; not retried after a failure, and skipped for subagent sessions. The list of indexed repositories also goes into the system prompt |
 | DSH | Once per session; not sent again after compaction |
 | pi | In the system prompt, rebuilt every turn |
-| OpenClaw | Not injected |
+| OpenClaw | In the system prompt, rebuilt every turn: `<user-profile>` for the user's profile and, with `peer_role`, the actor peer's profile. No memory index or skill catalog |
 | Hermes | Its own reader loads the profile and the preferences and entities listings, with a 6,000-token default budget |
 
 Budgets and limits:
@@ -246,7 +246,7 @@ The server stops query expansion after 5 seconds (`retrieval.recall_intent_timeo
 | OpenCode | 30 seconds |
 | DSH | 10 seconds, raised to at least 15 with query expansion. Recall blocks the pre-step |
 | pi | 15 seconds |
-| OpenClaw | 5 seconds for the whole recall, including a 500 ms health check. With the default `recallPreferAbstract=false`, each memory costs an extra read, which allows at most one find and six reads |
+| OpenClaw | 15 seconds by default for the context search (`autoRecallTimeoutMs`), after a 500 ms health check |
 | Hermes | 4 seconds in total and 3 seconds per request; configurable |
 
 OpenClaw and Hermes limit injected recall to 4,000 characters and skip an entry that does not fit instead of cutting it.

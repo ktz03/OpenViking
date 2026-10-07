@@ -14,7 +14,7 @@ OpenViking 的所有重要变更都将记录在此文件中。
   主动开启，保存后缺少该字段的策略升级后仍会变为 false，无法自动恢复用户当时的意图。
   已入队的旧任务保持提交时的语义。新增 `enable_working_memory` 布尔参数仅覆盖本次
   commit 的 WM，不覆盖其他策略。无 WM 的已完成归档仍可读取原文，摘要字段为空。
-  详见[升级说明](../../en/guides/working-memory-default-off.md)；缺少完整宿主历史的旧会话
+  详见[升级说明](../guides/working-memory-default-off.md)；缺少完整宿主历史的旧会话
   应先导出原文，通过宿主支持的入口完成历史交接，再切换模式。
 - **Watch API 迁移（不兼容变更）**：使用 `watch_interval > 0` 重新导入不再更新或恢复已有 Watch。
   原生 Watch 暂停后仍独占目标，不兼容的目标复用返回 `409 Conflict`。
