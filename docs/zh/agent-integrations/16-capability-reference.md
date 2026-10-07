@@ -56,13 +56,13 @@
 | OpenCode | 是，带会话 | profile、记忆索引、skill、已索引的仓库 | 空闲时，待提交 token 达到 20,000 | 是，在宿主的清理时限内 | 在压缩前后提交 |
 | DSH | 是，带会话 | profile、记忆索引、skill，每个会话一次 | 待提交 token 达到 20,000 | 是，预算 3 秒 | 未观察到 |
 | pi | 是，带会话 | profile、记忆索引、skill，每轮 | takeover 开：约 30,000 token；关：20,000 | takeover 开：否；关：是 | takeover 替换 pi 的摘要 |
-| OpenClaw | 是，不带会话 | 无 | token 预算的一半（默认 64,000） | 否 | 插件接管压缩 |
+| OpenClaw | 是，带会话 | profile，每轮 | token 预算的一半（默认 64,000） | 否 | 插件接管压缩 |
 | Hermes（内置） | 是，带会话，有回退路径 | profile 与记忆清单 | 否；只在会话边界 | 是，前提是待上传内容在 10 秒内完成 | fork 型压缩时提交 |
 | ov CLI | 否 | 否 | 只有 `ov session commit` | 不适用 | 不适用 |
 
 表格说明：
 
-- **带会话的召回**会发送会话 ID，服务端借助对话内容理解查询。共享插件的 context 模式还会扩写查询，并记录最近注入过的记忆，避免重复注入。Hermes 用 list 模式，没有注入台账；OpenClaw 用 `/find`，该接口没有会话字段。请求路径和回退见[召回请求如何到达服务端](#召回请求如何到达服务端)。
+- **带会话的召回**会发送会话 ID，服务端借助对话内容理解查询。共享插件的 context 模式还会扩写查询，并记录最近注入过的记忆，避免重复注入。Hermes 用 list 模式，没有注入台账。OpenClaw 用 context search 并发送会话 ID，但关闭去重，因为它注入的上下文每轮重建，不写入历史。请求路径和回退见[召回请求如何到达服务端](#召回请求如何到达服务端)。
 - **待提交 token** 是服务端统计的、已捕获但未提交的消息量。多数阈值是客户端设置，见[各集成何时提交](#各集成何时提交)。
 - **正常退出时提交**指集成会发出提交请求。网络错误、宿主的退出时限或进程被终止仍可能打断它。Ctrl+C、信号和崩溃见[退出时会发生什么](#退出时会发生什么)。
 
@@ -87,7 +87,7 @@
 
 使用前需要了解的行为：
 
-- **`remember`** 会创建一个名为 `mcp-store-<id>` 的一次性会话，写入消息后立即提交。它是唯一会提交的 MCP 工具。没有任何 MCP 工具会提交 Agent 当前的对话，那是自动 hook 的工作。
+- **`remember`** 会创建一个名为 `mcp-store-<id>` 的一次性会话，写入消息后立即提交。它是唯一会提交的 MCP 工具。提交被接受后它立刻返回，结果里带后台记忆提取任务的 `task_id`；提取过程再决定新建或更新哪些记忆。没有任何 MCP 工具会提交 Agent 当前的对话，那是自动 hook 的工作。
 - **`find` 与 `search`**：`find` 是不带会话上下文的快速检索。`search` 可以传 `session_id`，并做意图分析（`retrieval.enable_intent`，默认开启）。`find` 传 `context_type="skill"` 时，每个 skill 包只返回一条命中，指向它的 `SKILL.md`，范围包括用户自己的和账户共享的 skill。
 - **`write` 与 `edit`** 只能写 `viking://resources`、`viking://user` 和 `viking://agent`。新文件的扩展名必须是 `.md`、`.txt`、`.json`、`.yaml`、`.yml`、`.toml`、`.py`、`.js` 或 `.ts`。用户的 `skills/`、`peers/`、`privacy/` 和 `sessions/` 目录只读。写入 `viking://agent/skills` 不会被拒绝，但会跳过 skill 安装流程，skill 请用 `add_skill`。
 - **`add_resource` 传本地路径**时返回一个签名上传 URL（默认 600 秒有效）。模型需要把文件上传到这个 URL，例如用一条 shell 命令；上传后自动开始入库。远程 URL 会直接入库。
@@ -186,7 +186,7 @@ skill 走单独的路径。创建、安装或替换 skill 用 MCP `add_skill` �
 | OpenCode | v1：每次 `chat.message`；v2：每次提问 | 消息的文本部分 | v1 在消息前插入一个合成 part。v2 把结果存进消息 metadata，每个模型 step 在该消息前注入，不发新请求 |
 | DSH | `agent/pre-step` | 本批认领的所有消息，去掉自身注入的内容 | 追加为一条用户消息 |
 | pi | 在 `before_agent_start` 排队，在 `context` 事件中执行 | 提问 | 前置到最后一条真实用户消息，本轮提问拿到本轮的记忆 |
-| OpenClaw | 上下文组装时 | 最后一条用户消息，清洗后截到 4,000 字符 | `<relevant-memories>`，前置到最后一条用户消息 |
+| OpenClaw | 上下文组装时 | 传入的提问，清洗后截到 4,000 字符 | `<relevant-memories>`，放在 system prompt 中，每轮重建。宿主不传提问时前置到最后一条用户消息 |
 | Hermes | 每次模型调用前 | 5 个字符及以上的用户输入，去掉 skill 脚手架 | `<memory-context>`，只追加到本次请求中的当前用户消息，不写入存储 |
 
 <a id="_3-2-3-profile-开场注入"></a>
@@ -220,7 +220,7 @@ skill 走单独的路径。创建、安装或替换 skill 用 MCP `add_skill` �
 | OpenCode | 每个会话的第一条消息；失败后不重试，子代理会话跳过。已索引仓库的列表同时进入 system prompt |
 | DSH | 每个会话一次；压缩后不再发送 |
 | pi | 放在 system prompt 中，每轮重建 |
-| OpenClaw | 不注入 |
+| OpenClaw | 放在 system prompt 中，每轮重建：`<user-profile>` 包含用户的 profile，设置了 `peer_role` 时还包含当前 actor peer 的 profile。不注入记忆索引和 skill 清单 |
 | Hermes | 用自己的读取逻辑加载 profile 及 preferences、entities 清单，默认预算 6,000 token |
 
 预算与限制：
@@ -246,7 +246,7 @@ skill 走单独的路径。创建、安装或替换 skill 用 MCP `add_skill` �
 | OpenCode | 30 秒 |
 | DSH | 10 秒，开启查询扩写时至少 15 秒。召回会阻塞 pre-step |
 | pi | 15 秒 |
-| OpenClaw | 整个召回 5 秒，含 500 ms 健康检查。默认 `recallPreferAbstract=false` 时每条记忆多一次 read，预算内最多一次 find 和六次 read |
+| OpenClaw | context search 默认 15 秒（`autoRecallTimeoutMs`），之前有一次 500 ms 健康检查 |
 | Hermes | 总计 4 秒，单请求 3 秒；可配置 |
 
 OpenClaw 和 Hermes 把注入的召回内容限制在 4,000 字符，放不下的条目整条跳过，不截断。
