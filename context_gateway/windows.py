@@ -28,10 +28,11 @@ ALONE = (
 STAY = "A new context window cannot start at this point; continue in the current one."
 SEARCHABLE = " Earlier windows stay searchable with openviking_grep and openviking_read."
 REMINDERS = {
-    "soft": "[context-reminder] This context window is {} full. At the next natural boundary, "
-    "finish or checkpoint the current step, then call openviking_new_context with complete notes.",
-    "hard": "[context-reminder] This context window is {} full. Call openviking_new_context now "
-    "with complete notes, before the window runs out.",
+    "soft": "[context-reminder] This context window is {} full. Start a new window soon: once "
+    "the current step is done, call openviking_new_context with notes that record your findings "
+    "so far, with the exact paths, line numbers and values you will need, and what remains.",
+    "hard": "[context-reminder] This context window is {} full. Call openviking_new_context now, "
+    "on its own, with complete notes. This reminder repeats on every step until you do.",
 }
 
 
@@ -100,13 +101,13 @@ def since(request):
 
 
 def due(request, policy, index):
-    """The reminder this request is due; each kind is sent at most once per window."""
+    """The reminder this request is due: soft once per window, hard on every step past its ratio."""
     ratio = request.context_tokens / request.context_window
     sent = {
         request.records.get((K.INJECTION, anchor), {}).get("reminder")
         for anchor in request.chain[index + 1 :]
     }
-    if ratio >= policy.window_hard_ratio and "hard" not in sent:
+    if ratio >= policy.window_hard_ratio:
         return "hard"
     if ratio >= policy.window_soft_ratio and not sent & {"soft", "hard"}:
         return "soft"
@@ -237,11 +238,11 @@ async def context_remaining(request, credential, args):
     if gap:
         lines.append(f"Time since the user's previous message: {gap}.")
     if ratio >= policy.window_hard_ratio:
-        advice = "call openviking_new_context now with complete notes."
+        advice = "call openviking_new_context now, on its own, with complete notes."
     elif ratio >= policy.window_soft_ratio:
         advice = (
-            "plan a new window: at the next natural boundary, finish or checkpoint the current "
-            "step, then call openviking_new_context."
+            "start a new window soon: once the current step is done, call "
+            "openviking_new_context with notes that record your findings so far and what remains."
         )
     else:
         advice = "no action needed; keep working."
@@ -269,7 +270,8 @@ NATIVE_TOOLS = {
                 "notes": {
                     **TEXT,
                     "description": "Everything the next window needs: goal, decisions, current "
-                    "state, files and identifiers, open problems.",
+                    "state, findings so far with the exact paths, line numbers and values they "
+                    "rest on, open problems.",
                 },
                 "next_steps": {**TEXT, "description": "What to do first in the new window."},
             },

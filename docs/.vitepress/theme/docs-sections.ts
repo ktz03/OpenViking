@@ -107,7 +107,8 @@ export const sections: DocSection[] = [
         p('agent-integrations/15-agent-plugins'),
         p('agent-integrations/09-log-ingestion'),
         p('agent-integrations/19-recall-tuning'),
-        p('agent-integrations/18-plugin-development')
+        p('agent-integrations/18-plugin-development'),
+        p('guides/working-memory-default-off')
       ]),
       g('Context Gateway', '上下文网关', [
         p('guides/15-context-gateway'),
