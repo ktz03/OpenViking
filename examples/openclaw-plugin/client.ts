@@ -379,7 +379,10 @@ export class OpenVikingClient {
         signal: controller.signal,
       });
 
-      const payload = (await response.json().catch(() => ({}))) as {
+      const payload = (await response.json().catch((error: unknown) => {
+        if (error instanceof SyntaxError) return {};
+        throw error;
+      })) as {
         status?: string;
         result?: T;
         error?: { code?: string; message?: string; trace_id?: string };

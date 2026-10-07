@@ -1,3 +1,5 @@
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -873,4 +875,39 @@ it.each([true, false, undefined])("sends the WM override using the renamed API f
   expect(result.effective_enable_working_memory).toBe(enabled ?? false);
   const body = JSON.parse(String(transport.mock.calls[0][1].body));
   expect(body).toEqual(enabled === undefined ? {} : { enable_working_memory: enabled });
+});
+
+
+describe("OpenVikingClient response-body failures", () => {
+  it.each(["timeout", "reset"] as const)("rejects a %s after successful response headers", async (failure) => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.write('{"status":"ok","result":');
+      if (failure === "reset") setTimeout(() => res.destroy(), 30);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      let receivedHeaders = false;
+      const transport = async (input: string, init: RequestInit) => {
+        const response = await fetch(input, init);
+        receivedHeaders = true;
+        return response;
+      };
+      const client = new OpenVikingClient(url, "", "agent", 1000, "", "", undefined, { transport });
+      await expect(client.searchContext("body failure")).rejects.toMatchObject({
+        name: failure === "timeout" ? "AbortError" : "TypeError",
+      });
+      expect(receivedHeaders).toBe(true);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
+  it.each(["", "not JSON"])("preserves the completed-body fallback for %j", async (body) => {
+    const transport = vi.fn().mockResolvedValue(new Response(body, { status: 200 }));
+    const client = new OpenVikingClient("http://localhost", "", "agent", 5000, "", "", undefined, false, true, { transport });
+    await expect(client.searchContext("completed body")).resolves.toEqual({ entries: undefined });
+  });
 });

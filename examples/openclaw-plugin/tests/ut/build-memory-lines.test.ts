@@ -1,3 +1,5 @@
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -6,7 +8,7 @@ import {
   buildMemoryLinesWithBudget,
 } from "../../auto-recall.js";
 import { buildAutoRecallContext } from "../../auto-recall.js";
-import type { FindResultItem } from "../../client.js";
+import { OpenVikingClient, type FindResultItem } from "../../client.js";
 import { memoryOpenVikingConfigSchema } from "../../config.js";
 import { RecallTraceMemoryStore } from "../../recall-trace.js";
 
@@ -510,4 +512,38 @@ describe("buildAutoRecallContext trace", () => {
     expect(recorded.stats.injectedCount).toBe(0);
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("backend unavailable"));
   });
+});
+
+
+it.each([false, true])("distinguishes empty recall from a broken response body (broken=%s)", async (broken) => {
+  const server = createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    if (req.url === "/health") {
+      res.end(JSON.stringify({ status: "ok" }));
+    } else if (broken) {
+      res.write('{"status":"ok","result":');
+      setTimeout(() => res.destroy(), 30);
+    } else {
+      res.end(JSON.stringify({ status: "ok", result: { entries: [], rendered: "" } }));
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const client = new OpenVikingClient(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, "", "test", 5000);
+    const logger = { info: vi.fn(), warn: vi.fn() };
+    const traces = new RecallTraceMemoryStore(10);
+    const result = await buildAutoRecallContext({
+      cfg: memoryOpenVikingConfigSchema.parse({ autoRecall: true, recallTargetTypes: ["user"] }),
+      client, agentId: "test", queryText: "remember the preferred backend", logger,
+      traceRecorder: traces, sessionId: "body-read",
+    });
+    expect(result).toEqual({ memoryCount: 0, estimatedTokens: 0 });
+    expect(logger.warn).toHaveBeenCalledTimes(broken ? 1 : 0);
+    const trace = traces.query({ turn: "latest", sessionId: "body-read", limit: 10 }).entries[0]!;
+    if (broken) expect(trace.searches[0]?.error).toContain("TypeError");
+    else expect(trace.searches[0]?.error).toBeUndefined();
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
 });
