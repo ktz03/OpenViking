@@ -13,7 +13,8 @@ For development and licensing details, see [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## Install
 
-Hermes v2026.9.24 is the tested release baseline.
+Validated with Hermes v2026.9.24. CI also checks the reviewed Hermes main
+commit pinned in the [test workflow](../../.github/workflows/hermes-plugin-tests.yml).
 
 For a direct installation, replace the placeholder with the reviewed OpenViking
 commit's full 40-character SHA:

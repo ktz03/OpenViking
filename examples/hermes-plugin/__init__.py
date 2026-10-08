@@ -1110,7 +1110,7 @@ def _local_listener_suffix(endpoint: str) -> str:
     return f" The listener on {host}:{port} is {_describe_local_port_listener(host, port)}."
 
 
-def _start_local_openviking_server(endpoint: str) -> tuple[str, str]:
+def _start_local_openviking_server(endpoint: str, *, hermes_home=None) -> tuple[str, str]:
     try:
         host, port = _local_openviking_bind(endpoint)
     except ValueError as e:
@@ -1126,7 +1126,7 @@ def _start_local_openviking_server(endpoint: str) -> tuple[str, str]:
     server_cmd = shutil.which("openviking-server")
     if not server_cmd:
         return _LOCAL_SERVER_FAILED, "openviking-server was not found on PATH. Start it manually, then retry."
-    log_path = get_hermes_home() / _OPENVIKING_SERVER_LOG_RELATIVE_PATH
+    log_path = Path(hermes_home or get_hermes_home()) / _OPENVIKING_SERVER_LOG_RELATIVE_PATH
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         # Strip PYTHONPATH: the Desktop backend puts the Hermes venv on it, which
@@ -1136,7 +1136,33 @@ def _start_local_openviking_server(endpoint: str) -> tuple[str, str]:
         # would import aiohttp and friends from the Hermes venv instead of its own (its venv's site-packages
         # are shadowed because PYTHONPATH precedes them) — and on Windows the loaded DLLs then lock the
         # Hermes venv, aborting `hermes update` with access-denied on .pyd files. (#78153)
-        child_env = os.environ.copy()
+        # The server's embedding/VLM models may read provider keys, so the bound profile's pass;
+        # bot, gateway and GitHub tokens never do. HOME stays the user's: ov.conf defaults to
+        # ~/.openviking. Missing helpers fail startup rather than expose secrets.
+        from hermes_cli.config import OPTIONAL_ENV_VARS
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tools.environments.local import _finalize_child_env, _scrub_credentials, served_profile_child_env
+
+        home_token = set_hermes_home_override(hermes_home) if hermes_home else None
+        try:
+            # Profile hydration can re-add bot tokens. Reuse Hermes's credential
+            # policy after the overlay; these helpers predate the base_env API.
+            child_env = _scrub_credentials(
+                served_profile_child_env(target_home=hermes_home, inherit_credentials=True), inherit_credentials=True)
+            # Older hosts put gateway secrets in optional-credential metadata.
+            # Preserve model variables, including providers Hermes does not list.
+            for key in list(child_env):
+                metadata = OPTIONAL_ENV_VARS.get(key.upper(), {})
+                if (metadata.get("category") == "messaging"
+                        or (metadata.get("category") == "setting" and metadata.get("password"))
+                        or key.upper() in {"VERCEL_TOKEN", "VERCEL_OIDC_TOKEN"}):
+                    child_env.pop(key)
+            child_env = _finalize_child_env(child_env)
+        finally:
+            if home_token is not None:
+                reset_hermes_home_override(home_token)
+        if real_home := child_env.get("HERMES_REAL_HOME"):
+            child_env["HOME"] = real_home
         child_env.pop("PYTHONPATH", None)
         with log_path.open("ab") as log_file:
             subprocess.Popen([server_cmd, "--host", host, "--port", str(port)], stdout=log_file, stderr=log_file,
@@ -1649,7 +1675,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     endpoint = self._endpoint
                     start_state, start_message = _LOCAL_SERVER_STARTED, f"Starting Quick Local at {endpoint}. Logs: {server.paths.root.parent / _OPENVIKING_SERVER_LOG_RELATIVE_PATH}"
                 else:
-                    start_state, start_message = _start_local_openviking_server(endpoint)
+                    start_state, start_message = _start_local_openviking_server(endpoint, hermes_home=self._hermes_home)
             except Exception as exc:
                 logger.debug("OpenViking startup failed", exc_info=True)
                 start_state, start_message = _LOCAL_SERVER_FAILED, f"Startup failed ({type(exc).__name__}). Review the server log."
