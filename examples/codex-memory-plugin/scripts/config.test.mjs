@@ -215,3 +215,15 @@ for (const mode of ["off", "client", "server", "auto", "0", "1"]) {
     });
   });
 }
+
+test("slash-form directory patterns match a Windows working directory", () => {
+  const cfg = { bypassSessionPatterns: ["**/scratch"] };
+  assert.equal(isBypassed(cfg, { cwd: String.raw`C:\work\scratch` }), true);
+  assert.equal(isBypassed(cfg, { cwd: String.raw`C:\work\keep` }), false);
+  assert.equal(isBypassed(cfg, { sessionId: String.raw`a\scratch` }), false, "session ids stay literal");
+  assert.equal(
+    isBypassed({ bypassSessionPatterns: [String.raw`C:\work\scratch`] }, { cwd: String.raw`C:\work\scratch` }),
+    true,
+    "a backslash pattern still matches the raw path",
+  );
+});
