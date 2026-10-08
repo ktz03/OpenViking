@@ -80,7 +80,7 @@ class OpenVikingCaptureState(AgentState):
     openviking_captured_message_ids: dict[str, list[str]]
 
 
-class OpenVikingContextMiddleware(AgentMiddleware):
+class OpenVikingContextMiddleware(AgentMiddleware[OpenVikingCaptureState]):
     """Inject OpenViking recall into LangGraph agent model calls.
 
     The middleware mirrors the OpenClaw-style lifecycle at LangGraph's extension
@@ -280,14 +280,18 @@ class OpenVikingContextMiddleware(AgentMiddleware):
             updated_system = SystemMessage(content=f"{content}\n\n{context_block}".strip())
         return request.override(system_message=updated_system)
 
-    def before_model(self, state: AgentState[Any], runtime: Any) -> dict[str, Any] | None:
+    def before_model(self, state: OpenVikingCaptureState, runtime: Any) -> dict[str, Any] | None:
         """Place this middleware before the host summarizer to capture its input."""
         return self._capture(state, runtime, commit=False)
 
-    async def abefore_model(self, state: AgentState[Any], runtime: Any) -> dict[str, Any] | None:
+    async def abefore_model(
+        self, state: OpenVikingCaptureState, runtime: Any
+    ) -> dict[str, Any] | None:
         return await self._acapture(state, runtime, commit=False)
 
-    def _capture_state_update(self, state: Any, plan: _CapturePlan) -> dict[str, Any]:
+    def _capture_state_update(
+        self, state: OpenVikingCaptureState, plan: _CapturePlan
+    ) -> dict[str, Any]:
         delivered = dict(state.get("openviking_captured_message_ids") or {})
         delivered[_stable_json(plan.key)] = sorted(self._captured_message_ids.get(plan.key, set()))
         return {"openviking_captured_message_ids": delivered}
@@ -299,11 +303,11 @@ class OpenVikingContextMiddleware(AgentMiddleware):
             if message_id:
                 delivered.add(message_id)
 
-    def after_agent(self, state: AgentState[Any], runtime: Any) -> dict[str, Any] | None:
+    def after_agent(self, state: OpenVikingCaptureState, runtime: Any) -> dict[str, Any] | None:
         return self._capture(state, runtime, commit=True)
 
     def _capture(
-        self, state: AgentState[Any], runtime: Any, *, commit: bool
+        self, state: OpenVikingCaptureState, runtime: Any, *, commit: bool
     ) -> dict[str, Any] | None:
         plan = self._capture_plan(state, runtime)
         if plan is None:
@@ -331,14 +335,14 @@ class OpenVikingContextMiddleware(AgentMiddleware):
 
     async def aafter_agent(
         self,
-        state: AgentState[Any],
+        state: OpenVikingCaptureState,
         runtime: Any,
     ) -> dict[str, Any] | None:
         """Asynchronously capture messages after an agent run."""
         return await self._acapture(state, runtime, commit=True)
 
     async def _acapture(
-        self, state: AgentState[Any], runtime: Any, *, commit: bool
+        self, state: OpenVikingCaptureState, runtime: Any, *, commit: bool
     ) -> dict[str, Any] | None:
         plan = self._capture_plan(state, runtime)
         if plan is None:
@@ -371,7 +375,7 @@ class OpenVikingContextMiddleware(AgentMiddleware):
 
     def _capture_plan(
         self,
-        state: AgentState[Any],
+        state: OpenVikingCaptureState,
         runtime: Any,
     ) -> _CapturePlan | None:
         if not self.capture_on_after_agent:
