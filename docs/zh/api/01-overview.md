@@ -491,6 +491,7 @@ JSON 输出 - 错误：
 |------|------|------|
 | GET | `/api/v1/admin/configuration` | 获取 Cluster 层显式运行时配置 |
 | PATCH | `/api/v1/admin/configuration` | 更新 Cluster 层运行时配置 |
+| POST | `/api/v1/admin/restart` | 请求支持该能力的服务进程优雅重启（仅 ROOT） |
 | GET | `/api/v1/admin/accounts/{account_id}/configuration` | 获取 Account 层显式运行时配置 |
 | PATCH | `/api/v1/admin/accounts/{account_id}/configuration` | 更新 Account 层运行时配置 |
 | GET | `/api/v1/admin/agent-evolution` | 获取 Agent 进化状态（deprecated） |
@@ -549,6 +550,7 @@ JSON 输出 - 错误：
 | MKCOL | `/webdav/resources`、`/webdav/resources/{resource_path}` | 创建目录 |
 | MOVE | `/webdav/resources`、`/webdav/resources/{resource_path}` | 移动或重命名资源 |
 | POST | `/api/v1/compile` | 创建异步 Compile 任务 |
+| POST | `/api/v1/compile/embeddings` | 生成 Compile 临时路由文本的向量 |
 | GET | `/api/v1/compile/capabilities` | 检查 Compile 可用性 |
 | GET | `/api/v1/compile/submissions/{key}` | 按提交键查询任务 |
 | GET | `/bot/v1/health` | VikingBot 健康检查 |
