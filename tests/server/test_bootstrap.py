@@ -211,6 +211,8 @@ def test_bot_alias_propagates_resolved_config_to_workers(monkeypatch):
     )
 
     with monkeypatch.context() as worker_env:
+        worker_env.delenv(app_module.WORKER_HOST_ENV, raising=False)
+        worker_env.delenv(app_module.WORKER_PORT_ENV, raising=False)
         worker_env.delenv(app_module.WORKER_WITH_BOT_ENV, raising=False)
         worker_env.delenv(app_module.WORKER_BOT_API_URL_ENV, raising=False)
 
@@ -218,6 +220,8 @@ def test_bot_alias_propagates_resolved_config_to_workers(monkeypatch):
 
         assert captured["with_bot"] is True
         assert captured["app"] == "openviking.server.app:create_worker_app"
+        assert os.environ[app_module.WORKER_HOST_ENV] == config.host
+        assert os.environ[app_module.WORKER_PORT_ENV] == str(config.port)
         assert os.environ[app_module.WORKER_WITH_BOT_ENV] == "1"
         assert os.environ[app_module.WORKER_BOT_API_URL_ENV] == "http://127.0.0.1:19000"
 
@@ -267,6 +271,8 @@ def test_main_prints_config_diagnostics_on_validation_error(monkeypatch, capsys)
 def test_worker_factory_replays_bot_overrides(monkeypatch):
     config = ServerConfig(with_bot=False, bot_api_url="http://from-config")
     captured = {}
+    monkeypatch.setenv(app_module.WORKER_HOST_ENV, "::")
+    monkeypatch.setenv(app_module.WORKER_PORT_ENV, "1999")
     monkeypatch.setenv(app_module.WORKER_WITH_BOT_ENV, "1")
     monkeypatch.setenv(app_module.WORKER_BOT_API_URL_ENV, "http://127.0.0.1:19000")
     monkeypatch.setattr(
@@ -293,6 +299,8 @@ def test_worker_factory_replays_bot_overrides(monkeypatch):
 
     worker_config = app_module.create_worker_app()
 
+    assert worker_config.host == "::"
+    assert worker_config.port == 1999
     assert worker_config.with_bot is True
     assert worker_config.bot_api_url == "http://127.0.0.1:19000"
     assert captured == {

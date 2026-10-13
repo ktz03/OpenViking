@@ -26,6 +26,7 @@ logger = get_logger(__name__)
 
 VOLCENGINE_CLIENT_REQUEST_ID_HEADER = "X-Client-Request-Id"
 VOLCENGINE_CLIENT_REQUEST_ID = "ToB-direct,OpenViking_Service,openviking-service_cn-beijing"
+DEFAULT_VOLCENGINE_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 
 
 def _build_volcengine_headers(extra_headers: Optional[Dict[str, str]]) -> Dict[str, str]:
@@ -63,7 +64,7 @@ class VolcEngineVLM(OpenAIVLM):
         self.extra_headers = _build_volcengine_headers(self.extra_headers)
 
         if not self.api_base:
-            self.api_base = "https://ark.cn-beijing.volces.com/api/v3"
+            self.api_base = DEFAULT_VOLCENGINE_API_BASE
         if not self.model:
             self.model = "doubao-seed-2-0-lite-260428"
 

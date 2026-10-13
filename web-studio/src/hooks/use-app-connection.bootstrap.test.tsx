@@ -103,3 +103,74 @@ it.each(['', 'root-key'])(
     }
   },
 )
+
+it.each(['', 'invalid'])(
+  'recognizes gateway health with saved OV key %j',
+  async (apiKey) => {
+    const requests: string[] = []
+    const server = createServer((req, res) => {
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        'X-OpenViking-Account, X-OpenViking-User, X-API-Key',
+      )
+      if (req.method === 'OPTIONS') {
+        res.end()
+        return
+      }
+      requests.push(req.url || '')
+      res.setHeader('Content-Type', 'application/json')
+      // An invalid key only leaves out the identity fields.
+      res.end(
+        JSON.stringify({
+          status: 'ok',
+          service: 'openviking-gateway',
+          auth_mode: 'api_key',
+          openviking_url: 'https://ov.example',
+        }),
+      )
+    })
+    server.listen(0, '127.0.0.1')
+    await once(server, 'listening')
+    const { port } = server.address() as { port: number }
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    localStorage.setItem(
+      'ov_console_connection',
+      JSON.stringify({
+        baseUrl: `http://127.0.0.1:${port}`,
+        accountId: 'default',
+        userId: 'default',
+        apiKey,
+        adminApiKey: '',
+      }),
+    )
+    function Host() {
+      const { isGatewayHost, openvikingUrl, serverMode } = useAppConnection()
+      return (
+        <output>{`${isGatewayHost}:${openvikingUrl}:${serverMode}`}</output>
+      )
+    }
+    try {
+      render(
+        <QueryClientProvider client={queryClient}>
+          <AppConnectionProvider>
+            <Host />
+          </AppConnectionProvider>
+        </QueryClientProvider>,
+      )
+      await waitFor(() =>
+        expect(
+          screen.getByText('true:https://ov.example:api_key'),
+        ).toBeTruthy(),
+      )
+      expect(requests.every((path) => path === '/health')).toBe(true)
+    } finally {
+      cleanup()
+      queryClient.clear()
+      localStorage.removeItem('ov_console_connection')
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  },
+)

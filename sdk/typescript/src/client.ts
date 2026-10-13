@@ -705,11 +705,15 @@ export class OpenVikingClient {
           content: operation.content,
           content_base64: operation.contentBase64,
           mode: operation.mode,
+          tags: operation.tags,
+          tag_mode: operation.tagMode,
+          acl: operation.acl,
         }),
       ),
       wait: options.wait,
       timeout: options.timeout,
       telemetry: options.telemetry,
+      processing_mode: options.processingMode,
     });
     return this.request("POST", "/api/v1/content/batch-write", {
       body: mergeExtra(body, options.extra),

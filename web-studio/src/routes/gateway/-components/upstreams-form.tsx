@@ -8,6 +8,7 @@ import {
 } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
+import { Button } from '#/components/ui/button'
 import { Checkbox } from '#/components/ui/checkbox'
 import { Input } from '#/components/ui/input'
 import { RadioGroup, RadioGroupItem } from '#/components/ui/radio-group'
@@ -38,6 +39,8 @@ import {
   UPSTREAM_KEY_HEADER,
   VENDORS,
   baseUrlAfterSwitch,
+  baseUrlChanged,
+  baseUrlCorrection,
   defaultBaseUrl,
   endpointPreview,
   protocolFor,
@@ -47,6 +50,7 @@ import {
   usesDefaultBaseUrl,
 } from '../-lib/upstream-schema'
 import { KeyValueEditor } from './key-value-editor'
+import { useReadOnly } from './read-only'
 import { Notice } from './notice'
 import { NumberInput } from './number-input'
 import { SettingField } from './setting-field'
@@ -116,6 +120,7 @@ function ChoiceCard({
   /** Why the option can't be picked; disables it and replaces `detail`. */
   unavailable?: string
 }) {
+  const readOnly = useReadOnly()
   return (
     <label
       className={cn(
@@ -127,7 +132,7 @@ function ChoiceCard({
     >
       <RadioGroupItem
         value={value}
-        disabled={Boolean(unavailable)}
+        disabled={readOnly || Boolean(unavailable)}
         className="mt-0.5 data-disabled:opacity-50"
       />
       <span className="grid min-w-0 gap-1">
@@ -166,9 +171,11 @@ function CheckRow({
   label: string
   description: string
 }) {
+  const readOnly = useReadOnly()
   return (
     <label className="flex cursor-pointer items-start gap-3">
       <Checkbox
+        disabled={readOnly}
         checked={checked}
         className="mt-0.5"
         onCheckedChange={(value) => onCheckedChange(value)}
@@ -193,6 +200,10 @@ export function UpstreamForm({
   error,
 }: UpstreamFormProps) {
   const { t, i18n } = useTranslation('gateway')
+  const readOnly = useReadOnly()
+  const correction = baseUrlCorrection(draft)
+  const addressChanged = baseUrlChanged(draft, stored)
+  const headersCleared = addressChanged && Boolean(stored?.header_names?.length)
   const preview = endpointPreview(draft)
   const defaultUrl = defaultBaseUrl(draft.vendor, draft.protocol)
   const keyStored = Boolean(stored?.has_api_key)
@@ -333,7 +344,33 @@ export function UpstreamForm({
                 </code>
               </p>
             ) : null}
-            {defaultUrl && !usesDefaultBaseUrl(draft) ? (
+            {correction && !readOnly ? (
+              <Notice
+                tone="warning"
+                action={
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => onChange('base_url', correction.url)}
+                  >
+                    {t(
+                      correction.reason === 'anthropicVersion'
+                        ? 'upstreams.form.baseUrl.removeVersion'
+                        : 'upstreams.form.baseUrl.correctPath',
+                      { url: correction.url },
+                    )}
+                  </Button>
+                }
+              >
+                <p>{t(`upstreams.form.baseUrl.${correction.reason}`)}</p>
+              </Notice>
+            ) : null}
+            {/* The correction button already offers the default address. */}
+            {!readOnly &&
+            defaultUrl &&
+            !usesDefaultBaseUrl(draft) &&
+            correction?.url !== defaultUrl ? (
               <button
                 type="button"
                 className="flex max-w-full min-w-0 gap-1 justify-self-start text-xs font-medium whitespace-nowrap text-foreground underline underline-offset-4"
@@ -352,108 +389,142 @@ export function UpstreamForm({
         title={t('upstreams.sections.credentials.title')}
         description={t('upstreams.sections.credentials.description')}
       >
-        <SettingField label={t('upstreams.form.authMode.label')}>
-          <RadioGroup
-            value={draft.auth_mode}
-            aria-label={t('upstreams.form.authMode.label')}
-            className="grid gap-2 md:grid-cols-2"
-            onValueChange={(value) => {
-              const mode = AUTH_MODES.find((item) => item === value)
-              if (mode) onChange('auth_mode', mode)
-            }}
-          >
-            {AUTH_MODES.map((mode) => (
-              <ChoiceCard
-                key={mode}
-                value={mode}
-                title={t(`upstreams.form.authMode.${mode}.title`)}
-                description={t(`upstreams.form.authMode.${mode}.description`, {
-                  header: UPSTREAM_KEY_HEADER,
-                })}
-              />
-            ))}
-          </RadioGroup>
-        </SettingField>
-        {draft.auth_mode === 'managed' ? (
-          <SettingField
-            label={
-              <>
-                {t('upstreams.form.apiKey.label')}
-                {keyStored ? (
-                  <ToneBadge tone="success">
-                    {t('upstreams.form.apiKey.stored')}
-                  </ToneBadge>
-                ) : null}
-              </>
-            }
-            htmlFor="upstream-api-key"
-            description={t(
-              keyStored
-                ? 'upstreams.form.apiKey.storedDescription'
-                : 'upstreams.form.apiKey.description',
-            )}
-            error={error('api_key')}
-          >
-            <Input
-              {...PLAIN_INPUT_PROPS}
-              id="upstream-api-key"
-              type="password"
-              autoComplete="new-password"
-              value={draft.api_key}
-              placeholder={t(
-                keyStored
-                  ? 'field.storedSecret'
-                  : 'upstreams.form.apiKey.placeholder',
+        {readOnly ? (
+          <div className="flex flex-wrap items-center gap-2 text-sm">
+            <span>
+              {t(
+                draft.auth_mode === 'passthrough'
+                  ? 'upstreams.readOnly.clientKey'
+                  : 'upstreams.readOnly.managedKey',
               )}
-              aria-invalid={Boolean(error('api_key'))}
-              className="font-mono sm:max-w-md"
-              onChange={(event) => onChange('api_key', event.target.value)}
-              onBlur={() => onBlur('api_key')}
-            />
-          </SettingField>
-        ) : null}
-        <SettingField
-          label={t('upstreams.form.headers.label')}
-          description={t('upstreams.form.headers.description')}
-          error={error('headers')}
-        >
-          <KeyValueEditor
-            value={draft.headers}
-            storedKeys={stored?.header_names}
-            maskValues
-            keyPlaceholder={t('upstreams.form.headers.name')}
-            valuePlaceholder={t('upstreams.form.headers.value')}
-            addLabel={t('upstreams.form.headers.add')}
-            aria-invalid={Boolean(error('headers'))}
-            onChange={(headers) => onChange('headers', headers)}
-          />
-        </SettingField>
-        <div className="grid gap-3">
-          <CheckRow
-            checked={draft.coding_plan}
-            label={t('upstreams.form.codingPlan.label')}
-            description={t('upstreams.form.codingPlan.description')}
-            onCheckedChange={(checked) => {
-              onChange('coding_plan', checked)
-              if (!checked) onChange('allow_coding_plan', false)
-            }}
-          />
-          {draft.coding_plan ? (
-            <Notice tone="warning" className="ml-7">
-              <p>{t('upstreams.form.codingPlan.warning')}</p>
-              <div className="mt-2">
-                <CheckRow
-                  checked={draft.allow_coding_plan}
-                  label={t('upstreams.form.codingPlan.allow')}
-                  description={t('upstreams.form.codingPlan.allowDescription')}
-                  onCheckedChange={(checked) =>
-                    onChange('allow_coding_plan', checked)
-                  }
+            </span>
+            {draft.coding_plan ? (
+              <ToneBadge tone="neutral">
+                {t(
+                  draft.allow_coding_plan
+                    ? 'upstreams.readOnly.codingAllowed'
+                    : 'upstreams.readOnly.codingBlocked',
+                )}
+              </ToneBadge>
+            ) : null}
+          </div>
+        ) : (
+          <>
+            <SettingField label={t('upstreams.form.authMode.label')}>
+              <RadioGroup
+                value={draft.auth_mode}
+                aria-label={t('upstreams.form.authMode.label')}
+                className="grid gap-2 md:grid-cols-2"
+                onValueChange={(value) => {
+                  const mode = AUTH_MODES.find((item) => item === value)
+                  if (mode) onChange('auth_mode', mode)
+                }}
+              >
+                {AUTH_MODES.map((mode) => (
+                  <ChoiceCard
+                    key={mode}
+                    value={mode}
+                    title={t(`upstreams.form.authMode.${mode}.title`)}
+                    description={t(
+                      `upstreams.form.authMode.${mode}.description`,
+                      {
+                        header: UPSTREAM_KEY_HEADER,
+                      },
+                    )}
+                  />
+                ))}
+              </RadioGroup>
+            </SettingField>
+            {draft.auth_mode === 'managed' ? (
+              <SettingField
+                label={
+                  <>
+                    {t('upstreams.form.apiKey.label')}
+                    {keyStored && !addressChanged ? (
+                      <ToneBadge tone="success">
+                        {t('upstreams.form.apiKey.stored')}
+                      </ToneBadge>
+                    ) : null}
+                  </>
+                }
+                htmlFor="upstream-api-key"
+                description={t(
+                  addressChanged && !draft.api_key.trim()
+                    ? 'upstreams.form.apiKey.addressChanged'
+                    : keyStored
+                      ? 'upstreams.form.apiKey.storedDescription'
+                      : 'upstreams.form.apiKey.description',
+                )}
+                error={error('api_key')}
+              >
+                <Input
+                  {...PLAIN_INPUT_PROPS}
+                  id="upstream-api-key"
+                  type="password"
+                  autoComplete="new-password"
+                  value={draft.api_key}
+                  placeholder={t(
+                    keyStored && !addressChanged
+                      ? 'field.storedSecret'
+                      : 'upstreams.form.apiKey.placeholder',
+                  )}
+                  aria-invalid={Boolean(error('api_key'))}
+                  className="font-mono sm:max-w-md"
+                  onChange={(event) => onChange('api_key', event.target.value)}
+                  onBlur={() => onBlur('api_key')}
                 />
-              </div>
-            </Notice>
-          ) : null}
-        </div>
+              </SettingField>
+            ) : null}
+            <SettingField
+              label={t('upstreams.form.headers.label')}
+              description={t(
+                headersCleared
+                  ? 'upstreams.form.headers.addressChanged'
+                  : 'upstreams.form.headers.description',
+              )}
+              error={error('headers')}
+            >
+              <KeyValueEditor
+                value={draft.headers}
+                storedKeys={addressChanged ? undefined : stored?.header_names}
+                maskValues
+                keyPlaceholder={t('upstreams.form.headers.name')}
+                valuePlaceholder={t('upstreams.form.headers.value')}
+                addLabel={t('upstreams.form.headers.add')}
+                aria-invalid={Boolean(error('headers'))}
+                onChange={(headers) => onChange('headers', headers)}
+              />
+            </SettingField>
+            <div className="grid gap-3">
+              <CheckRow
+                checked={draft.coding_plan}
+                label={t('upstreams.form.codingPlan.label')}
+                description={t('upstreams.form.codingPlan.description')}
+                onCheckedChange={(checked) => {
+                  onChange('coding_plan', checked)
+                  if (!checked) onChange('allow_coding_plan', false)
+                }}
+              />
+              {draft.coding_plan ? (
+                <Notice tone="warning" className="ml-7">
+                  <p>{t('upstreams.form.codingPlan.warning')}</p>
+                  <div className="mt-2">
+                    <CheckRow
+                      checked={draft.allow_coding_plan}
+                      label={t('upstreams.form.codingPlan.allow')}
+                      description={t(
+                        'upstreams.form.codingPlan.allowDescription',
+                      )}
+                      onCheckedChange={(checked) =>
+                        onChange('allow_coding_plan', checked)
+                      }
+                    />
+                  </div>
+                </Notice>
+              ) : null}
+            </div>
+          </>
+        )}
       </SettingSection>
 
       <SettingSection
