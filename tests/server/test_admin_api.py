@@ -34,7 +34,7 @@ from openviking.server.user_config import (
     user_config_backup_uri,
 )
 from openviking.service.core import OpenVikingService
-from openviking.service.deletion import setup_deletion
+from openviking.service.deletion import DeletionService, setup_deletion
 from openviking.service.task_store import (
     SYSTEM_TASK_ACCOUNT_ID,
     SYSTEM_TASK_USER_ID,
@@ -311,6 +311,28 @@ async def _wait_for_task(client: httpx.AsyncClient, task_id: str) -> dict:
 # ---- Account CRUD ----
 
 
+async def test_delete_account_files_disables_automatic_pathlock(monkeypatch):
+    """Account cleanup must bypass the deleted tree's automatic PathLock."""
+    path = "/local/account-to-delete"
+    agfs = Mock()
+    agfs.rm = AsyncMock()
+    agfs.stat = AsyncMock(side_effect=AGFSNotFoundError(path))
+    service = Mock()
+    service.viking_fs._async_agfs = agfs
+    tracker = Mock()
+    monkeypatch.setattr("openviking.service.deletion.get_task_tracker", lambda: tracker)
+    deletion = DeletionService(
+        service=service,
+        manager=Mock(),
+        service_loop=asyncio.get_running_loop(),
+    )
+
+    await deletion._delete_account_files("account-to-delete")
+
+    agfs.rm.assert_awaited_once_with(path, recursive=True, auto_pathlock=False)
+    tracker.forget_account_tasks.assert_called_once_with("account-to-delete")
+
+
 @pytest_asyncio.fixture
 async def template_account(lightweight_admin_client):
     account_id = _uid()
@@ -324,17 +346,31 @@ async def template_account(lightweight_admin_client):
 
 
 async def test_studio_file_configuration_permissions_revision_and_overrides(
-    lightweight_admin_client, lightweight_admin_app, template_account, tmp_path, monkeypatch,
+    lightweight_admin_client,
+    lightweight_admin_app,
+    template_account,
+    tmp_path,
+    monkeypatch,
 ):
     from openviking.config.scope import ConfigScope
     from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
 
     account_id, admin_headers = template_account
     config_path = tmp_path / "ov.conf"
-    config_path.write_text(json.dumps({"vlm": {"provider": "openai", "model": "gpt-4o", "api_key": "file-secret"}}))
+    config_path.write_text(
+        json.dumps({"vlm": {"provider": "openai", "model": "gpt-4o", "api_key": "file-secret"}})
+    )
     monkeypatch.setattr(OpenVikingConfigSingleton, "_config_file", config_path)
     manager = lightweight_admin_app.state.fake_service.runtime_config_manager
-    await manager.patch_account(account_id, {"vlm": {"model": "override-model", "credentials": [{"provider": "openai", "api_key": "account-secret"}]}})
+    await manager.patch_account(
+        account_id,
+        {
+            "vlm": {
+                "model": "override-model",
+                "credentials": [{"provider": "openai", "api_key": "account-secret"}],
+            }
+        },
+    )
     url = "/api/v1/admin/configuration"
     params = {"source": "file", "account_id": account_id}
     denied = await lightweight_admin_client.get(url, params=params, headers=admin_headers)
@@ -355,15 +391,28 @@ async def test_studio_file_configuration_permissions_revision_and_overrides(
     assert override_response.json()["result"]["overrides"]["cluster"] == ["query_planner"]
     content = json.loads(result["content"])
     content["rerank"] = {
-        "provider": "jev", "api_key": "jev-secret", "mode": "choice", "threshold": 0
+        "provider": "jev",
+        "api_key": "jev-secret",
+        "mode": "choice",
+        "threshold": 0,
     }
     body = {"revision": result["revision"], "content": json.dumps(content)}
-    assert (await lightweight_admin_client.patch(url, params={"source": "file"}, headers=admin_headers, json=body)).status_code == 403
-    saved = await lightweight_admin_client.patch(url, params={"source": "file"}, headers=root_headers(), json=body)
+    assert (
+        await lightweight_admin_client.patch(
+            url, params={"source": "file"}, headers=admin_headers, json=body
+        )
+    ).status_code == 403
+    saved = await lightweight_admin_client.patch(
+        url, params={"source": "file"}, headers=root_headers(), json=body
+    )
     assert saved.status_code == 200, saved.text
     assert saved.json()["result"]["restart_required"]
     assert json.loads(config_path.read_text())["rerank"]["provider"] == "jev"
-    assert (await lightweight_admin_client.patch(url, params={"source": "file"}, headers=root_headers(), json=body)).status_code == 400
+    assert (
+        await lightweight_admin_client.patch(
+            url, params={"source": "file"}, headers=root_headers(), json=body
+        )
+    ).status_code == 400
     settings = await manager.get_settings(ConfigScope.account(account_id))
     assert settings["vlm"]["model"] == "override-model"
 
@@ -987,12 +1036,10 @@ async def test_account_memory_templates_range_expressions_reach_file_body(
     fs = lightweight_admin_app.state.fake_service.viking_fs
     snapshot = await resolve_account_memory_registry(fs, account_id, MemoryTypeRegistry())
     schema = snapshot.get("events")
-    context = ExtractContext(
-        [
-            Message(id="m1", role="user", parts=[TextPart("Selected source message")]),
-            Message(id="m2", role="user", parts=[TextPart("Unrelated source message")]),
-        ]
-    )
+    context = ExtractContext([
+        Message(id="m1", role="user", parts=[TextPart("Selected source message")]),
+        Message(id="m2", role="user", parts=[TextPart("Unrelated source message")]),
+    ])
     rendered = MemoryFileUtils.write(
         MemoryFile(memory_type="events", extra_fields={"ranges": "0", "summary": "summary"}),
         content_template=schema.content_template,
@@ -1315,33 +1362,29 @@ async def test_account_memory_templates_locked_fields_cannot_be_modified(
         for key, value in defaults.items()
         if key not in editable
     ]
-    invalid.extend(
-        [
-            {"unknown": "ignored?"},
-            {"Description": "wrong key"},
-            {"_updated_at": "forged"},
-            {"_account_content_template": False},
-            {"deployment_content_template": "forged"},
-            {"enabled": 1},
-            {"fields": [{"name": "renamed_field", "description": "changed"}]},
-            {"description": None},
-            {"description": " \n"},
-            {"fields": [None]},
-        ]
-    )
+    invalid.extend([
+        {"unknown": "ignored?"},
+        {"Description": "wrong key"},
+        {"_updated_at": "forged"},
+        {"_account_content_template": False},
+        {"deployment_content_template": "forged"},
+        {"enabled": 1},
+        {"fields": [{"name": "renamed_field", "description": "changed"}]},
+        {"description": None},
+        {"description": " \n"},
+        {"fields": [None]},
+    ])
     for field in defaults["fields"]:
         invalid.extend(
             {"fields": [{"name": field["name"], key: None if value is not None else "changed"}]}
             for key, value in field.items()
             if key not in {"name", "description"}
         )
-        invalid.extend(
-            [
-                {"fields": [{"name": field["name"], "unknown": "ignored?"}]},
-                {"fields": [{"name": field["name"], "description": ""}]},
-                {"fields": [{"name": field["name"]}, {"name": field["name"]}]},
-            ]
-        )
+        invalid.extend([
+            {"fields": [{"name": field["name"], "unknown": "ignored?"}]},
+            {"fields": [{"name": field["name"], "description": ""}]},
+            {"fields": [{"name": field["name"]}, {"name": field["name"]}]},
+        ])
     if memory_type == "events":
         invalid.extend(
             {"fields": [{"name": name, "description": "changed"}]} for name in ("goal", "ranges")
@@ -2131,6 +2174,33 @@ async def test_list_users_for_default_account_without_users_file_returns_empty_l
     assert resp.json()["result"] == []
 
 
+async def test_list_accounts_with_watcher_uses_memory(
+    lightweight_admin_client: httpx.AsyncClient,
+    lightweight_admin_app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A running watcher keeps list requests on the in-memory fast path."""
+    loop = asyncio.get_running_loop()
+    watch_task = loop.create_future()
+
+    async def _unexpected_read(_path: str):
+        raise AssertionError("list accounts should not read AGFS while watcher is running")
+
+    manager = lightweight_admin_app.state.api_key_manager
+    manager._store._watch_task = watch_task
+    monkeypatch.setattr(manager._store, "_read_json", _unexpected_read)
+    try:
+        resp = await lightweight_admin_client.get("/api/v1/admin/accounts", headers=root_headers())
+        users_resp = await lightweight_admin_client.get(
+            "/api/v1/admin/accounts/default/users", headers=root_headers()
+        )
+    finally:
+        watch_task.cancel()
+
+    assert resp.status_code == 200, resp.text
+    assert users_resp.status_code == 200, users_resp.text
+
+
 async def test_identity_settings_refreshes_a_stale_registry_on_demand(
     admin_client: httpx.AsyncClient,
     admin_app: FastAPI,
@@ -2308,22 +2378,18 @@ async def test_delete_account(
             account_id=SYSTEM_TASK_ACCOUNT_ID,
             user_id=SYSTEM_TASK_USER_ID,
         )
-        await queue.enqueue(
-            {
-                "task_id": user_cleanup.task_id,
-                "account_id": acct,
-                "user_id": "alice",
-                "target": {"account_id": acct, "user_id": "bob"},
-            }
-        )
-        await queue.enqueue(
-            {
-                "task_id": late_task_id,
-                "account_id": SYSTEM_TASK_ACCOUNT_ID,
-                "user_id": SYSTEM_TASK_USER_ID,
-                "target": {"account_id": acct, "user_id": "bob"},
-            }
-        )
+        await queue.enqueue({
+            "task_id": user_cleanup.task_id,
+            "account_id": acct,
+            "user_id": "alice",
+            "target": {"account_id": acct, "user_id": "bob"},
+        })
+        await queue.enqueue({
+            "task_id": late_task_id,
+            "account_id": SYSTEM_TASK_ACCOUNT_ID,
+            "user_id": SYSTEM_TASK_USER_ID,
+            "target": {"account_id": acct, "user_id": "bob"},
+        })
         skipped = await _wait_for_task(admin_client, late_task_id)
         assert skipped["status"] == "completed"
         assert skipped["result"] == {"deleted": not recreated, "stale": True}
@@ -2622,8 +2688,16 @@ async def test_remove_user(
     admin_client: httpx.AsyncClient,
     admin_service: OpenVikingService,
     admin_app: FastAPI,
+    monkeypatch,
 ):
-    """Deletion revokes the user and removes only their private data, uploads, and tasks."""
+    """Deletion revokes the user and removes only their private data, uploads, tasks,
+    and embedded gateway state."""
+    import openviking_gateway.app as gateway_module
+
+    gateway = object()
+    delete_gateway_data = AsyncMock()
+    monkeypatch.setattr(gateway_module, "delete_data", delete_gateway_data)
+    monkeypatch.setattr(admin_app.state.deletion_service, "_gateway_app", gateway)
     acct = _uid()
     await admin_client.post(
         "/api/v1/admin/accounts",
@@ -2673,6 +2747,7 @@ async def test_remove_user(
     assert not await admin_service.viking_fs.exists(bob_upload_uri, ctx=upload_ctx)
     assert await admin_service.viking_fs.exists(alice_upload_uri, ctx=upload_ctx)
     assert not await admin_app.state.api_key_manager.has_user(acct, "bob")
+    delete_gateway_data.assert_awaited_once_with(gateway, acct, "bob")
     assert (
         await get_task_tracker().get(
             bob_task.task_id,
@@ -3129,10 +3204,7 @@ async def test_trusted_mode_admin_can_register_user_in_own_account(
         headers=trusted_headers(account=acct, user="alice", include_api_key=True),
     )
     assert users.status_code == 200
-    assert all(
-        user["api_key_available"] is False
-        for user in users.json()["result"]
-    )
+    assert all(user["api_key_available"] is False for user in users.json()["result"])
 
     rotated = await trusted_admin_client.post(
         f"/api/v1/admin/accounts/{acct}/users/bob/key",
@@ -3449,12 +3521,10 @@ async def test_server_restart_requires_root_and_valid_revision(
         server_overrides = {"host": cli_host}
         lightweight_admin_app.state.server_config_overrides = server_overrides
     path.write_text(
-        json.dumps(
-            {
-                "server": server,
-                "vlm": {"provider": "openai", "model": "gpt-4o", "api_key": "test-key"},
-            }
-        )
+        json.dumps({
+            "server": server,
+            "vlm": {"provider": "openai", "model": "gpt-4o", "api_key": "test-key"},
+        })
     )
     monkeypatch.setattr(OpenVikingConfigSingleton, "_config_file", path)
     monkeypatch.setattr(OpenVikingConfigSingleton, "_config_file_content", path.read_bytes())

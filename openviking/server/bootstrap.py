@@ -20,6 +20,8 @@ import uvicorn
 
 from openviking.server.app import (
     WORKER_BOT_API_URL_ENV,
+    WORKER_HOST_ENV,
+    WORKER_PORT_ENV,
     WORKER_WITH_BOT_ENV,
     create_app,
 )
@@ -350,6 +352,8 @@ def _main(recovery):
             # can independently import the application.  We stash the
             # resolved config path in an env-var so that the factory can
             # pick it up (ServerConfig already reads OPENVIKING_CONFIG_FILE).
+            os.environ[WORKER_HOST_ENV] = config.host or ""
+            os.environ[WORKER_PORT_ENV] = str(config.port)
             os.environ[WORKER_WITH_BOT_ENV] = "1" if config.with_bot else "0"
             os.environ[WORKER_BOT_API_URL_ENV] = config.bot_api_url
             uvicorn.run(

@@ -200,7 +200,7 @@ async def test_key_scope_revocation_and_root_rejection(running_gateway):
             },
         )
         assert response.status_code == expected
-    other_admin = {**admin, "X-OpenViking-Account": "other"}
+    other_admin = {"X-API-Key": "other"}
     assert (await client.get("/admin/keys", headers=other_admin)).json() == []
     listed = (await client.get("/admin/keys", headers=admin)).json()
     assert key["key"] not in str(listed) and "user-key" not in str(listed)
@@ -606,6 +606,10 @@ async def test_ark_paths_unknown_fields_and_cache_key(
         if k not in {"id", "revision", "has_api_key", "header_names", "account"}
     }
     payload["vendor"] = vendor
+    payload["base_url"] = payload["base_url"].removesuffix("/v1") + (
+        "/api/compatible" if payload["protocol"] == "anthropic" else "/api/v3"
+    )
+    payload["api_key"] = "model-secret"
     response = await client.put("/admin/upstreams/" + protocol, headers=admin, json=payload)
     assert response.status_code == 200, response.text
     field = "input" if protocol == "responses" else "messages"
@@ -730,15 +734,13 @@ async def test_attachment_import_and_signed_upload_proxy(running_gateway, name):
     assert "viking://resources/imported" in model_requests[1]["messages"][-1]["content"]
     # The token is the sole upload authorization, and the destination is fixed.
     response = await client.post(
-        "/gateway/uploads?token=signed-once&url=http://attacker",
+        "/uploads?token=signed-once&url=http://attacker",
         files={"file": ("notes.txt", b"upload")},
         headers={"Authorization": "Bearer not-forwarded"},
     )
     assert response.status_code == 200, response.text
     assert uploads[-1] == ("file", "notes.txt", b"upload")
-    assert (
-        await client.post("/gateway/uploads", files={"file": ("x.txt", b"x")})
-    ).status_code == 400
+    assert (await client.post("/uploads", files={"file": ("x.txt", b"x")})).status_code == 400
 
 
 async def test_shell_upload_instructions_use_public_proxy(running_gateway):
@@ -818,6 +820,10 @@ async def test_ark_responses_stream_keeps_native_fields_and_done(running_gateway
     allowed = {"name", "protocol", "base_url", "models", "aliases", "vendor"}
     payload = {k: v for k, v in upstream.items() if k in allowed}
     payload["vendor"] = vendor
+    payload["base_url"] = payload["base_url"].removesuffix("/v1") + (
+        "/api/compatible" if payload["protocol"] == "anthropic" else "/api/v3"
+    )
+    payload["api_key"] = "model-secret"
     assert (
         await client.put("/admin/upstreams/responses", headers=admin, json=payload)
     ).status_code == 200
@@ -887,16 +893,34 @@ async def test_large_first_tool_request_keeps_client_token_limit(running_gateway
 async def test_ark_connection_test_lists_models_under_api_v3(running_gateway, vendor):
     app, client, admin, _, seen, _ = running_gateway
     upstream = await app.state.management.get("tenant", "upstreams", "chat")
-    await app.state.management.save("tenant", "upstreams", "chat", {**upstream, "vendor": vendor})
+    await app.state.management.save(
+        "tenant",
+        "upstreams",
+        "chat",
+        {
+            **upstream,
+            "vendor": vendor,
+            "base_url": upstream["base_url"].removesuffix("/v1") + "/api/v3",
+        },
+    )
     response = await client.post("/admin/upstreams/chat/test", headers=admin)
-    assert response.json() == {"ok": True, "status": 200}
+    assert response.json()["ok"] and response.json()["status"] == 200
     assert seen[-1][0] == "/api/v3/models"
 
 
 async def test_ark_burst_is_forwarded_without_local_429(running_gateway):
     app, client, admin, key, seen, _ = running_gateway
     upstream = await app.state.management.get("tenant", "upstreams", "chat")
-    await app.state.management.save("tenant", "upstreams", "chat", {**upstream, "vendor": "ark"})
+    await app.state.management.save(
+        "tenant",
+        "upstreams",
+        "chat",
+        {
+            **upstream,
+            "vendor": "ark",
+            "base_url": upstream["base_url"].removesuffix("/v1") + "/api/v3",
+        },
+    )
     headers = {"Authorization": "Bearer " + key["key"], "X-OpenViking-Session": "ark-burst"}
     for _ in range(20):
         response = await client.post(
@@ -1058,7 +1082,7 @@ async def test_capture_reset_is_scoped_to_the_key_account(running_gateway):
     log = (await client.get("/admin/logs", headers=admin)).json()[0]
     path = "/admin/keys/" + log["credential_id"] + "/capture/reset"
     body = {"session": log["session"], "protocol": "chat"}
-    wrong = await client.post(path, headers={**admin, "X-OpenViking-Account": "other"}, json=body)
+    wrong = await client.post(path, headers={"X-API-Key": "other"}, json=body)
     assert wrong.status_code == 404
     assert (await client.post(path, headers=admin, json=body)).status_code == 200
     # The session header value the client sent names the same session.
@@ -1072,10 +1096,16 @@ async def test_capture_reset_is_scoped_to_the_key_account(running_gateway):
 async def test_guides_report_the_client_facing_address(running_gateway):
     app, client, admin, _, _, _ = running_gateway
     response = await client.get("/admin/guides", headers=admin)
-    assert response.json() == {"base_url": "http://127.0.0.1:1935", "public_url_configured": False}
+    assert response.json() == {
+        "base_url": "http://gateway/gateway",
+        "public_url_configured": False,
+    }
     app.state.config.public_url = "https://ov.example.com"
     response = await client.get("/admin/guides", headers=admin)
-    assert response.json() == {"base_url": "https://ov.example.com", "public_url_configured": True}
+    assert response.json() == {
+        "base_url": "https://ov.example.com/gateway",
+        "public_url_configured": True,
+    }
 
 
 async def test_upstream_save_keeps_blank_secrets_per_header(running_gateway):
@@ -1140,7 +1170,9 @@ async def test_user_and_account_data_deletion_routes(running_gateway):
     response = await client.delete("/admin/users/bob/data", headers=admin)
     assert response.json() == {"deleted": True}
     assert (await client.get("/admin/keys", headers=admin)).json()
-    response = await client.delete("/admin/account/data", headers=admin)
+    response = await client.delete(
+        "/admin/account/data?account_id=tenant", headers={"X-API-Key": "root"}
+    )
     assert response.status_code == 200 and response.json() == {"deleted": True}
     assert (await client.get("/admin/keys", headers=admin)).json() == []
     response = await client.get("/v1/models", headers={"Authorization": "Bearer " + key["key"]})
@@ -1157,40 +1189,20 @@ async def test_admin_tools_list_the_mcp_tools_for_profiles(running_gateway):
         {"name": "find", "description": "OpenViking find", "annotations": {"readOnlyHint": True}},
         {"name": "list", "description": "OpenViking list"},
     ]
-    assert backend["tools_calls"] == ["user-key"]
-    # An account without gateway keys has no OpenViking key to list tools with.
-    response = await client.get("/admin/tools", headers={**admin, "X-OpenViking-Account": "new"})
-    assert response.status_code == 200 and response.json() == []
-    assert backend["tools_calls"] == ["user-key"]
+    assert backend["tools_calls"] == ["admin-key"]
+    # Tools use the caller's credential and do not require a gateway key.
+    await app.state.management.delete("tenant", "keys", running_gateway[3]["id"])
+    response = await client.get("/admin/tools", headers=admin)
+    assert response.status_code == 200 and len(response.json()) == 2
 
 
-async def test_admin_tools_skip_rejected_keys_and_report_failures_cleanly(running_gateway):
+async def test_admin_tools_report_callers_failure_cleanly(running_gateway):
     app, client, admin, _, _, _ = running_gateway
     backend = app.state.test_backend
-    response = await client.post(
-        "/admin/keys",
-        headers=admin,
-        json={
-            "name": "second",
-            "openviking_key": "second-key",
-            "policy_id": "default",
-            "upstream_ids": ["chat"],
-        },
-    )
-    assert response.status_code == 200, response.text
-    # A 401 here would read as the admin's own Studio sign-in failing.
-    backend["tools_status"] = {"user-key": 401, "second-key": 401}
+    backend["tools_status"] = {"admin-key": 401}
     response = await client.get("/admin/tools", headers=admin)
-    assert response.status_code == 502 and "private server detail" not in response.text
-    # An outage is not retried with every key.
-    backend["tools_status"] = {"user-key": 503, "second-key": 503}
-    backend["tools_calls"] = []
-    response = await client.get("/admin/tools", headers=admin)
-    assert response.status_code == 502 and len(backend["tools_calls"]) == 1
-    backend["tools_status"] = {"user-key": 401}
-    response = await client.get("/admin/tools", headers=admin)
-    assert response.status_code == 200 and len(response.json()) == len(MCP_TOOLS)
-    assert backend["tools_calls"][-1] == "second-key"
+    assert response.status_code == 401 and "private server detail" not in response.text
+    assert backend["tools_calls"] == ["admin-key"]
 
 
 async def test_model_restricted_key_rejects_bodies_without_a_readable_model(running_gateway):

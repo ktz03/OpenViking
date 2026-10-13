@@ -1637,6 +1637,33 @@ async def test_batch_write_http_timeout_outlives_server_wait_timeout():
 
 
 @pytest.mark.asyncio
+async def test_batch_write_serializes_processing_mode_and_operation_metadata():
+    client = AsyncHTTPClient(url="http://localhost:1933")
+    client._request = AsyncMock(return_value=object())
+    client._handle_response_data = lambda _response: {"result": {}}
+
+    await client.batch_write(
+        "viking://resources/wiki",
+        [
+            {
+                "uri": "viking://resources/wiki/a.md",
+                "content": "new",
+                "tags": ["team=search"],
+                "tag_mode": "append",
+                "acl": {"acl_mode": "restricted", "entries": []},
+            }
+        ],
+        options={"processing_mode": "vectors_only"},
+    )
+
+    payload = client._request.await_args.kwargs["json"]
+    assert payload["processing_mode"] == "vectors_only"
+    assert payload["operations"][0]["tags"] == ["team=search"]
+    assert payload["operations"][0]["tag_mode"] == "append"
+    assert payload["operations"][0]["acl"] == {"acl_mode": "restricted", "entries": []}
+
+
+@pytest.mark.asyncio
 async def test_watch_routes_support_uri_lookup_and_normalization():
     client = AsyncHTTPClient(url="http://localhost:1933")
     fake_http = SimpleNamespace(

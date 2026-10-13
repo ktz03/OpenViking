@@ -257,18 +257,22 @@ type WriteOptions struct {
 
 // BatchWriteOperation is one file write in a batch.
 type BatchWriteOperation struct {
-	URI           string  `json:"uri"`
-	Content       *string `json:"content,omitempty"`
-	ContentBase64 *string `json:"content_base64,omitempty"`
-	Mode          string  `json:"mode,omitempty"`
+	URI           string   `json:"uri"`
+	Content       *string  `json:"content,omitempty"`
+	ContentBase64 *string  `json:"content_base64,omitempty"`
+	Mode          string   `json:"mode,omitempty"`
+	Tags          []string `json:"tags,omitempty"`
+	TagMode       string   `json:"tag_mode,omitempty"`
+	ACL           *ACLSpec `json:"acl,omitempty"`
 }
 
 // BatchWriteOptions controls BatchWrite.
 type BatchWriteOptions struct {
-	Wait      *bool
-	Timeout   *float64
-	Telemetry any
-	Extra     map[string]any
+	Wait           *bool
+	Timeout        *float64
+	Telemetry      any
+	ProcessingMode string
+	Extra          map[string]any
 }
 
 // SetTagsOptions controls SetTags.

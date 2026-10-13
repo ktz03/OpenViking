@@ -7,7 +7,7 @@ import { fetchAdminAccounts } from '#/lib/admin'
 import { isOvClientError, ovClient } from '#/lib/ov-client'
 
 import {
-  detectServerMode,
+  isServerAuthMode,
   fetchServerHealth,
   normalizeBaseUrl,
 } from './use-server-mode'
@@ -43,6 +43,8 @@ type AppConnectionContextValue = {
   generatedCredential: GeneratedCredential | null
   identityScopeKey: string
   isConnectionRoleLoading: boolean
+  isGatewayHost: boolean
+  openvikingUrl: string
   openConnectionSettings: () => void
   saveConnection: (next: ConnectionDraft) => void
   setGeneratedCredential: (credential: GeneratedCredential) => void
@@ -158,7 +160,7 @@ function normalizeConnectionDraft(
     // slash here ran on every keystroke and fought the input: typing the "//"
     // of "http://" kept collapsing back to "http:". Trailing slashes are
     // stripped where the URL is actually used instead (ovClient.setOptions,
-    // detectServerMode, detectConnectionRole, and the admin client).
+    // fetchServerHealth, detectConnectionRole, and the admin client).
     baseUrl: connection.baseUrl.trim(),
     userId: connection.userId.trim(),
   }
@@ -417,7 +419,11 @@ export function resolveSwitchedIdentity(
 export function createManagementAccountConnection(
   connection: ConnectionDraft,
   accountId: string,
+  isGatewayHost = false,
 ): ConnectionDraft {
+  if (isGatewayHost) {
+    return { ...connection, accountId: accountId.trim() }
+  }
   return {
     ...connection,
     accountId: accountId.trim(),
@@ -496,6 +502,10 @@ export function AppConnectionProvider({
 }) {
   const queryClient = useQueryClient()
   const authPromptSuppressedUntilRef = React.useRef(0)
+  const hostDiscoveryRef = React.useRef<Promise<Record<
+    string,
+    unknown
+  > | null> | null>(null)
   const navigate = useNavigate()
   const pathname = useRouterState({
     select: (state) => state.location.pathname,
@@ -524,6 +534,8 @@ export function AppConnectionProvider({
       ),
   )
   const [serverMode, setServerMode] = React.useState<ServerMode>('checking')
+  const [isGatewayHost, setIsGatewayHost] = React.useState(false)
+  const [openvikingUrl, setOpenvikingUrl] = React.useState('')
   const [generatedCredential, setGeneratedCredential] =
     React.useState<GeneratedCredential | null>(null)
 
@@ -541,15 +553,65 @@ export function AppConnectionProvider({
   React.useEffect(() => {
     let cancelled = false
 
+    const isCancelled = () => cancelled
     setServerMode('checking')
-    void detectServerMode(
-      connection.baseUrl,
-      createConnectionHealthHeaders(connection),
-    ).then((mode) => {
-      if (!cancelled) {
-        setServerMode(mode)
+    void (async () => {
+      // A standalone Studio is bound to the gateway serving /studio. Discover
+      // that host without forwarding credentials saved for another server.
+      if (
+        isBrowser() &&
+        window.location.pathname.startsWith('/studio') &&
+        normalizeBaseUrl(connection.baseUrl) !== window.location.origin
+      ) {
+        hostDiscoveryRef.current ??= fetchServerHealth(
+          window.location.origin,
+        ).catch(() => null)
+        const host = await hostDiscoveryRef.current
+        if (isCancelled()) return
+        if (host?.service === 'openviking-gateway') {
+          setIsGatewayHost(true)
+          setOpenvikingUrl(
+            typeof host.openviking_url === 'string' ? host.openviking_url : '',
+          )
+          const next = synchronizeConnectionRuntime(
+            {
+              ...connection,
+              baseUrl: window.location.origin,
+              apiKey: '',
+              adminApiKey: '',
+              accountId: 'default',
+              userId: 'default',
+            },
+            'checking',
+          )
+          queryClient.clear()
+          setConnection(next)
+          return
+        }
       }
-    })
+      let health: Record<string, unknown>
+      try {
+        // The gateway answers an invalid OV key with health minus identity.
+        health = await fetchServerHealth(
+          connection.baseUrl,
+          createConnectionHealthHeaders(connection),
+        )
+      } catch {
+        if (!isCancelled()) setServerMode('offline')
+        return
+      }
+      if (!isCancelled()) {
+        setIsGatewayHost(health.service === 'openviking-gateway')
+        setOpenvikingUrl(
+          typeof health.openviking_url === 'string'
+            ? health.openviking_url
+            : '',
+        )
+        setServerMode(
+          isServerAuthMode(health.auth_mode) ? health.auth_mode : 'api_key',
+        )
+      }
+    })()
 
     return () => {
       cancelled = true
@@ -560,6 +622,7 @@ export function AppConnectionProvider({
     connection.apiKey,
     connection.baseUrl,
     connection.userId,
+    queryClient,
   ])
 
   React.useEffect(() => {
@@ -703,6 +766,8 @@ export function AppConnectionProvider({
       generatedCredential,
       identityScopeKey: createIdentityScopeKey(connection, serverMode),
       isConnectionRoleLoading,
+      isGatewayHost,
+      openvikingUrl,
       openConnectionSettings,
       saveConnection: commitConnection,
       setGeneratedCredential,
@@ -750,7 +815,11 @@ export function AppConnectionProvider({
           throw createConnectionError('rootRequired')
         }
         commitConnection(
-          createManagementAccountConnection(connection, accountId),
+          createManagementAccountConnection(
+            connection,
+            accountId,
+            isGatewayHost,
+          ),
         )
       },
     }
@@ -759,6 +828,8 @@ export function AppConnectionProvider({
     connectionRole,
     generatedCredential,
     isConnectionRoleLoading,
+    isGatewayHost,
+    openvikingUrl,
     navigate,
     openConnectionSettings,
     pathname,
