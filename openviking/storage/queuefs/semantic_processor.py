@@ -35,7 +35,6 @@ from openviking.parse.parsers.media.utils import (
 from openviking.prompts import render_prompt
 from openviking.pyagfs.exceptions import AGFSNotADirectoryError
 from openviking.server.identity import RequestContext, Role
-from openviking.service.task_processing_time import pause_task_processing
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.service.task_work_index import detach_task_context
 from openviking.storage.abstract_overview import (
@@ -282,8 +281,7 @@ class SemanticProcessor(DequeueHandlerBase):
         # Throttle to prevent re-enqueue storm during OPEN window
         wait = self._account_breaker(msg.account_id).retry_after
         if wait > 0:
-            with pause_task_processing():
-                await asyncio.sleep(wait)
+            await asyncio.sleep(wait)
 
         queue_manager = get_queue_manager()
         if queue_manager is not None:
@@ -706,6 +704,8 @@ class SemanticProcessor(DequeueHandlerBase):
                                 file_md5s=msg.file_md5s,
                                 artifact_files=msg.artifact_files,
                                 file_abstracts=msg.file_abstracts,
+                                file_vector_actions=msg.file_vector_actions,
+                                file_ingest_options=msg.file_ingest_options,
                                 telemetry_id=msg.telemetry_id,
                             )
                             await executor.run(run_uri)

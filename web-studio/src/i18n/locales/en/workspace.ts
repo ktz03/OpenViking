@@ -396,7 +396,7 @@ const workspace = {
       totalDuration: 'Total Time',
       processingNotStarted: 'Not started',
       processingDurationHelp:
-        'Worker processing time, including model and I/O calls. Excludes queue and downstream waits; overlapping workers count once. Incomplete or legacy records are unavailable.',
+        'Processing time is wall-clock time after at least one Work is claimed by a worker, including model calls, I/O, downstream waits, and backoff; overlapping workers count once. Waiting time is total time minus processing time, mainly queue and scheduling gaps.',
       processingDuration: 'Processing Time',
       waitingDuration: 'Waiting Time',
       timingUnavailable: 'Not recorded',
@@ -782,6 +782,22 @@ const workspace = {
     },
   },
   settings: {
+    gatewayConnection: {
+      title: 'Sign in to OpenViking Gateway',
+      openvikingUrl: 'This gateway uses OpenViking at {{url}}',
+      apiKey: 'OpenViking API key',
+      keyHint: 'A user, account admin or root API key all work.',
+      wrongKey:
+        "Gateway keys (ovgw_) and gateway management keys (ovgm_) can't be used to sign in. Enter an OpenViking API key.",
+      invalidKey:
+        'OpenViking rejected this API key. Check the key and try again.',
+      unreachable:
+        "The gateway can't reach OpenViking ({{url}}). Make sure OpenViking is running and the gateway's openviking_url (in gateway.conf or OPENVIKING_GATEWAY_OPENVIKING_URL) points to it, then try again.",
+      gatewayUnreachable:
+        "Can't reach this gateway. Make sure it is running, then try again.",
+      connect: 'Sign in',
+      connecting: 'Signing in…',
+    },
     pageTitle: 'Settings',
     tabs: { connection: 'Connection', configuration: 'Server configuration' },
     models: {

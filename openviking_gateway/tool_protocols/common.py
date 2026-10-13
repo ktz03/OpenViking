@@ -209,10 +209,6 @@ class ToolProtocol(ABC):
         return True
 
     @staticmethod
-    def auth_header(key: str) -> dict:
-        return {"authorization": "Bearer " + key}
-
-    @staticmethod
     def is_reply(message: dict) -> bool:
         """Whether a history item belongs to a model reply, so a reply can end at it."""
         return message.get("role") == "assistant"

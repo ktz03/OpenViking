@@ -1,12 +1,15 @@
+import urlVectors from '../../../../../tests/fixtures/gateway_upstream_urls.json'
 import { describe, expect, it } from 'vitest'
 
-import type { Upstream, UpstreamInput, Vendor } from './api'
+import type { Protocol, Upstream, UpstreamInput, Vendor } from './api'
 import {
   PROTOCOLS,
   UPSTREAM_DEFAULTS,
   VENDORS,
   VENDOR_PROTOCOLS,
   baseUrlAfterSwitch,
+  baseUrlChanged,
+  baseUrlCorrection,
   defaultBaseUrl,
   endpointPreview,
   isValidBaseUrl,
@@ -117,8 +120,8 @@ describe('default base URLs', () => {
     ['deepseek', 'chat', 'https://api.deepseek.com'],
     ['deepseek', 'responses', 'https://api.deepseek.com'],
     ['deepseek', 'anthropic', 'https://api.deepseek.com/anthropic'],
-    ['ark', 'anthropic', 'https://ark.cn-beijing.volces.com'],
-    ['byteplus', 'responses', 'https://ark.ap-southeast.bytepluses.com'],
+    ['ark', 'anthropic', 'https://ark.cn-beijing.volces.com/api/compatible'],
+    ['byteplus', 'responses', 'https://ark.ap-southeast.bytepluses.com/api/v3'],
     ['newcomer', 'chat', ''],
   ] as const)('%s + %s → %s', (vendor, protocol, url) => {
     expect(defaultBaseUrl(vendor as Vendor, protocol)).toBe(url)
@@ -172,64 +175,12 @@ describe('base URLs', () => {
     expect(isValidBaseUrl(url)).toBe(valid)
   })
 
-  it.each([
-    [
-      'https://api.openai.com/v1',
-      'generic',
-      '/v1/chat/completions',
-      'https://api.openai.com/v1/chat/completions',
-    ],
-    [
-      'https://api.anthropic.com/',
-      'anthropic',
-      '/v1/messages',
-      'https://api.anthropic.com/v1/messages',
-    ],
-    [
-      'https://host/api/paas/v4',
-      'generic',
-      '/v1/chat/completions',
-      'https://host/api/paas/v4/v1/chat/completions',
-    ],
-    [
-      'https://ark.cn-beijing.volces.com',
-      'ark',
-      '/v1/messages',
-      'https://ark.cn-beijing.volces.com/api/compatible/v1/messages',
-    ],
-    [
-      'https://ark.cn-beijing.volces.com',
-      'ark',
-      '/v1/responses',
-      'https://ark.cn-beijing.volces.com/api/v3/responses',
-    ],
-    [
-      'https://ark.cn-beijing.volces.com/api/v3',
-      'ark',
-      '/v1/chat/completions',
-      'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
-    ],
-    [
-      'https://ark.cn-beijing.volces.com/api/v3',
-      'ark',
-      '/v1/messages',
-      'https://ark.cn-beijing.volces.com/api/v3/api/compatible/v1/messages',
-    ],
-    [
-      'https://ark.ap-southeast.bytepluses.com',
-      'byteplus',
-      '/v1/messages',
-      'https://ark.ap-southeast.bytepluses.com/api/compatible/v1/messages',
-    ],
-    [
-      'https://ark.ap-southeast.bytepluses.com/api/v3',
-      'byteplus',
-      '/v1/responses',
-      'https://ark.ap-southeast.bytepluses.com/api/v3/responses',
-    ],
-  ] as const)('%s (%s) + %s', (base, vendor, path, expected) => {
-    expect(upstreamUrl(base, vendor, path)).toBe(expected)
-  })
+  it.each(urlVectors)(
+    'joins the shared URL vector: $name',
+    ({ base_url, protocol, path, expected }) => {
+      expect(upstreamUrl(base_url, protocol as Protocol, path)).toBe(expected)
+    },
+  )
 
   it('previews the protocol endpoint once the URL is valid', () => {
     expect(endpointPreview(input({ protocol: 'responses' }))).toBe(
@@ -248,7 +199,16 @@ describe('validateUpstream', () => {
     expect(validateUpstream(input({ api_key: '' })).api_key?.key).toBe(
       'validation.apiKeyRequired',
     )
-    expect(validateUpstream(input({ api_key: '' }), stored)).toEqual({})
+    expect(
+      validateUpstream(
+        input({ api_key: '', base_url: stored.base_url }),
+        stored,
+      ),
+    ).toEqual({})
+    // A new address drops the stored key, so a new one is required.
+    expect(validateUpstream(input({ api_key: '' }), stored).api_key?.key).toBe(
+      'validation.apiKeyRequired',
+    )
     expect(
       validateUpstream(input({ api_key: '', auth_mode: 'passthrough' })),
     ).toEqual({})
@@ -259,8 +219,16 @@ describe('validateUpstream', () => {
 
   it('checks headers, aliases and context windows', () => {
     const header = (headers: Record<string, string>) =>
-      validateUpstream(input({ headers }), stored).headers
+      validateUpstream(input({ headers, base_url: stored.base_url }), stored)
+        .headers
     expect(header({ 'OpenAI-Organization': '' })).toBeUndefined()
+    // Stored values are dropped with a new address.
+    expect(
+      validateUpstream(
+        input({ headers: { 'OpenAI-Organization': '' } }),
+        stored,
+      ).headers?.key,
+    ).toBe('validation.headerValue')
     expect(header({ 'X-New': '' })).toEqual({
       key: 'validation.headerValue',
       values: { name: 'X-New' },
@@ -287,7 +255,13 @@ describe('validateUpstream', () => {
       values: { vendor: 'openai', protocol: 'anthropic' },
     })
     expect(
-      validateUpstream(input({ vendor: 'deepseek', protocol: 'anthropic' })),
+      validateUpstream(
+        input({
+          vendor: 'deepseek',
+          protocol: 'anthropic',
+          base_url: 'https://api.deepseek.com/anthropic',
+        }),
+      ),
     ).toEqual({})
   })
 
@@ -336,5 +310,51 @@ describe('replaysReasoning', () => {
     expect(replayReasoningSetting('deepseek', false)).toBe(false)
     expect(replayReasoningSetting('generic', false)).toBeNull()
     expect(replayReasoningSetting('generic', true)).toBe(true)
+  })
+})
+
+describe('URL corrections and changed secrets', () => {
+  it('preserves custom hosts when adding a provider path', () => {
+    expect(
+      baseUrlCorrection(
+        input({ vendor: 'openai', base_url: 'https://proxy.example/' }),
+      ),
+    ).toEqual({ reason: 'missingPath', url: 'https://proxy.example/v1' })
+    expect(
+      baseUrlCorrection(
+        input({ vendor: 'ark', base_url: 'https://ark.example' }),
+      ),
+    ).toEqual({ reason: 'missingPath', url: 'https://ark.example/api/v3' })
+    expect(
+      baseUrlCorrection(
+        input({ vendor: 'generic', base_url: 'https://proxy.example' }),
+      ),
+    ).toBeUndefined()
+  })
+  it('rejects Anthropic bases with /v1 and suggests removing it', () => {
+    const draft = input({
+      protocol: 'anthropic',
+      base_url: 'https://proxy.example/anthropic/v1/',
+    })
+    expect(baseUrlCorrection(draft)).toEqual({
+      reason: 'anthropicVersion',
+      url: 'https://proxy.example/anthropic',
+    })
+    expect(validateUpstream(draft).base_url?.key).toBe(
+      'validation.anthropicBaseUrl',
+    )
+  })
+  it('recognizes address changes but ignores trailing slashes', () => {
+    expect(baseUrlChanged({ base_url: stored.base_url + '/' }, stored)).toBe(
+      false,
+    )
+    expect(baseUrlChanged({ base_url: 'https://other.example' }, stored)).toBe(
+      true,
+    )
+  })
+  it('reads redacted upstream details without header names', () => {
+    expect(
+      toUpstreamInput({ ...stored, header_names: undefined }).headers,
+    ).toEqual({})
   })
 })

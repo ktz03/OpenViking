@@ -1,6 +1,11 @@
 import type * as React from 'react'
 import { Link } from '@tanstack/react-router'
-import { ArrowRightIcon, CheckIcon, ListChecksIcon } from 'lucide-react'
+import {
+  ArrowRightIcon,
+  CheckIcon,
+  ListChecksIcon,
+  TriangleAlertIcon,
+} from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { Button } from '#/components/ui/button'
@@ -15,7 +20,13 @@ import {
 import { cn } from '#/lib/utils'
 
 import { NEW_ID } from '../-lib/search'
-import { useKeys, useProfiles, useUpstreams } from '../-lib/use-gateway'
+import {
+  useGateway,
+  useKeys,
+  useProfiles,
+  useUpstreams,
+} from '../-lib/use-gateway'
+import { ManagementUnlockButton } from './access-notices'
 import { RecommendedProfileButton } from './recommended-profile-button'
 
 type StepState = 'done' | 'current' | 'todo'
@@ -92,6 +103,7 @@ function SetupStep({
  */
 export function OverviewSetup() {
   const { t } = useTranslation('gateway')
+  const { readOnly } = useGateway()
   const upstreams = useUpstreams()
   const profiles = useProfiles()
   const keys = useKeys()
@@ -103,10 +115,22 @@ export function OverviewSetup() {
   const done = [...counts.map((count) => Boolean(count)), false]
   const current = loaded ? done.indexOf(false) : -1
   const stateOf = (index: number): StepState =>
-    done[index] ? 'done' : index === current ? 'current' : 'todo'
+    done[index]
+      ? 'done'
+      : readOnly && index < 2
+        ? 'todo'
+        : index === current
+          ? 'current'
+          : 'todo'
   const variantOf = (index: number) =>
     index === current ? 'default' : 'outline'
   const [upstreamCount = 0, profileCount = 0, keyCount = 0] = counts
+  // Upstreams imported from the server's VLM settings carry a `vlm-` id.
+  const importedCount =
+    upstreams.data?.filter((item) => item.id.startsWith('vlm-')).length ?? 0
+  const blockedUpstreams = (upstreams.data ?? []).filter(
+    (item) => item.coding_plan && !item.allow_coding_plan,
+  )
 
   const viewButton = (
     to: '/gateway/upstreams' | '/gateway/profiles' | '/gateway/keys',
@@ -150,13 +174,52 @@ export function OverviewSetup() {
             state={stateOf(0)}
             title={t('overview.setup.upstream.title')}
             description={
-              done[0]
-                ? t('overview.setup.upstream.done', { count: upstreamCount })
-                : t('overview.setup.upstream.description')
+              <>
+                <p>
+                  {done[0]
+                    ? t(
+                        readOnly
+                          ? 'overview.setup.providedUpstreams'
+                          : !importedCount
+                            ? 'overview.setup.upstream.done'
+                            : importedCount < upstreamCount
+                              ? 'overview.setup.someImportedUpstreams'
+                              : 'overview.setup.importedUpstreams',
+                        { count: upstreamCount, imported: importedCount },
+                      )
+                    : t(
+                        readOnly
+                          ? 'overview.setup.waitUpstreams'
+                          : 'overview.setup.upstream.description',
+                      )}
+                </p>
+                {readOnly
+                  ? null
+                  : blockedUpstreams.map((item) => (
+                      <p
+                        key={item.id}
+                        className="mt-1 flex items-start gap-1.5 text-xs text-amber-800 dark:text-amber-200"
+                      >
+                        <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+                        <span>
+                          {t('overview.setup.codingPlan', { name: item.name })}{' '}
+                          <Link
+                            to="/gateway/upstreams/$upstreamId"
+                            params={{ upstreamId: item.id }}
+                            className="font-medium underline underline-offset-4"
+                          >
+                            {t('overview.setup.confirm')}
+                          </Link>
+                        </span>
+                      </p>
+                    ))}
+              </>
             }
           >
             {done[0] ? (
               viewButton('/gateway/upstreams')
+            ) : readOnly ? (
+              <ManagementUnlockButton />
             ) : (
               <Button
                 size="sm"
@@ -179,12 +242,23 @@ export function OverviewSetup() {
             title={t('overview.setup.profile.title')}
             description={
               done[1]
-                ? t('overview.setup.profile.done', { count: profileCount })
-                : t('overview.setup.profile.description')
+                ? t(
+                    readOnly
+                      ? 'overview.setup.providedProfiles'
+                      : 'overview.setup.profile.done',
+                    { count: profileCount },
+                  )
+                : t(
+                    readOnly
+                      ? 'overview.setup.waitProfiles'
+                      : 'overview.setup.profile.description',
+                  )
             }
           >
             {done[1] ? (
               viewButton('/gateway/profiles')
+            ) : readOnly ? (
+              <ManagementUnlockButton />
             ) : (
               <>
                 <RecommendedProfileButton
@@ -219,7 +293,11 @@ export function OverviewSetup() {
                   <p>{t('overview.setup.key.description')}</p>
                   {loaded && !(done[0] && done[1]) ? (
                     <p className="mt-1 text-xs">
-                      {t('overview.setup.key.blocked')}
+                      {t(
+                        readOnly
+                          ? 'overview.setup.key.waiting'
+                          : 'overview.setup.key.blocked',
+                      )}
                     </p>
                   ) : null}
                 </>

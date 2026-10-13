@@ -27,10 +27,6 @@ class AnthropicProtocol(ToolProtocol):
     signed_thinking = True
 
     @staticmethod
-    def auth_header(key):
-        return {"x-api-key": key}
-
-    @staticmethod
     def thinking_as_text(message):
         content = message.get("content")
         if message.get("role") != "assistant" or not isinstance(content, list):
