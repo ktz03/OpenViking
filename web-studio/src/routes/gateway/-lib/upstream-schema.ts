@@ -84,8 +84,8 @@ const DEFAULT_BASE_URLS: Partial<Record<Vendor, string>> = {
   anthropic: 'https://api.anthropic.com',
   openai: 'https://api.openai.com/v1',
   deepseek: 'https://api.deepseek.com',
-  ark: 'https://ark.cn-beijing.volces.com',
-  byteplus: 'https://ark.ap-southeast.bytepluses.com',
+  ark: 'https://ark.cn-beijing.volces.com/api/v3',
+  byteplus: 'https://ark.ap-southeast.bytepluses.com/api/v3',
 }
 
 /**
@@ -119,6 +119,9 @@ export function defaultBaseUrl(vendor: Vendor, protocol: Protocol): string {
   // DeepSeek serves Anthropic Messages under a path of its own.
   if (vendor === 'deepseek' && protocol === 'anthropic') {
     return 'https://api.deepseek.com/anthropic'
+  }
+  if (ARK_VENDORS.includes(vendor) && protocol === 'anthropic') {
+    return DEFAULT_BASE_URLS[vendor]!.replace('/api/v3', '/api/compatible')
   }
   const known: Partial<Record<string, string>> = DEFAULT_BASE_URLS
   return known[vendor] ?? ''
@@ -183,7 +186,7 @@ export function toUpstreamInput(upstream: Upstream): UpstreamInput {
     ...upstream,
     api_key: '',
     headers: Object.fromEntries(
-      upstream.header_names.map((name) => [name, '']),
+      (upstream.header_names ?? []).map((name) => [name, '']),
     ),
   }
   for (const field of ['id', 'revision', 'has_api_key', 'header_names']) {
@@ -218,30 +221,49 @@ export function isValidBaseUrl(value: string): boolean {
   )
 }
 
-/**
- * Where the gateway sends a request for `path` (a `/v1/…` client path),
- * following its rules: a base ending in `/v1` does not get a second `/v1`;
- * Ark and ModelArk map Messages to `/api/compatible/v1` and everything else
- * to `/api/v3`.
- */
+/** SDK URL joining: OpenAI paths omit /v1; Anthropic paths retain it. */
 export function upstreamUrl(
   baseUrl: string,
-  vendor: Vendor,
+  protocol: Protocol,
   path: string,
 ): string {
   const base = baseUrl.trim().replace(/\/+$/, '')
-  const basePath = new URL(base).pathname.replace(/\/+$/, '')
-  if (ARK_VENDORS.includes(vendor)) {
-    const suffix = path.replace(/^\/v1/, '')
-    const prefix = path.startsWith('/v1/messages')
-      ? '/api/compatible/v1'
-      : '/api/v3'
-    return basePath.endsWith(prefix) ? base + suffix : base + prefix + suffix
+  return (
+    base + (protocol === 'anthropic' ? path : path.replace(/^\/v1(?=\/)/, ''))
+  )
+}
+
+/** A likely URL mistake that the editor can fix without replacing a custom host. */
+export function baseUrlCorrection(
+  upstream: Pick<UpstreamInput, 'base_url' | 'vendor' | 'protocol'>,
+): { reason: 'anthropicVersion' | 'missingPath'; url: string } | undefined {
+  if (!isValidBaseUrl(upstream.base_url)) return undefined
+  const base = upstream.base_url.trim().replace(/\/+$/, '')
+  const path = new URL(base).pathname.replace(/\/+$/, '')
+  if (upstream.protocol === 'anthropic' && path.endsWith('/v1')) {
+    return { reason: 'anthropicVersion', url: base.slice(0, -3) }
   }
-  if (basePath.endsWith('/v1') && path.startsWith('/v1/')) {
-    return base + path.slice(3)
+  if (
+    upstream.protocol !== 'anthropic' &&
+    !path &&
+    ['openai', 'ark', 'byteplus'].includes(upstream.vendor)
+  ) {
+    return {
+      reason: 'missingPath',
+      url: base + (upstream.vendor === 'openai' ? '/v1' : '/api/v3'),
+    }
   }
-  return base + path
+}
+
+/** Matches the backend's normalization when deciding whether stored secrets survive. */
+export function baseUrlChanged(
+  input: Pick<UpstreamInput, 'base_url'>,
+  stored?: Pick<Upstream, 'base_url'>,
+): boolean {
+  const normalize = (url: string) => url.trim().replace(/\/+$/, '')
+  return Boolean(
+    stored && normalize(input.base_url) !== normalize(stored.base_url),
+  )
 }
 
 /**
@@ -253,11 +275,7 @@ export function endpointPreview(
   protocol: Protocol = upstream.protocol,
 ): string {
   if (!isValidBaseUrl(upstream.base_url)) return ''
-  return upstreamUrl(
-    upstream.base_url,
-    upstream.vendor,
-    PROTOCOL_PATHS[protocol],
-  )
+  return upstreamUrl(upstream.base_url, protocol, PROTOCOL_PATHS[protocol])
 }
 
 /**
@@ -286,14 +304,25 @@ export function validateUpstream(
         ? undefined
         : { key: 'validation.baseUrl' }),
   )
+  if (baseUrlCorrection(input)?.reason === 'anthropicVersion') {
+    collect(errors, 'base_url', {
+      key: 'validation.anthropicBaseUrl',
+    })
+  }
   const apiKey = input.api_key.trim()
   if (apiKey.startsWith('sk-ant-oat')) {
     collect(errors, 'api_key', { key: 'validation.subscriptionKey' })
   }
-  if (input.auth_mode === 'managed' && !apiKey && !stored?.has_api_key) {
+  // A new address drops the stored API key and header values.
+  const addressChanged = baseUrlChanged(input, stored)
+  if (
+    input.auth_mode === 'managed' &&
+    !apiKey &&
+    (addressChanged || !stored?.has_api_key)
+  ) {
     collect(errors, 'api_key', { key: 'validation.apiKeyRequired' })
   }
-  const storedHeaders = stored?.header_names ?? []
+  const storedHeaders = addressChanged ? [] : (stored?.header_names ?? [])
   for (const [name, value] of Object.entries(input.headers)) {
     const values = { name }
     if (!name.trim() || /[\r\n]/.test(name + value)) {

@@ -82,6 +82,8 @@ class SemanticMsg:
     artifact_ref: Optional[Dict[str, Any]] = None
     artifact_files: List[str] = field(default_factory=list)
     file_abstracts: Dict[str, str] = field(default_factory=dict)
+    file_vector_actions: Dict[str, str] = field(default_factory=dict)
+    file_ingest_options: Dict[str, IngestOptions] = field(default_factory=dict)
     plan: Optional[SemanticPlan] = None
 
     def __init__(
@@ -113,6 +115,8 @@ class SemanticMsg:
         artifact_ref: Optional[Dict[str, Any]] = None,
         artifact_files: Optional[List[str]] = None,
         file_abstracts: Optional[Dict[str, str]] = None,
+        file_vector_actions: Optional[Dict[str, str]] = None,
+        file_ingest_options: Optional[Dict[str, IngestOptions | Dict[str, Any]]] = None,
         plan: SemanticPlan | Dict[str, Any] | None = None,
         queue_enqueued_at: float = 0.0,
         failure_requeue_count: int = 0,
@@ -148,6 +152,16 @@ class SemanticMsg:
         self.artifact_ref = dict(artifact_ref) if artifact_ref else None
         self.artifact_files = list(artifact_files or [])
         self.file_abstracts = dict(file_abstracts or {})
+        self.file_vector_actions = {}
+        for uri, action in (file_vector_actions or {}).items():
+            normalized_action = str(action)
+            if normalized_action not in {"upsert", "merge"}:
+                raise ValueError(f"unsupported file vector action: {normalized_action}")
+            self.file_vector_actions[str(uri)] = normalized_action
+        self.file_ingest_options = {
+            str(uri): IngestOptions.from_value(options)
+            for uri, options in (file_ingest_options or {}).items()
+        }
         self.plan = (
             plan
             if isinstance(plan, SemanticPlan)
@@ -160,6 +174,9 @@ class SemanticMsg:
         """Convert object to dictionary."""
         data = asdict(self)
         data["ingest_options"] = self.ingest_options.to_dict()
+        data["file_ingest_options"] = {
+            uri: options.to_dict() for uri, options in self.file_ingest_options.items()
+        }
         if self.plan is not None:
             data["plan"] = self.plan.to_dict()
         return data
@@ -227,6 +244,16 @@ class SemanticMsg:
             ),
             file_abstracts=(
                 data.get("file_abstracts") if isinstance(data.get("file_abstracts"), dict) else None
+            ),
+            file_vector_actions=(
+                data.get("file_vector_actions")
+                if isinstance(data.get("file_vector_actions"), dict)
+                else None
+            ),
+            file_ingest_options=(
+                data.get("file_ingest_options")
+                if isinstance(data.get("file_ingest_options"), dict)
+                else None
             ),
             plan=data.get("plan") if isinstance(data.get("plan"), dict) else None,
             queue_enqueued_at=data.get("queue_enqueued_at", 0.0),
