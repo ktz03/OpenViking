@@ -386,7 +386,7 @@ const workspace = {
       totalDuration: '总耗时',
       processingNotStarted: '未开始',
       processingDurationHelp:
-        '仅累计工序实际处理区间，含模型与 I/O 调用；排除排队和等待下游，并行重叠只计一次。旧任务或重启后记录不完整时显示未记录。',
+        '处理耗时为至少一个 Work 已被 Worker 领取后的墙钟时间，包含模型调用、I/O、下游等待和退避，并行重叠只计一次；等待耗时为总耗时减去处理耗时，主要包含排队和调度空档。',
       processingDuration: '处理耗时',
       waitingDuration: '等待耗时',
       timingUnavailable: '未记录',
@@ -750,6 +750,20 @@ const workspace = {
     },
   },
   settings: {
+    gatewayConnection: {
+      title: '登录 OpenViking 网关',
+      openvikingUrl: '这台网关连接的 OpenViking：{{url}}',
+      apiKey: 'OpenViking API 密钥',
+      keyHint: '用户、账号管理员或 Root 的 API 密钥都可以。',
+      wrongKey:
+        '网关密钥（ovgw_）和网关管理密钥（ovgm_）不能用来登录，请输入 OpenViking API 密钥。',
+      invalidKey: 'OpenViking 拒绝了这个 API 密钥。请确认密钥正确后重试。',
+      unreachable:
+        '网关连不上 OpenViking（{{url}}）。确认 OpenViking 正在运行、网关的 openviking_url（gateway.conf 或 OPENVIKING_GATEWAY_OPENVIKING_URL）指向它，然后重试。',
+      gatewayUnreachable: '连不上这台网关。确认网关正在运行后重试。',
+      connect: '登录',
+      connecting: '正在登录…',
+    },
     pageTitle: '设置',
     tabs: { connection: '连接设置', configuration: '服务端配置' },
     models: {

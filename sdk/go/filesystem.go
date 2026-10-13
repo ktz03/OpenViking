@@ -326,6 +326,7 @@ func (c *Client) BatchWrite(
 		setAny(payload, "wait", opts.Wait)
 		setFloatPtr(payload, "timeout", opts.Timeout)
 		setAny(payload, "telemetry", opts.Telemetry)
+		setString(payload, "processing_mode", opts.ProcessingMode)
 		if err := mergeExtra(payload, opts.Extra); err != nil {
 			return nil, err
 		}
