@@ -17,7 +17,9 @@ from .agent_evolution_config import AgentEvolutionConfig
 from .cache_config import CacheConfig
 from .config_loader import resolve_config_path
 from .config_utils import (
+    DEFAULT_SERVICE_NAME,
     format_validation_error,
+    normalize_service_name,
     warn_unknown_config_fields,
     warn_unknown_fields,
 )
@@ -36,7 +38,7 @@ from .ingest_config import IngestConfig
 from .log_config import LogConfig
 from .memory_config import MemoryConfig
 from .oauth_config import OAuthConfig
-from .openviking_gateway_config import OpenVikingGatewayConfig
+from .openviking_gateway_config import EmbeddedGatewayConfig
 from .parser_config import (
     AnydocConfig,
     AudioConfig,
@@ -196,6 +198,10 @@ class OpenVikingConfig(BaseModel):
         default=None,
         description="Deprecated and ignored. User is the only data-plane identity.",
     )
+    service_name: str = Field(
+        default=DEFAULT_SERVICE_NAME,
+        description="OpenViking deployment name shared by cache namespaces and OTel defaults",
+    )
 
     cache: Optional[CacheConfig] = Field(
         default=None,
@@ -319,7 +325,7 @@ class OpenVikingConfig(BaseModel):
         description="External Connector service configuration for data import",
     )
 
-    gateway: OpenVikingGatewayConfig = Field(default_factory=OpenVikingGatewayConfig)
+    gateway: EmbeddedGatewayConfig = Field(default_factory=EmbeddedGatewayConfig)
 
     enable_watch_scheduler: bool = Field(
         default=True,
@@ -374,9 +380,22 @@ class OpenVikingConfig(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _validate_service_name(self) -> "OpenVikingConfig":
+        """Validate and normalize the top-level service name."""
+        self.service_name = normalize_service_name(self.service_name)
+        return self
+
+    @model_validator(mode="after")
     def _validate_cache_runtime_config(self) -> "OpenVikingConfig":
+        """Require the shared cache Provider whenever AGFS selects a cache-backed runtime."""
         agfs = self.storage.agfs
-        uses_canonical_cache = agfs.cachefs.backend == "cache" or agfs.queuefs.backend == "cache"
+        backups = agfs.backups or {}
+        uses_canonical_cache = (
+            agfs.cachefs.backend == "cache"
+            or agfs.queuefs.backend == "cache"
+            or agfs.pathlock.provider == "cache"
+            or backups.get("provider", "filesystem") == "cache"
+        )
         if uses_canonical_cache and self.cache is None:
             raise ValueError("top-level cache config is required when an AGFS backend uses cache")
         return self

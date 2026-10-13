@@ -26,7 +26,7 @@ export function normalizeBaseUrl(baseUrl: string): string {
   return baseUrl.trim().replace(/\/+$/, '')
 }
 
-function isServerAuthMode(value: unknown): value is ServerAuthMode {
+export function isServerAuthMode(value: unknown): value is ServerAuthMode {
   return (
     typeof value === 'string' && SERVER_AUTH_MODES.has(value as ServerAuthMode)
   )
@@ -80,17 +80,5 @@ export async function fetchServerHealth(
       recentHealthRequest = undefined
     }
     throw error
-  }
-}
-
-export async function detectServerMode(
-  baseUrl: string,
-  headers?: Record<string, string>,
-): Promise<ServerMode> {
-  try {
-    const data = await fetchServerHealth(baseUrl, headers)
-    return isServerAuthMode(data.auth_mode) ? data.auth_mode : 'api_key'
-  } catch {
-    return 'offline'
   }
 }

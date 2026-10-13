@@ -249,6 +249,22 @@ describe('createManagementAccountConnection', () => {
   })
 })
 
+it('preserves a root login key and caller identity when selecting a gateway account', () => {
+  const connection = {
+    accountId: 'account-a',
+    userId: 'root',
+    apiKey: 'root-login-key',
+    adminApiKey: '',
+    baseUrl: 'http://localhost:1935',
+  }
+  expect(
+    createManagementAccountConnection(connection, ' account-b ', true),
+  ).toEqual({
+    ...connection,
+    accountId: 'account-b',
+  })
+})
+
 describe('synchronizeConnectionRuntime', () => {
   it('updates the imperative client before React state consumers remount', () => {
     const next = synchronizeConnectionRuntime(

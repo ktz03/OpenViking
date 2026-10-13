@@ -70,12 +70,14 @@ class DeletionService:
         service_loop: asyncio.AbstractEventLoop,
         oauth_store: Any = None,
         usage_audit_runtime: Any = None,
+        gateway_app: Any = None,
     ) -> None:
         self._service = service
         self._manager = manager
         self._service_loop = service_loop
         self._oauth_store = oauth_store
         self._usage_audit_runtime = usage_audit_runtime
+        self._gateway_app = gateway_app
         self._request_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
@@ -307,11 +309,10 @@ class DeletionService:
         try:
             # Settle each started operation before propagating cancellation;
             # the durable message can then resume cleanup after restart.
-            gateway_config = getattr(getattr(self._service, "_config", None), "gateway", None)
-            if gateway_config is not None and gateway_config.enabled:
-                from openviking.service.gateway_deletion import delete_gateway_data
+            if self._gateway_app is not None:
+                from openviking_gateway.app import delete_data
 
-                await run_to_completion(lambda: delete_gateway_data(gateway_config, account_id, user_id))
+                await run_to_completion(lambda: delete_data(self._gateway_app, account_id, user_id))
             scheduler = self._service.watch_scheduler
             if scheduler is not None:
                 await run_to_completion(lambda: scheduler.delete_tasks(account_id, user_id))
@@ -501,6 +502,7 @@ async def setup_deletion(
     manager: Any,
     oauth_store: Any = None,
     usage_audit_runtime: Any = None,
+    gateway_app: Any = None,
 ) -> Optional[DeletionService]:
     """Create the deletion service after storage and authentication are ready."""
     if manager is None or service.viking_fs is None or service._queue_manager is None:
@@ -511,6 +513,7 @@ async def setup_deletion(
         service_loop=asyncio.get_running_loop(),
         oauth_store=oauth_store,
         usage_audit_runtime=usage_audit_runtime,
+        gateway_app=gateway_app,
     )
     await deletion_service.initialize()
     return deletion_service

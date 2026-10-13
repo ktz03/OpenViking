@@ -129,6 +129,14 @@ class Upstream(BaseModel):
             )
         return value.rstrip("/")
 
+    @model_validator(mode="after")
+    def validate_protocol_base(self):
+        if self.protocol == "anthropic" and urlsplit(self.base_url).path.endswith("/v1"):
+            raise ValueError(
+                "Anthropic base_url must not end in /v1; the gateway appends /v1/messages"
+            )
+        return self
+
     @field_validator("headers")
     @classmethod
     def validate_headers(cls, value: dict[str, str]) -> dict[str, str]:
@@ -145,7 +153,8 @@ class Upstream(BaseModel):
 class KeyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str
-    openviking_key: str
+    openviking_key: str = ""
+    user_id: str | None = None
     policy_id: str
     upstream_ids: list[str] = Field(min_length=1)
     models: list[str] = Field(default_factory=list)
