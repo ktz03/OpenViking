@@ -17,6 +17,7 @@ import orjson
 
 from .capture_store import Document
 from .client import VikingError
+from .config import MOUNT_PATH
 from .state_store import get_state
 from .storage import digest
 from .tool_catalog import PREFIX, TOOL_OVERRIDES
@@ -270,7 +271,7 @@ class ToolExecutor:
         if token:
             if not self.public_url:
                 raise ValueError("Set gateway.public_url for client uploads")
-            url = self.public_url + "/gateway/uploads?token=" + quote(token, safe="")
+            url = self.public_url + MOUNT_PATH + "/uploads?token=" + quote(token, safe="")
             for block in value.get("content", []):
                 if block.get("type") == "text":
                     block["text"] = UPLOAD_URL.sub(lambda _: url, block["text"])

@@ -62,7 +62,6 @@ from openviking.server.auth import (
     _extract_api_key,
     get_api_key_manager_or_raise,
     normalize_actor_peer_header,
-    registry_watcher_running,
     resolve_identity,
     should_expose_user_key,
 )
@@ -200,7 +199,7 @@ class _IdentityASGIMiddleware:
             actor_peer_id = normalize_actor_peer_header(
                 request.headers.get("x-openviking-actor-peer")
             )
-            ctx = _build_request_context(
+            ctx = await _build_request_context(
                 request,
                 identity,
                 actor_peer_id=actor_peer_id,
@@ -373,9 +372,7 @@ async def list_users(
     if include_credentials and not should_expose_user_key(request):
         raise PermissionDeniedError("Credential disclosure is disabled in trusted auth mode")
     manager = get_api_key_manager_or_raise(request)
-    if not registry_watcher_running(request):
-        await manager.refresh_account_users_from_store(ctx.account_id)
-    result = manager.get_users_page(
+    result = await manager.list_users_page(
         ctx.account_id,
         limit=limit,
         page=page,
@@ -397,10 +394,8 @@ async def list_groups(context: Context) -> dict[str, Any]:
     """
     ctx = _get_ctx()
     manager = get_api_key_manager_or_raise(context.request_context.request)
-    await manager.ensure_account_groups_loaded(ctx.account_id)
-    return {
-        "groups": [{"group_id": group["group_id"]} for group in manager.get_groups(ctx.account_id)]
-    }
+    groups = await manager.get_groups(ctx.account_id)
+    return {"groups": [{"group_id": group["group_id"]} for group in groups]}
 
 
 @_mcp_error_results()
@@ -1211,9 +1206,9 @@ async def write(
     """Write text to a viking:// file. Use this for files you author yourself (notes, profiles, state), the same way you would use a working directory. To change part of an existing file, prefer the edit tool over a full rewrite. To store a file, document, URL, or repo the user gives you, use add_resource; for a skill, use add_skill. Do not copy its text into a file here instead.
 
     - mode="replace" (default): overwrite the file; creates it and any missing parent directories if needed.
-    - mode="create": fail if the file already exists.
-    - Any new file (whether created by "replace" or "create") must end in one of: .md .txt .json .yaml .yml .toml .py .js .ts
-    - mode="append": append to the end of an existing file; fails if the file does not exist.
+    - mode="create": compatibility alias for replace; overwrite an existing file or create it if missing.
+    - Any new file (whether created by "replace", "append", or "create") must end in one of: .md .txt .json .yaml .yml .toml .py .js .ts
+    - mode="append": append to the end of an existing file; use the supplied content as the initial body if it is missing.
     - acl: optional shared-resource ACL with acl_mode (inherit/restricted) and entries
       (principal=user:<id>/group:<id>/user:*, level=read/write/manage). Explicit ACL
       requires manage on the target, or its parent for a new file. Omit to preserve
@@ -1225,19 +1220,9 @@ async def write(
     ctx = _get_ctx()
     uri = _resolve_mcp_workspace_uri(uri, ctx)
 
-    try:
-        result = await service.fs.write(
-            uri=uri, content=content, ctx=ctx, mode=mode, wait=wait, timeout=timeout, acl=acl
-        )
-    except NotFoundError:
-        if mode != "replace":
-            raise
-        # Replace doubles as create-or-overwrite so agents can save a new file
-        # without first checking whether it exists; strict creation stays
-        # available via mode="create".
-        result = await service.fs.write(
-            uri=uri, content=content, ctx=ctx, mode="create", wait=wait, timeout=timeout, acl=acl
-        )
+    result = await service.fs.write(
+        uri=uri, content=content, ctx=ctx, mode=mode, wait=wait, timeout=timeout, acl=acl
+    )
     written = result.get("written_bytes", 0)
     message = (
         f"Wrote {written} bytes to {result.get('uri', uri)} (mode={result.get('mode', mode)})."

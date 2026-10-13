@@ -62,6 +62,9 @@ class BatchWriteOperation(BaseModel):
     mode: Literal["replace", "append", "create", "upsert"] = "replace"
     # Optional byte revision, checked under the existing file locks before any writes.
     expected_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    tags: list[str] | None = None
+    tag_mode: Literal["replace", "append", "clear"] = "replace"
+    acl: AclSpec | None = None
 
     @model_validator(mode="after")
     def validate_content_shape(self) -> "BatchWriteOperation":
@@ -80,6 +83,7 @@ class BatchWriteRequest(BaseModel):
     telemetry: TelemetryRequest = False
     # Preserve conflicting target files and return their URI/reason while writing other files.
     skip_conflicts: bool = False
+    processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE
 
 
 class SetTagsRequest(BaseModel):
@@ -286,6 +290,7 @@ async def batch_write(
             wait=request.wait,
             timeout=request.timeout,
             skip_conflicts=request.skip_conflicts,
+            processing_mode=request.processing_mode,
         ),
     )
     return Response(

@@ -386,7 +386,7 @@ const workspace = {
       totalDuration: '总耗时',
       processingNotStarted: '未开始',
       processingDurationHelp:
-        '仅累计工序实际处理区间，含模型与 I/O 调用；排除排队和等待下游，并行重叠只计一次。旧任务或重启后记录不完整时显示未记录。',
+        '处理耗时为至少一个 Work 已被 Worker 领取后的墙钟时间，包含模型调用、I/O、下游等待和退避，并行重叠只计一次；等待耗时为总耗时减去处理耗时，主要包含排队和调度空档。',
       processingDuration: '处理耗时',
       waitingDuration: '等待耗时',
       timingUnavailable: '未记录',
@@ -750,6 +750,20 @@ const workspace = {
     },
   },
   settings: {
+    gatewayConnection: {
+      title: '登录 OpenViking 网关',
+      openvikingUrl: '这台网关连接的 OpenViking：{{url}}',
+      apiKey: 'OpenViking API 密钥',
+      keyHint: '用户、账号管理员或 Root 的 API 密钥都可以。',
+      wrongKey:
+        '网关密钥（ovgw_）和网关管理密钥（ovgm_）不能用来登录，请输入 OpenViking API 密钥。',
+      invalidKey: 'OpenViking 拒绝了这个 API 密钥。请确认密钥正确后重试。',
+      unreachable:
+        '网关连不上 OpenViking（{{url}}）。确认 OpenViking 正在运行、网关的 openviking_url（gateway.conf 或 OPENVIKING_GATEWAY_OPENVIKING_URL）指向它，然后重试。',
+      gatewayUnreachable: '连不上这台网关。确认网关正在运行后重试。',
+      connect: '登录',
+      connecting: '正在登录…',
+    },
     pageTitle: '设置',
     tabs: { connection: '连接设置', configuration: '服务端配置' },
     models: {
@@ -1122,9 +1136,9 @@ const workspace = {
         learnMore: '查看 API 密钥获取方式',
         trusted: {
           primary:
-            '当前 Trusted 服务启用了 Root API 密钥校验。浏览器需要配置相同的密钥，才能访问管理接口和租户数据接口。',
+            'Trusted 模式必须使用 Root API 密钥，localhost 也不例外。请在上方“Root 或管理员 API 密钥”中填入服务端的 root key。',
           secondary:
-            '请向部署管理员索取 Root API 密钥；它位于服务端 ov.conf 的 server.root_api_key。Trusted 模式的数据身份由账号和用户断言确定，不需要用户 API 密钥。',
+            '请向部署管理员索取密钥。如果服务端还没配置，请在服务端 ov.conf 中设置非空的 server.root_api_key，然后重启服务，并在这里填写同一个值。无需另外生成用户 API 密钥。',
           title: 'Trusted 服务需要 Root API 密钥',
         },
       },
@@ -1136,6 +1150,10 @@ const workspace = {
         primary: '该服务器配置了 {{mode}} 认证。',
         title: '不支持的认证模式',
       },
+      trustedRootHint:
+        '填写服务端 ov.conf 中的 server.root_api_key；Trusted 模式的管理和数据访问都使用它。',
+      trustedUserHint:
+        'Trusted 模式无需单独的用户 API 密钥，数据身份由账号和用户名决定。',
       userHint: '供文件系统和租户数据 API 使用。',
     },
     connectionPage: {
@@ -1206,6 +1224,8 @@ const workspace = {
         dataKeyRequired: '需要用户或账号管理员 API 密钥',
         rootAvailable: 'Root 管理权限可用',
         tenantDataAvailable: '租户数据访问可用',
+        trustedKeyRequired:
+          '需要 Root API 密钥，请填写服务端 ov.conf 中的 server.root_api_key',
         trustedIdentityRequired: 'Trusted 模式的数据访问需要账号和用户信息',
       },
       state: {
