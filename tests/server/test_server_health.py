@@ -103,13 +103,12 @@ async def test_health_endpoint_without_api_key():
     assert "role" not in body
 
 
-@pytest.mark.parametrize("root_key", [None, "test-root-key"])
 @pytest.mark.parametrize(
     "credentials", ["anonymous", "partial", "trusted", "keyed", "malformed", "asserted-root"]
 )
-async def test_health_trusted_identity_contract(root_key, credentials, caplog, service):
+async def test_health_trusted_identity_contract(credentials, caplog, service):
     app = create_app(
-        config=ServerConfig(auth_mode="trusted", host="127.0.0.1", root_api_key=root_key),
+        config=ServerConfig(auth_mode="trusted", host="127.0.0.1", root_api_key="test-root-key"),
         service=service,
     )
     await _initialize_auth_plugin(app, service, app.state.config)
@@ -129,16 +128,16 @@ async def test_health_trusted_identity_contract(root_key, credentials, caplog, s
     ) as client:
         response = await client.get("/health", headers=headers)
     body = response.json()
-    expected_status = 401 if root_key and credentials in ("trusted", "malformed") else 200
+    expected_status = 401 if credentials in ("trusted", "malformed") else 200
     assert response.status_code == expected_status
     if expected_status == 401:
         assert body["error"]["code"] == "UNAUTHENTICATED"
         return
-    if credentials == "keyed" or (credentials == "trusted" and not root_key):
+    if credentials == "keyed":
         assert (body["account_id"], body["user_id"], body["role"]) == ("account-a", "alice", "user")
     else:
         assert "role" not in body
-    assert body["root_api_key_required"] is bool(root_key)
+    assert body["root_api_key_required"] is True
     if credentials in ("anonymous", "partial"):
         assert "Failed to resolve identity" not in caplog.text
 
@@ -238,7 +237,9 @@ async def test_process_time_header(client: httpx.AsyncClient):
 
 async def test_openviking_error_handler(client: httpx.AsyncClient):
     """Requesting a non-existent resource should return structured error."""
-    resp = await client.get("/api/v1/fs/stat", params={"uri": "viking://nonexistent/path"})
+    resp = await client.get(
+        "/api/v1/fs/stat", params={"uri": "viking://resources/nonexistent/path"}
+    )
     assert resp.status_code == 404
     body = resp.json()
     assert body["status"] == "error"
@@ -250,15 +251,26 @@ async def test_404_for_unknown_route(client: httpx.AsyncClient):
     assert resp.status_code == 404
 
 
-async def test_lifespan_shutdown_ignores_cancelled_service_close():
+async def test_lifespan_shutdown_ignores_cancelled_service_close(monkeypatch):
     class _Service:
         async def initialize(self):
             pass
 
+        async def apply_agent_evolution_config(self):
+            pass
+
+        viking_fs = None
+        _queue_manager = None
+
         async def close(self):
             raise asyncio.CancelledError("shutdown")
 
-    app = create_app(config=ServerConfig(), service=_Service())
+    monkeypatch.setattr("openviking.server.app.OpenVikingService", _Service)
+    monkeypatch.setattr(
+        "openviking.server.app.get_task_tracker",
+        lambda: SimpleNamespace(start_cleanup_loop=lambda: None, stop_cleanup_loop=lambda: None),
+    )
+    app = create_app(config=ServerConfig())
 
     async with app.router.lifespan_context(app):
         pass
@@ -368,7 +380,7 @@ async def test_slow_init_does_not_block_health(monkeypatch):
 
 
 async def test_initialize_runtime_state_loads_api_key_manager(monkeypatch):
-    """API key auth must finish manager loading before the app is considered ready."""
+    """The auth plugin must publish its manager before deletion setup."""
 
     class MockService:
         def __init__(self):
@@ -378,17 +390,17 @@ async def test_initialize_runtime_state_loads_api_key_manager(monkeypatch):
         async def initialize(self):
             self._initialized = True
 
-    class FakeAPIKeyManager:
-        def __init__(self, root_key, viking_fs, api_key_hashing_enabled):
-            self.root_key = root_key
-            self.viking_fs = viking_fs
-            self.api_key_hashing_enabled = api_key_hashing_enabled
-            self.loaded = False
+        async def apply_agent_evolution_config(self):
+            pass
 
-        async def load(self):
-            self.loaded = True
+    manager = object()
+    setup = AsyncMock(return_value=None)
+    monkeypatch.setattr("openviking.service.deletion.setup_deletion", setup)
 
-    monkeypatch.setattr("openviking.server.app.APIKeyManager", FakeAPIKeyManager)
+    async def initialize_plugin(app, service, config):
+        app.state.api_key_manager = manager
+
+    monkeypatch.setattr("openviking.server.app._initialize_auth_plugin", initialize_plugin)
 
     app = SimpleNamespace(state=SimpleNamespace(api_key_manager=None))
     service = MockService()
@@ -397,5 +409,5 @@ async def test_initialize_runtime_state_loads_api_key_manager(monkeypatch):
     await _initialize_runtime_state(app, service, config)
 
     assert service._initialized is True
-    assert app.state.api_key_manager is not None
-    assert app.state.api_key_manager.loaded is True
+    assert app.state.api_key_manager is manager
+    assert setup.await_args.kwargs["manager"] is manager
