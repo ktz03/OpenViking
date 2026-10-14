@@ -1,3 +1,14 @@
+import * as React from 'react'
+import { Link } from '@tanstack/react-router'
+import { Button } from '#/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '#/components/ui/dialog'
 import { useMutation } from '@tanstack/react-query'
 import { LoaderCircleIcon, PlugZapIcon, Trash2Icon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
@@ -5,12 +16,19 @@ import { toast } from 'sonner'
 
 import { cn } from '#/lib/utils'
 
-import { deleteUpstream, testUpstream, toGatewayError } from '../-lib/api'
+import {
+  deleteUpstream,
+  saveUpstream,
+  testUpstream,
+  toGatewayError,
+} from '../-lib/api'
 import type { Upstream, UpstreamTestResult } from '../-lib/api'
+import { toastGatewayError } from '../-lib/error-toast'
 import { gatewayErrorMessage } from '../-lib/localize'
 import type { Translate } from '../-lib/localize'
 import { useGateway } from '../-lib/use-gateway'
-import { ConfirmDialog } from './confirm-dialog'
+import { toUpstreamInput } from '../-lib/upstream-schema'
+import { Notice } from './notice'
 import { ExplainedButton } from './explained-button'
 import { ToneBadge } from './status-badges'
 import type { Tone } from './status-badges'
@@ -40,31 +58,60 @@ export function describeTest(t: Translate, outcome: TestOutcome): TestSummary {
       explanation: gatewayErrorMessage(t, outcome.error),
     }
   }
+  const withUrl = (message: string) =>
+    result.url ? `${message} ${result.url}` : message
+  if (
+    result.reason === 'models_unavailable' ||
+    result.status === 404 ||
+    result.status === 405 ||
+    result.reason === 'rate_limited' ||
+    result.status === 429
+  ) {
+    return {
+      tone: 'neutral',
+      label: t('upstreams.test.result.unverified', { status: result.status }),
+      explanation: withUrl(
+        t(
+          result.reason === 'rate_limited' || result.status === 429
+            ? 'upstreams.test.explain.rateLimited'
+            : 'upstreams.test.explain.notFound',
+        ),
+      ),
+    }
+  }
+  if (result.reason === 'upstream_key_missing') {
+    return {
+      tone: 'danger',
+      label: t('upstreams.credentials.keyMissing'),
+      explanation: t('errors.reasons.upstream_key_missing'),
+    }
+  }
   if (result.status === undefined) {
     return {
       tone: 'danger',
       label: t('upstreams.test.result.unreachable'),
-      explanation: t('upstreams.test.explain.unreachable'),
+      explanation: withUrl(t('upstreams.test.explain.unreachable')),
     }
   }
   const { status } = result
-  if (result.ok) {
+  if (result.ok && result.reason !== 'upstream_key_rejected') {
     return {
       tone: 'success',
       label: t('upstreams.test.result.ok', { status }),
       explanation: t('upstreams.test.explain.ok'),
     }
   }
+  // 404 and 405 were answered above as reachable but unverified.
   const explanation =
-    status === 401 || status === 403
+    result.reason === 'upstream_key_rejected' ||
+    status === 401 ||
+    status === 403
       ? t('upstreams.test.explain.auth')
-      : status === 404
-        ? t('upstreams.test.explain.notFound')
-        : t('upstreams.test.explain.status', { status })
+      : t('upstreams.test.explain.status', { status })
   return {
     tone: 'danger',
     label: t('upstreams.test.result.failed', { status }),
-    explanation,
+    explanation: withUrl(explanation),
   }
 }
 
@@ -145,12 +192,12 @@ export function UpstreamTest({
 }
 
 type DeleteUpstreamButtonProps = {
-  /** Keys that use the upstream; deleting is blocked while there are any. */
+  /** Known keys that use the upstream; the server confirms conflicts. */
   usedBy: number | undefined
   onClick: () => void
 }
 
-/** Header Delete button, disabled with the reason while keys use the upstream. */
+/** Header Delete button; the server checks whether keys still use it. */
 export function DeleteUpstreamButton({
   usedBy,
   onClick,
@@ -162,7 +209,6 @@ export function DeleteUpstreamButton({
       type="button"
       variant="destructive"
       size="sm"
-      disabled={blocked}
       explanation={
         blocked ? t('upstreams.delete.blocked', { count: usedBy }) : undefined
       }
@@ -189,27 +235,101 @@ export function DeleteUpstreamDialog({
 }: DeleteUpstreamDialogProps) {
   const { t } = useTranslation('gateway')
   const { connection, invalidate } = useGateway()
+  const [conflict, setConflict] = React.useState<number | null>(null)
+  React.useEffect(() => setConflict(null), [upstream?.id])
+  const disable = useMutation({
+    mutationFn: (target: Upstream) =>
+      saveUpstream(connection, target.id, {
+        ...toUpstreamInput(target),
+        enabled: false,
+      }),
+    onSuccess: async () => {
+      onOpenChange(false)
+      await invalidate('upstreams')
+    },
+    onError: (error) => toastGatewayError(t, error),
+  })
   const remove = useMutation({
     mutationFn: (target: Upstream) => deleteUpstream(connection, target.id),
     onSuccess: async (_result, target) => {
       toast.success(t('upstreams.toast.deleted', { name: target.name }))
+      onOpenChange(false)
       onDeleted?.()
       await invalidate('upstreams')
     },
     onError: async (error) => {
-      toast.error(gatewayErrorMessage(t, error))
-      if (toGatewayError(error).reason === 'conflict') await invalidate('keys')
+      const failure = toGatewayError(error)
+      if (failure.reason === 'in_use') {
+        setConflict(failure.keyCount ?? 0)
+        await invalidate('keys')
+      } else toastGatewayError(t, error)
     },
   })
+  const pending = remove.isPending || disable.isPending
   return (
-    <ConfirmDialog
+    <Dialog
       open={upstream !== null}
-      onOpenChange={onOpenChange}
-      title={t('upstreams.delete.title', { name: upstream?.name ?? '' })}
-      description={t('upstreams.delete.description')}
-      confirmLabel={t('upstreams.delete.confirm')}
-      icon={<Trash2Icon />}
-      onConfirm={() => (upstream ? remove.mutateAsync(upstream) : undefined)}
-    />
+      onOpenChange={(open) => {
+        if (!pending) onOpenChange(open)
+      }}
+    >
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>
+            {t('upstreams.delete.title', { name: upstream?.name ?? '' })}
+          </DialogTitle>
+          <DialogDescription>
+            {t('upstreams.delete.description')}
+          </DialogDescription>
+        </DialogHeader>
+        {conflict !== null ? (
+          <Notice tone="warning">
+            <p>{t('upstreams.delete.inUse', { count: conflict })}</p>
+            {upstream?.enabled ? (
+              <p>{t('upstreams.delete.disableHint')}</p>
+            ) : null}
+            <Link
+              to="/gateway/keys"
+              className="justify-self-start font-medium underline underline-offset-4"
+            >
+              {t('actions.viewKeys')}
+            </Link>
+          </Notice>
+        ) : null}
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            disabled={pending}
+            onClick={() => onOpenChange(false)}
+          >
+            {t('actions.cancel')}
+          </Button>
+          {conflict !== null ? (
+            upstream?.enabled ? (
+              <Button
+                type="button"
+                disabled={pending}
+                onClick={() => disable.mutate(upstream)}
+              >
+                {t('upstreams.delete.disable')}
+              </Button>
+            ) : null
+          ) : (
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={pending}
+              onClick={() => {
+                if (upstream) remove.mutate(upstream)
+              }}
+            >
+              <Trash2Icon />
+              {t('upstreams.delete.confirm')}
+            </Button>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }

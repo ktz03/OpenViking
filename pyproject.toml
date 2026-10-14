@@ -29,7 +29,11 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-    "openviking-sdk>=0.1.9",
+    "aiohttp>=3.13.3",
+    "async-timeout>=5.0.1",
+    "orjson>=3.11.7",
+    "packaging>=24.0",
+    "openviking-sdk>=0.1.15",
     "pydantic>=2.0.0",
     "typing-extensions>=4.5.0",
     "pyyaml>=6.0",
@@ -89,12 +93,6 @@ dependencies = [
 
 
 [project.optional-dependencies]
-gateway = [
-    "aiohttp>=3.13.3",
-    "async-timeout>=5.0.1",
-    "orjson>=3.11.7",
-    "packaging>=24.0",
-]
 gateway-fast = [
     "uvloop>=0.21; sys_platform != 'win32'",
     "httptools>=0.6",

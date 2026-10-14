@@ -20,6 +20,8 @@ import uvicorn
 
 from openviking.server.app import (
     WORKER_BOT_API_URL_ENV,
+    WORKER_HOST_ENV,
+    WORKER_PORT_ENV,
     WORKER_WITH_BOT_ENV,
     create_app,
 )
@@ -130,6 +132,19 @@ def _resolve_cli_config_for_bot(config_path: Optional[str]) -> Optional[str]:
 
 
 def main():
+    """Run the CLI with one recovery attempt for remote restart startup failures."""
+    from openviking.server.restart import RestartRecovery
+
+    recovery = RestartRecovery()
+    try:
+        _main(recovery)
+    except (Exception, SystemExit) as exc:
+        if not isinstance(exc, SystemExit) or exc.code not in (None, 0):
+            recovery.rollback()
+        raise
+
+
+def _main(recovery):
     """Main entry point for openviking-server command."""
     parser = argparse.ArgumentParser(
         description="OpenViking HTTP Server",
@@ -276,6 +291,9 @@ def main():
     if args.with_bot:
         config.with_bot = True
 
+    if recovery.pending and config.workers > 1:
+        raise ValueError("Remote restart recovery requires a single worker")
+
     bot_process: Optional[BotProcess] = None
     if config.with_bot:
         import secrets
@@ -311,23 +329,31 @@ def main():
             )
             sys.exit(1)
 
-    # Create and run server app
-    app = create_app(
-        config,
-        config_path=(
-            str(resolved_config_path) if resolved_config_path is not None else args.config
-        ),
-    )
-    workers_info = f" (workers: {config.workers})" if config.workers > 1 else ""
-    print(f"OpenViking HTTP Server is running on {config.host}:{config.port}{workers_info}")
-
+    restart_requested = False
     try:
+        # Create and run server app
+        app = create_app(
+            config,
+            server_overrides={
+                key: getattr(config, key)
+                for key in ("host", "port", "workers", "with_bot")
+                if getattr(args, key) is not None and (key != "with_bot" or args.with_bot)
+            },
+            config_path=(
+                str(resolved_config_path) if resolved_config_path is not None else args.config
+            ),
+        )
+        workers_info = f" (workers: {config.workers})" if config.workers > 1 else ""
+        print(f"OpenViking HTTP Server is running on {config.host}:{config.port}{workers_info}")
+
         workers = config.workers
         if workers > 1:
             # Multi-worker mode requires an import string so each worker
             # can independently import the application.  We stash the
             # resolved config path in an env-var so that the factory can
             # pick it up (ServerConfig already reads OPENVIKING_CONFIG_FILE).
+            os.environ[WORKER_HOST_ENV] = config.host or ""
+            os.environ[WORKER_PORT_ENV] = str(config.port)
             os.environ[WORKER_WITH_BOT_ENV] = "1" if config.with_bot else "0"
             os.environ[WORKER_BOT_API_URL_ENV] = config.bot_api_url
             uvicorn.run(
@@ -340,8 +366,9 @@ def main():
                 log_config=None,
             )
         else:
-            uvicorn.run(
+            restart_requested = _run_restartable_server(
                 app,
+                recovery=recovery,
                 host=config.host,
                 port=config.port,
                 timeout_keep_alive=config.timeout_keep_alive,
@@ -351,6 +378,33 @@ def main():
         # Cleanup vikingbot process on shutdown
         if bot_process is not None:
             _stop_vikingbot_gateway(bot_process)
+    if restart_requested:
+        # Preserve the interpreter, CLI arguments, cwd and environment. Replacing
+        # this process also keeps its PID and relationship to systemd/Docker.
+        if resolved_config_path is not None:
+            os.environ[OPENVIKING_CONFIG_ENV] = str(resolved_config_path)
+        os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
+
+
+def _run_restartable_server(app, recovery=None, **kwargs) -> bool:
+    from openviking.server.restart import RestartController
+
+    server = uvicorn.Server(uvicorn.Config(app, **kwargs))
+    controller = RestartController(lambda: setattr(server, "should_exit", True), recovery)
+    app.state.restart_controller = controller
+    if recovery is not None:
+        startup = server.startup
+
+        async def startup_with_recovery(*args, **kwargs):
+            await startup(*args, **kwargs)
+            if server.started:
+                recovery.ready()
+
+        server.startup = startup_with_recovery
+    server.run()
+    if recovery is not None and recovery.pending:
+        raise RuntimeError("Server failed to complete startup")
+    return controller.requested
 
 
 def _handle_vikingbot_failure(output: str, returncode: int) -> None:

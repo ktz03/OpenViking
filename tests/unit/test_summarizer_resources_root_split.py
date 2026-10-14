@@ -7,7 +7,8 @@ from unittest.mock import patch
 import pytest
 
 from openviking.server.identity import RequestContext, Role
-from openviking.utils.summarizer import Summarizer
+from openviking.utils.ingest_options import IngestOptions
+from openviking.utils.summarizer import FileRefreshRequest, Summarizer
 from openviking_cli.session.user_id import UserIdentifier
 
 
@@ -220,7 +221,11 @@ async def test_flat_file_refresh_enqueues_incremental_parent_summary():
             skip_vectorization=False,
         )
 
-    assert result == {"status": "success", "enqueued_count": 1}
+    assert result == {
+        "status": "success",
+        "enqueued_count": 1,
+        "semantic_action": "refresh_now",
+    }
     assert len(queue.msgs) == 1
     msg = queue.msgs[0]
     assert msg.uri == "viking://resources"
@@ -230,6 +235,66 @@ async def test_flat_file_refresh_enqueues_incremental_parent_summary():
     assert msg.role == Role.ROOT
     assert msg.telemetry_id == "tid"
     assert wait_tracker.registered == [("tid", msg.id)]
+
+
+@pytest.mark.asyncio
+async def test_grouped_file_refresh_coalesces_only_direct_parents():
+    queue = _DummyQueue()
+    qm = _DummyQueueManager(queue)
+    wait_tracker = _DummyWaitTracker()
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.ROOT)
+
+    with (
+        patch("openviking.utils.summarizer.get_queue_manager", return_value=qm),
+        patch(
+            "openviking.utils.summarizer.get_current_telemetry",
+            return_value=SimpleNamespace(telemetry_id="tid"),
+        ),
+        patch(
+            "openviking.utils.summarizer.get_request_wait_tracker",
+            return_value=wait_tracker,
+        ),
+    ):
+        result = await Summarizer(vlm_processor=None).refresh_file_parents(
+            changes=[
+                FileRefreshRequest(
+                    "viking://resources/docs/a.md",
+                    created=True,
+                    md5="a",
+                    vector_action="upsert",
+                    ingest_options=IngestOptions(search_tags=["team=search"]),
+                ),
+                FileRefreshRequest("viking://resources/docs/b.md", md5="b"),
+                FileRefreshRequest("viking://resources/src/main.py", md5="c"),
+            ],
+            ctx=ctx,
+        )
+
+    assert result["enqueued_count"] == 2
+    assert result["parent_actions"] == {
+        "viking://resources/docs": "refresh_now",
+        "viking://resources/src": "refresh_now",
+    }
+    assert len(queue.msgs) == 2
+    messages = {msg.uri: msg for msg in queue.msgs}
+    assert messages["viking://resources/docs"].changes == {
+        "added": ["viking://resources/docs/a.md"],
+        "modified": ["viking://resources/docs/b.md"],
+    }
+    assert messages["viking://resources/docs"].file_md5s == {
+        "viking://resources/docs/a.md": "a",
+        "viking://resources/docs/b.md": "b",
+    }
+    assert messages["viking://resources/docs"].file_vector_actions == {
+        "viking://resources/docs/a.md": "upsert"
+    }
+    assert messages["viking://resources/docs"].file_ingest_options == {
+        "viking://resources/docs/a.md": IngestOptions(search_tags=["team=search"])
+    }
+    assert messages["viking://resources/src"].changes == {
+        "modified": ["viking://resources/src/main.py"]
+    }
+    assert messages["viking://resources/src"].file_vector_actions == {}
 
 
 @pytest.mark.asyncio

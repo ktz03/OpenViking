@@ -35,7 +35,6 @@ from openviking.parse.parsers.media.utils import (
 from openviking.prompts import render_prompt
 from openviking.pyagfs.exceptions import AGFSNotADirectoryError
 from openviking.server.identity import RequestContext, Role
-from openviking.service.task_processing_time import pause_task_processing
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.service.task_work_index import detach_task_context
 from openviking.storage.abstract_overview import (
@@ -52,6 +51,7 @@ from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.index_action import FieldPatch
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.process_result import ProcessResult
+from openviking.storage.queuefs.retry_policy import MAX_FAILURE_REQUEUE_COUNT
 from openviking.storage.queuefs.semantic_executor import SemanticTreeExecutor, SemanticTreeStats
 from openviking.storage.queuefs.semantic_lock import SemanticLockScope
 from openviking.storage.queuefs.semantic_msg import SemanticMsg, build_semantic_coalesce_key
@@ -281,8 +281,7 @@ class SemanticProcessor(DequeueHandlerBase):
         # Throttle to prevent re-enqueue storm during OPEN window
         wait = self._account_breaker(msg.account_id).retry_after
         if wait > 0:
-            with pause_task_processing():
-                await asyncio.sleep(wait)
+            await asyncio.sleep(wait)
 
         queue_manager = get_queue_manager()
         if queue_manager is not None:
@@ -328,7 +327,20 @@ class SemanticProcessor(DequeueHandlerBase):
         error: Exception,
         *,
         work: SemanticMessageWork,
+        consume_failure_budget: bool = True,
     ) -> ProcessResult:
+        if consume_failure_budget and msg.failure_requeue_count >= MAX_FAILURE_REQUEUE_COUNT:
+            terminal_error = f"{error} (failure requeue limit reached: {MAX_FAILURE_REQUEUE_COUNT})"
+            logger.error("Semantic message reached failure requeue limit: %s", msg.uri)
+            self._merge_request_stats(msg.telemetry_id, error_count=1)
+            get_request_wait_tracker().mark_semantic_failed(
+                msg.telemetry_id, msg.id, terminal_error
+            )
+            await self._cleanup_local_artifact(msg)
+            return ProcessResult.failed(terminal_error)
+
+        if consume_failure_budget:
+            msg.failure_requeue_count += 1
         try:
             await work.reenqueue_after_error()
             self._merge_request_stats(msg.telemetry_id, requeue_count=1)
@@ -692,6 +704,8 @@ class SemanticProcessor(DequeueHandlerBase):
                                 file_md5s=msg.file_md5s,
                                 artifact_files=msg.artifact_files,
                                 file_abstracts=msg.file_abstracts,
+                                file_vector_actions=msg.file_vector_actions,
+                                file_ingest_options=msg.file_ingest_options,
                                 telemetry_id=msg.telemetry_id,
                             )
                             await executor.run(run_uri)
@@ -743,11 +757,15 @@ class SemanticProcessor(DequeueHandlerBase):
                     exc_info=True,
                 )
                 if msg is not None and work is not None:
-                    return await self._requeue_semantic_msg_after_error(
+                    result = await self._requeue_semantic_msg_after_error(
                         msg,
                         e,
                         work=work,
+                        consume_failure_budget=False,
                     )
+                    if result.error is not None:
+                        execute_status = "error"
+                    return result
                 return ProcessResult.failed(str(e))
 
             error_class = classify_api_error(e)
@@ -794,11 +812,14 @@ class SemanticProcessor(DequeueHandlerBase):
                 if breaker is not None:
                     breaker.record_failure(e)
                 if msg is not None and work is not None:
-                    return await self._requeue_semantic_msg_after_error(
+                    result = await self._requeue_semantic_msg_after_error(
                         msg,
                         e,
                         work=work,
                     )
+                    if result.error is not None:
+                        execute_status = "error"
+                    return result
                 return ProcessResult.failed(str(e))
         finally:
             if msg is not None and execute_started_at is not None:

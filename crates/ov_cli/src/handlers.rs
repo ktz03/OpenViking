@@ -415,7 +415,7 @@ pub async fn handle_restore(
     .await
 }
 
-use crate::{SystemBackendCommands, SystemCommands};
+use crate::SystemCommands;
 
 pub async fn handle_system(cmd: SystemCommands, ctx: CliContext) -> Result<()> {
     let client = ctx.get_client();
@@ -440,16 +440,6 @@ pub async fn handle_system(cmd: SystemCommands, ctx: CliContext) -> Result<()> {
             commands::system::consistency(&client, &uri, ctx.output_format, ctx.compact).await
         }
         SystemCommands::Crypto { action } => commands::crypto::handle_crypto(action).await,
-        SystemCommands::Backend { action } => match action {
-            SystemBackendCommands::SyncStatus { uri } => {
-                commands::system::backend_sync_status(&client, &uri, ctx.output_format, ctx.compact)
-                    .await
-            }
-            SystemBackendCommands::SyncRetry { uri } => {
-                commands::system::backend_sync_retry(&client, &uri, ctx.output_format, ctx.compact)
-                    .await
-            }
-        },
     }
 }
 
@@ -1375,9 +1365,10 @@ fn validating_target_config(language: Language) -> &'static str {
     }
 }
 
-pub async fn handle_read(uri: String, ctx: CliContext) -> Result<()> {
+/// Read a URI with a zero-based offset and line count; -1 reads through EOF.
+pub async fn handle_read(uri: String, offset: i64, limit: i64, ctx: CliContext) -> Result<()> {
     let client = ctx.get_client();
-    commands::content::read(&client, &uri, ctx.output_format, ctx.compact).await
+    commands::content::read(&client, &uri, offset, limit, ctx.output_format, ctx.compact).await
 }
 
 pub async fn handle_abstract(uri: String, ctx: CliContext) -> Result<()> {

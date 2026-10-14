@@ -118,9 +118,13 @@ export interface BatchWriteOperation {
   content?: string;
   contentBase64?: string;
   mode?: "replace" | "append" | "create" | "upsert";
+  tags?: string[];
+  tagMode?: "replace" | "append" | "clear";
+  acl?: AclSpec;
 }
 /** Batch-write request options. */
 export interface BatchWriteOptions extends WaitOptions {
+  processingMode?: ProcessingMode;
   extra?: JsonObject;
 }
 /** Compile request options. */
