@@ -61,6 +61,7 @@ import {
 } from '#/hooks/use-app-connection'
 import type { ServerMode } from '#/hooks/use-server-mode'
 import { cn } from '#/lib/utils'
+import { useGateway } from '#/routes/gateway/-lib/use-gateway'
 import { resolveStudioManagementCapabilities } from '#/lib/studio-permissions'
 
 type NavItem = {
@@ -295,6 +296,26 @@ export function ConnectionScopedRouteContent({
   return serverMode === 'checking' ? null : children
 }
 
+/**
+ * Every signed-in user of an OpenViking server sees the gateway entry, even
+ * while the gateway is off: the page explains how to turn it on.
+ */
+export function shouldShowGatewayNavigation({
+  isGatewayHost,
+  serverMode,
+  allowed,
+}: {
+  isGatewayHost: boolean
+  serverMode: ServerMode
+  /** `useGateway().allowed`: the gateway can be asked for /access. */
+  allowed: boolean
+}): boolean {
+  return (
+    isGatewayHost ||
+    (serverMode !== 'checking' && serverMode !== 'offline' && allowed)
+  )
+}
+
 function AppShellInner({ children }: { children: React.ReactNode }) {
   const { i18n, t } = useTranslation(['appShell', 'common'])
   const navigate = useNavigate()
@@ -313,13 +334,18 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   }/api/01-overview`
   const [crossDeviceVerifyOpen, setCrossDeviceVerifyOpen] =
     React.useState(false)
-  const { connection, connectionRole, isConnectionRoleLoading, serverMode } =
-    useAppConnection()
+  const {
+    connection,
+    connectionRole,
+    isConnectionRoleLoading,
+    isGatewayHost,
+    serverMode,
+  } = useAppConnection()
   const settingsActive = pathname === '/settings'
   const usersActive = pathname === '/users' || pathname.startsWith('/users/')
-  const contextGatewayActive =
-    pathname === '/context-gateway' || pathname.startsWith('/context-gateway/')
-  const { canManageUsers } = resolveStudioManagementCapabilities({
+  const gatewayActive =
+    pathname === '/gateway' || pathname.startsWith('/gateway/')
+  const capabilities = resolveStudioManagementCapabilities({
     hasControlCredential: Boolean(connection.adminApiKey.trim()),
     isRoleLoading: isConnectionRoleLoading,
     role: connectionRole,
@@ -328,6 +354,15 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
   const crossDeviceVerifyActive =
     pathname === '/oauth/verify' || pathname.startsWith('/oauth/verify/')
   const visibleNavItems = NAV_ITEMS
+  const gateway = useGateway()
+  const showGateway = shouldShowGatewayNavigation({
+    isGatewayHost,
+    serverMode,
+    allowed: gateway.allowed,
+  })
+  // A standalone gateway serves only its own pages and the connection page.
+  const navSections = isGatewayHost ? [] : NAV_SECTIONS
+  const canManageUsers = !isGatewayHost && capabilities.canManageUsers
 
   function openCrossDeviceVerify(): void {
     if (crossDeviceVerifyActive) {
@@ -363,7 +398,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
         </SidebarHeader>
 
         <SidebarContent className="gap-0 py-1">
-          {NAV_SECTIONS.map((section) => (
+          {navSections.map((section) => (
             <SidebarGroup key={section.id} className="pb-1">
               <SidebarGroupLabel className="h-7 px-2 pt-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-sidebar-foreground/45">
                 {t(section.titleKey, { ns: 'appShell' })}
@@ -432,20 +467,18 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                     <span>{t('footer.connection', { ns: 'appShell' })}</span>
                   </SidebarMenuButton>
                 </SidebarMenuItem>
-                {canManageUsers ? (
+                {showGateway ? (
                   <SidebarMenuItem>
                     <SidebarMenuButton
-                      render={<Link to="/context-gateway" />}
-                      isActive={contextGatewayActive}
-                      tooltip={t('footer.contextGatewayBeta', {
+                      render={<Link to="/gateway" />}
+                      isActive={gatewayActive}
+                      tooltip={t('footer.gatewayBeta', {
                         ns: 'appShell',
                       })}
                       className="h-9 pr-12"
                     >
                       <WaypointsIcon />
-                      <span>
-                        {t('footer.contextGateway', { ns: 'appShell' })}
-                      </span>
+                      <span>{t('footer.gateway', { ns: 'appShell' })}</span>
                     </SidebarMenuButton>
                     {/* Hidden while the sidebar is collapsed; the tooltip says Beta then. */}
                     <SidebarMenuBadge className="h-4.5 rounded-full border border-sidebar-border px-1.5 text-[10px] font-medium text-sidebar-foreground/55 peer-data-[size=default]/menu-button:top-[9px]">
@@ -466,7 +499,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
                     </SidebarMenuButton>
                   </SidebarMenuItem>
                 ) : null}
-                <SidebarMenuItem>
+                <SidebarMenuItem hidden={isGatewayHost}>
                   <SidebarMenuButton
                     onClick={openCrossDeviceVerify}
                     isActive={crossDeviceVerifyActive}
@@ -487,7 +520,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
             </SidebarGroupContent>
           </SidebarGroup>
 
-          <SidebarGroup className="pb-1">
+          <SidebarGroup className="pb-1" hidden={isGatewayHost}>
             <SidebarGroupLabel className="h-7 px-2 pt-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-sidebar-foreground/45">
               {t('sidebar.groups.resources', { ns: 'appShell' })}
             </SidebarGroupLabel>
@@ -610,7 +643,7 @@ function AppShellInner({ children }: { children: React.ReactNode }) {
 
             <div className="h-6 w-px bg-border/80" aria-hidden="true" />
 
-            <CurrentUserMenu />
+            {isGatewayHost ? null : <CurrentUserMenu />}
           </div>
         </header>
 

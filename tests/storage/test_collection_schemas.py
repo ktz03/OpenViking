@@ -32,6 +32,7 @@ from openviking.storage.expr import Eq
 from openviking.storage.index_action import IndexAction
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
 from openviking.storage.queuefs.process_result import ProcessOutcome
+from openviking.storage.queuefs.retry_policy import MAX_FAILURE_REQUEUE_COUNT
 from openviking.storage.vector_ids import vector_record_id
 from openviking.storage.vectordb import engine as vectordb_engine
 from openviking.storage.vectordb.collection.collection import Collection
@@ -818,7 +819,7 @@ async def test_embedding_handler_open_breaker_logs_summary_instead_of_per_item_w
             self.enqueued = []
 
         async def enqueue_embedding_msg(self, msg):
-            self.enqueued.append(msg.id)
+            self.enqueued.append(msg)
             return None
 
     embedder = _DummyEmbedder()
@@ -827,7 +828,8 @@ async def test_embedding_handler_open_breaker_logs_summary_instead_of_per_item_w
         lambda: _DummyConfig(embedder),
     )
 
-    handler = TextEmbeddingHandler(_QueueingVikingDB())
+    vikingdb = _QueueingVikingDB()
+    handler = TextEmbeddingHandler(vikingdb)
     monkeypatch.setattr(
         await handler.breaker(),
         "check",
@@ -855,6 +857,112 @@ async def test_embedding_handler_open_breaker_logs_summary_instead_of_per_item_w
         assert result.outcome is ProcessOutcome.REQUEUED
         assert result.value is None
         assert result.error is None
+    assert all(msg.failure_requeue_count == 0 for msg in vikingdb.enqueued)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_requeue_count", "expected_outcome"),
+    [
+        (0, ProcessOutcome.REQUEUED),
+        (MAX_FAILURE_REQUEUE_COUNT, ProcessOutcome.FAILED),
+    ],
+)
+async def test_embedding_failure_requeue_limit(
+    monkeypatch, failure_requeue_count, expected_outcome
+):
+    class _QueueingVikingDB:
+        is_closing = False
+        has_queue_manager = True
+
+        def __init__(self):
+            self.enqueued = []
+
+        async def enqueue_embedding_msg(self, msg):
+            self.enqueued.append(msg)
+
+    class _TransientErrorEmbedder(_DummyEmbedder):
+        async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
+            raise RuntimeError("500 Internal Server Error")
+
+    vikingdb = _QueueingVikingDB()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(_TransientErrorEmbedder()),
+    )
+    handler = TextEmbeddingHandler(vikingdb)
+    msg = EmbeddingMsg(
+        message="hello",
+        context_data={
+            "id": "id-1",
+            "uri": "viking://resources/sample",
+            "account_id": "default",
+            "abstract": "sample",
+        },
+        failure_requeue_count=failure_requeue_count,
+    )
+
+    result = await handler.on_dequeue({"data": msg.to_json()})
+
+    assert result.outcome is expected_outcome
+    if expected_outcome is ProcessOutcome.REQUEUED:
+        assert len(vikingdb.enqueued) == 1
+        assert vikingdb.enqueued[0].failure_requeue_count == 1
+    else:
+        assert vikingdb.enqueued == []
+        assert result.error is not None
+        assert "failure requeue limit reached" in result.error
+
+
+@pytest.mark.asyncio
+async def test_embedding_failure_requeue_stops_after_three_attempts(monkeypatch):
+    class _QueueingVikingDB:
+        is_closing = False
+        has_queue_manager = True
+
+        def __init__(self):
+            self.enqueued = []
+
+        async def enqueue_embedding_msg(self, msg):
+            self.enqueued.append(msg)
+
+    class _TransientErrorEmbedder(_DummyEmbedder):
+        async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
+            self.calls += 1
+            raise RuntimeError("500 Internal Server Error")
+
+    embedder = _TransientErrorEmbedder()
+    vikingdb = _QueueingVikingDB()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(embedder),
+    )
+    handler = TextEmbeddingHandler(vikingdb)
+    msg = EmbeddingMsg(
+        message="hello",
+        context_data={
+            "id": "id-1",
+            "uri": "viking://resources/sample",
+            "account_id": "default",
+            "abstract": "sample",
+        },
+    )
+
+    results = []
+    for _ in range(3):
+        results.append(await handler.on_dequeue({"data": msg.to_json()}))
+        if results[-1].outcome is ProcessOutcome.REQUEUED:
+            msg = vikingdb.enqueued[-1]
+
+    assert [result.outcome for result in results] == [
+        ProcessOutcome.REQUEUED,
+        ProcessOutcome.REQUEUED,
+        ProcessOutcome.FAILED,
+    ]
+    assert [msg.failure_requeue_count for msg in vikingdb.enqueued] == [1, 2]
+    assert embedder.calls == 3
+    assert results[-1].error is not None
+    assert "failure requeue limit reached" in results[-1].error
 
 
 @pytest.mark.asyncio
@@ -896,6 +1004,39 @@ async def test_embedding_auth_error_fails_terminally_without_reenqueue(monkeypat
     )
     assert vikingdb.enqueued == []  # terminal: not re-enqueued
     (await handler.breaker()).check()  # breaker not tripped (would raise if open)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_query", [True, False])
+async def test_request_level_400_does_not_trip_account_breaker(monkeypatch, is_query):
+    """One rejected input (e.g. an invalid image URL) must not open the
+    account-wide breaker and block the next, valid embedding call."""
+
+    class _RejectFirstEmbedder(_DummyEmbedder):
+        async def embed_async(self, text: str, is_query: bool = False) -> EmbedResult:
+            if self.calls == 0:
+                self.calls += 1
+                raise RuntimeError(
+                    "Error code: 400 - {'error': {'code': 'InvalidParameter', "
+                    "'message': 'Invalid base64 image url'}}"
+                )
+            return self.embed(text, is_query=is_query)
+
+    embedder = _RejectFirstEmbedder()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(embedder),
+    )
+    handler = TextEmbeddingHandler(SimpleNamespace(is_closing=False, has_queue_manager=True))
+    provider = handler._embedding_provider
+
+    with pytest.raises(RuntimeError, match="400"):
+        await provider.embed("default", "bad input", is_query=is_query)
+
+    (await handler.breaker()).check()  # would raise CircuitBreakerOpen if tripped
+    result = await provider.embed("default", "good input", is_query=is_query)
+    assert result.dense_vector == [0.1, 0.2]
+    assert embedder.calls == 2
 
 
 @pytest.mark.asyncio
