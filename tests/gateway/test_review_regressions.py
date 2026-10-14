@@ -300,14 +300,19 @@ async def test_hot_read_ignores_unrelated_operational_documents(
     kernel, store, _, _ = setup_kernel
     policy.update(recall=False)
     p = await prepare(kernel, credential, policy, history(1)[:1])
-    with store.connect() as c:
-        c.executemany(
-            "INSERT INTO state(scope,key,value,version,touched) VALUES (?,?,?,1,?)",
-            [
-                (p.scope, f"tool:unrelated-{i}", store.encode({"content": "old"}), time.time())
-                for i in range(1500)
-            ],
-        )
+
+    def insert():
+        # Encoding runs the encryptor on the event loop, so it must happen off the loop thread.
+        with store.connect() as c:
+            c.executemany(
+                "INSERT INTO state(scope,key,value,version,touched) VALUES (?,?,?,1,?)",
+                [
+                    (p.scope, f"tool:unrelated-{i}", store.encode({"content": "old"}), time.time())
+                    for i in range(1500)
+                ],
+            )
+
+    await store.run(insert, write=True)
     decoded = []
     original = store.decode
 

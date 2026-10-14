@@ -1,6 +1,6 @@
 import * as React from 'react'
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { createFileRoute } from '@tanstack/react-router'
+import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import {
   CircleAlertIcon,
   CircleDashedIcon,
@@ -13,6 +13,8 @@ import {
 import { useTranslation } from 'react-i18next'
 
 import { Alert, AlertDescription, AlertTitle } from '#/components/ui/alert'
+import { Button } from '#/components/ui/button'
+import { fetchServerHealth } from '#/hooks/use-server-mode'
 import { Badge } from '#/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '#/components/ui/card'
 import {
@@ -30,10 +32,159 @@ import { PLAIN_INPUT_PROPS } from '#/lib/form-input'
 import { cn } from '#/lib/utils'
 import { localizeCapabilityDetail } from './-lib/localize-capability-probe'
 import type { ConnectionDraft } from '#/hooks/use-app-connection'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '#/components/ui/tabs'
+import { ServerConfigurationEditor } from './-components/server-configuration'
 
 export const Route = createFileRoute('/settings')({
   component: ConnectionSettingsRoute,
 })
+
+function ConnectionSettingsRoute() {
+  const { t } = useTranslation('settings')
+  const { identityScopeKey, isGatewayHost } = useAppConnection()
+  if (isGatewayHost) return <GatewayConnectionSettings />
+  return (
+    <div className="flex w-full min-w-0 flex-col gap-5">
+      <h1 className="text-2xl font-semibold">{t('pageTitle')}</h1>
+      <Tabs defaultValue="connection" className="min-w-0 gap-5">
+        <TabsList variant="line">
+          <TabsTrigger value="connection">{t('tabs.connection')}</TabsTrigger>
+          <TabsTrigger value="configuration">
+            {t('tabs.configuration')}
+          </TabsTrigger>
+        </TabsList>
+        <TabsContent value="connection">
+          <ConnectionSettingsPanel />
+        </TabsContent>
+        <TabsContent value="configuration" keepMounted>
+          <ServerConfigurationEditor key={identityScopeKey} />
+        </TabsContent>
+      </Tabs>
+    </div>
+  )
+}
+
+/** Whether the gateway reports OpenViking itself unreachable for this key. */
+async function openvikingUnreachable(baseUrl: string, apiKey: string) {
+  try {
+    const response = await fetch(
+      `${baseUrl.replace(/\/+$/, '')}/gateway/admin/access`,
+      { headers: { 'X-API-Key': apiKey } },
+    )
+    const body: unknown = await response.json()
+    return (
+      typeof body === 'object' &&
+      body !== null &&
+      (body as { reason?: unknown }).reason === 'openviking_unreachable'
+    )
+  } catch {
+    return false
+  }
+}
+
+export function GatewayConnectionSettings() {
+  const { t } = useTranslation('settings')
+  const { connection, openvikingUrl, saveConnection, serverMode } =
+    useAppConnection()
+  const navigate = useNavigate()
+  const [apiKey, setApiKey] = React.useState(
+    connection.apiKey || connection.adminApiKey,
+  )
+  const [pending, setPending] = React.useState(false)
+  const [error, setError] = React.useState('')
+  const misplacedKey = apiKey.startsWith('ovgw_') || apiKey.startsWith('ovgm_')
+
+  async function login(event: React.FormEvent) {
+    event.preventDefault()
+    if (misplacedKey) return
+    setPending(true)
+    setError('')
+    try {
+      const health = await fetchServerHealth(
+        connection.baseUrl,
+        apiKey.trim() ? { 'X-API-Key': apiKey.trim() } : {},
+      )
+      // The gateway answers an invalid key with health minus identity, and
+      // so it does while OpenViking is down; /access tells the two apart.
+      if (apiKey.trim() && typeof health.user_id !== 'string') {
+        setError(
+          (await openvikingUnreachable(connection.baseUrl, apiKey.trim()))
+            ? t('gatewayConnection.unreachable', { url: openvikingUrl })
+            : t('gatewayConnection.invalidKey'),
+        )
+        return
+      }
+      saveConnection({
+        ...connection,
+        adminApiKey: '',
+        apiKey: apiKey.trim(),
+        accountId:
+          typeof health.account_id === 'string'
+            ? health.account_id
+            : connection.accountId,
+        userId:
+          typeof health.user_id === 'string'
+            ? health.user_id
+            : connection.userId,
+      })
+      await navigate({ to: '/gateway' })
+    } catch {
+      setError(t('gatewayConnection.gatewayUnreachable'))
+    } finally {
+      setPending(false)
+    }
+  }
+
+  return (
+    <Card className="w-full max-w-xl">
+      <CardHeader>
+        <CardTitle>{t('gatewayConnection.title')}</CardTitle>
+        {openvikingUrl ? (
+          <p className="break-all text-sm text-muted-foreground">
+            {t('gatewayConnection.openvikingUrl', { url: openvikingUrl })}
+          </p>
+        ) : null}
+      </CardHeader>
+      <CardContent>
+        <form className="grid gap-4" onSubmit={(event) => void login(event)}>
+          <Field>
+            <FieldLabel htmlFor="gateway-openviking-key">
+              {t('gatewayConnection.apiKey')}
+            </FieldLabel>
+            <FieldContent>
+              <Input
+                id="gateway-openviking-key"
+                type="password"
+                value={apiKey}
+                required={serverMode !== 'dev'}
+                onChange={(event) => {
+                  setApiKey(event.target.value)
+                  setError('')
+                }}
+                {...PLAIN_INPUT_PROPS}
+              />
+              <FieldDescription>
+                {t('gatewayConnection.keyHint')}
+              </FieldDescription>
+              {misplacedKey || error ? (
+                <p role="alert" className="text-sm text-destructive">
+                  {misplacedKey ? t('gatewayConnection.wrongKey') : error}
+                </p>
+              ) : null}
+            </FieldContent>
+          </Field>
+          <Button type="submit" disabled={pending || misplacedKey}>
+            {t(
+              pending
+                ? 'gatewayConnection.connecting'
+                : 'gatewayConnection.connect',
+            )}
+          </Button>
+        </form>
+      </CardContent>
+    </Card>
+  )
+}
 
 function getCapabilityIcon(result: CapabilityProbeResult | undefined) {
   if (!result) {
@@ -124,7 +275,7 @@ function UserApiKeyInput({
   )
 }
 
-function ConnectionSettingsRoute() {
+function ConnectionSettingsPanel() {
   const { i18n, t } = useTranslation('settings')
   const { connection, saveConnection, serverMode } = useAppConnection()
   const [draft, setDraft] = React.useState<ConnectionDraft>(connection)
@@ -206,10 +357,7 @@ function ConnectionSettingsRoute() {
     ? 'https://docs.openviking.ai/zh/guides/04-authentication'
     : 'https://docs.openviking.ai/en/guides/04-authentication'
   const trustedCredentialRequired =
-    serverMode === 'trusted' &&
-    !probeQuery.isFetching &&
-    !hasControlCredential &&
-    probeQuery.data?.rootApiKeyRequired === true
+    serverMode === 'trusted' && !probeQuery.isFetching && !hasControlCredential
   const keyGuide =
     serverMode === 'trusted'
       ? trustedCredentialRequired
@@ -241,15 +389,6 @@ function ConnectionSettingsRoute() {
 
   return (
     <div className="flex w-full min-w-0 flex-col gap-5">
-      <header className="flex flex-col gap-2">
-        <h1 className="text-2xl font-semibold tracking-tight">
-          {t('connectionPage.title')}
-        </h1>
-        <p className="max-w-3xl text-sm leading-6 text-muted-foreground">
-          {t('connectionPage.description')}
-        </p>
-      </header>
-
       <Card className="gap-0 overflow-hidden border-primary/25 bg-primary/[0.025] py-0 shadow-sm ring-1 ring-primary/10">
         <CardHeader className="gap-2 border-b border-primary/15 bg-primary/[0.07] px-5 py-3.5">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -335,7 +474,11 @@ function ConnectionSettingsRoute() {
                       {...PLAIN_INPUT_PROPS}
                     />
                     <FieldDescription>
-                      {t('connection.rootHint')}
+                      {t(
+                        serverMode === 'trusted'
+                          ? 'connection.trustedRootHint'
+                          : 'connection.rootHint',
+                      )}
                     </FieldDescription>
                   </FieldContent>
                 </Field>
@@ -353,7 +496,11 @@ function ConnectionSettingsRoute() {
                       placeholder={t('placeholders.userApiKey')}
                     />
                     <FieldDescription>
-                      {t('connection.userHint')}
+                      {t(
+                        serverMode === 'trusted'
+                          ? 'connection.trustedUserHint'
+                          : 'connection.userHint',
+                      )}
                     </FieldDescription>
                   </FieldContent>
                 </Field>

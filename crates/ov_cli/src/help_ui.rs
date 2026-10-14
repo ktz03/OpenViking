@@ -395,10 +395,16 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
     CommandHelpSpec {
         path: &["read"],
         purpose: "Read exact Level 2 file content from a Viking URI.",
-        examples: &[HelpItem {
-            label: "ov read viking://projects/acme/spec.md",
-            description: "Print exact file content.",
-        }],
+        examples: &[
+            HelpItem {
+                label: "ov read viking://projects/acme/spec.md",
+                description: "Print exact file content.",
+            },
+            HelpItem {
+                label: "ov read viking://projects/acme/spec.md --offset 10 --limit 5",
+                description: "Read lines 11 through 15 (offset is zero-based).",
+            },
+        ],
         next_steps: &[
             HelpItem {
                 label: "ov write <uri> --content \"...\"",
@@ -868,7 +874,7 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
     },
     CommandHelpSpec {
         path: &["compile"],
-        purpose: "Use a Skill to compile OpenViking materials into Wiki pages or a Skill package, or `--skill memory` to consolidate existing memories in place.",
+        purpose: "Use a required VikingBot Skill to transform materials into reports, JSON, Wiki pages or other Skill-defined files, or `--skill memory` to consolidate existing memories in place.",
         examples: &[
             HelpItem {
                 label: "ov compile --from viking://resources/weekly --to viking://resources/wiki --skill viking://agent/skills/monthly_wiki",
@@ -1334,7 +1340,7 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
     },
     CommandHelpSpec {
         path: &["system"],
-        purpose: "Run server utility, health, consistency, backend sync, and crypto commands.",
+        purpose: "Run server utility, health, consistency, and crypto commands.",
         examples: &[
             HelpItem {
                 label: "ov system health",
@@ -1344,32 +1350,10 @@ const COMMAND_HELP_SPECS: &[CommandHelpSpec] = &[
                 label: "ov system consistency viking://projects/acme",
                 description: "Check filesystem/vector consistency.",
             },
-            HelpItem {
-                label: "ov system backend sync-status viking://projects/acme",
-                description: "Inspect multi-write backend sync lag.",
-            },
         ],
         next_steps: &[HelpItem {
             label: "ov status",
             description: "Use the standard status view.",
-        }],
-    },
-    CommandHelpSpec {
-        path: &["system", "backend"],
-        purpose: "Inspect and repair multi-write backend sync state.",
-        examples: &[
-            HelpItem {
-                label: "ov system backend sync-status viking://resources",
-                description: "Show pending and acknowledged backend sync state.",
-            },
-            HelpItem {
-                label: "ov system backend sync-retry viking://resources",
-                description: "Retry lagging backend sync targets.",
-            },
-        ],
-        next_steps: &[HelpItem {
-            label: "ov system backend sync-status <uri>",
-            description: "Inspect the subtree again after retry.",
         }],
     },
     CommandHelpSpec {
@@ -2986,7 +2970,6 @@ mod tests {
     fn curated_help_lists_timeout_for_waiting_commands() {
         for args in [
             ["ov", "add-resource", "--help"],
-            ["ov", "add-skill", "--help"],
             ["ov", "rm", "--help"],
             ["ov", "write", "--help"],
         ] {
@@ -3208,7 +3191,7 @@ mod tests {
             ("admin", "Manage accounts, users, roles, and API keys."),
             (
                 "system",
-                "Run server utility, health, consistency, backend sync, and crypto commands.",
+                "Run server utility, health, consistency, and crypto commands.",
             ),
             ("observer", "Inspect specific OpenViking server subsystems."),
         ] {
@@ -3273,20 +3256,6 @@ mod tests {
             .is_none(),
             "--compact without a value should not hide the privacy command from help detection"
         );
-    }
-
-    #[test]
-    fn supported_nested_curated_help_still_renders() {
-        let rendered = strip_ansi(
-            &render_command_help_request(&os_args(&["ov", "system", "backend", "--help"]))
-                .expect("system backend help should render curated nested help"),
-        );
-
-        assert!(rendered.contains("ov system backend"));
-        assert!(rendered.contains("sync-status"));
-        assert!(rendered.contains("sync-retry"));
-        assert!(!rendered.contains("help                               Print this message"));
-        assert!(rendered.contains("--sudo"));
     }
 
     #[test]

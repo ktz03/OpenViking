@@ -721,6 +721,10 @@ class VLMConfig(BaseModel):
         except Exception:
             pass
 
+    def build_vlm_config_dict_for_credential(self, credential: VLMCredential) -> Dict[str, Any]:
+        """Return the effective backend settings for one normalized credential."""
+        return self._build_vlm_config_dict_for_credential(credential)
+
     def _build_vlm_config_dict_for_credential(self, credential: VLMCredential) -> Dict[str, Any]:
         """Build VLM instance config dict for a specific credential."""
         result = {

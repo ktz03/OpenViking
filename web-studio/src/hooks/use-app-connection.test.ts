@@ -249,6 +249,22 @@ describe('createManagementAccountConnection', () => {
   })
 })
 
+it('preserves a root login key and caller identity when selecting a gateway account', () => {
+  const connection = {
+    accountId: 'account-a',
+    userId: 'root',
+    apiKey: 'root-login-key',
+    adminApiKey: '',
+    baseUrl: 'http://localhost:1935',
+  }
+  expect(
+    createManagementAccountConnection(connection, ' account-b ', true),
+  ).toEqual({
+    ...connection,
+    accountId: 'account-b',
+  })
+})
+
 describe('synchronizeConnectionRuntime', () => {
   it('updates the imperative client before React state consumers remount', () => {
     const next = synchronizeConnectionRuntime(
@@ -294,33 +310,39 @@ describe('resolveConnectionRoleProbeState', () => {
     })
   })
 
-  it('keeps non-dev no-key connections unknown without probing', () => {
-    expect(
-      resolveConnectionRoleProbeState({
-        apiKey: '',
-        baseUrl: 'http://localhost:3000',
-        serverMode: 'api_key',
-      }),
-    ).toEqual({
-      isLoading: false,
-      role: 'unknown',
-      shouldProbe: false,
-    })
-  })
+  it.each(['api_key', 'trusted'] as const)(
+    'keeps non-dev no-key connections unknown without probing: %s',
+    (serverMode) => {
+      expect(
+        resolveConnectionRoleProbeState({
+          apiKey: '',
+          baseUrl: 'http://localhost:3000',
+          serverMode,
+        }),
+      ).toEqual({
+        isLoading: false,
+        role: 'unknown',
+        shouldProbe: false,
+      })
+    },
+  )
 
-  it('probes non-dev keyed connections through /health', () => {
-    expect(
-      resolveConnectionRoleProbeState({
-        apiKey: 'root-key',
-        baseUrl: 'http://localhost:3000',
-        serverMode: 'api_key',
-      }),
-    ).toEqual({
-      isLoading: true,
-      role: 'unknown',
-      shouldProbe: true,
-    })
-  })
+  it.each(['api_key', 'trusted'] as const)(
+    'probes non-dev keyed connections through /health: %s',
+    (serverMode) => {
+      expect(
+        resolveConnectionRoleProbeState({
+          apiKey: 'root-key',
+          baseUrl: 'http://localhost:3000',
+          serverMode,
+        }),
+      ).toEqual({
+        isLoading: true,
+        role: 'unknown',
+        shouldProbe: true,
+      })
+    },
+  )
 })
 
 describe('shouldRedirectToLoginOnApiError', () => {

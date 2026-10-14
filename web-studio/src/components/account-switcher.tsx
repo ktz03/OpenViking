@@ -60,6 +60,7 @@ export function AccountSwitcher() {
     connection,
     connectionRole,
     isConnectionRoleLoading,
+    isGatewayHost,
     setGeneratedCredential,
     serverMode,
     switchIdentity,
@@ -79,23 +80,30 @@ export function AccountSwitcher() {
     adminUserId: DEFAULT_USER_ID,
   })
 
-  const { canManageAccounts } = resolveStudioManagementCapabilities({
+  const capabilities = resolveStudioManagementCapabilities({
     hasControlCredential: Boolean(connection.adminApiKey.trim()),
     isRoleLoading: isConnectionRoleLoading,
     role: connectionRole,
     serverMode,
   })
 
+  const canManageAccounts = isGatewayHost
+    ? connectionRole === 'root' && !isConnectionRoleLoading
+    : capabilities.canManageAccounts
+
   const adminConnection = React.useMemo<AdminConnection>(
     () => ({
       accountId: connection.accountId,
-      apiKey: connection.adminApiKey,
+      apiKey:
+        connection.adminApiKey || (isGatewayHost ? connection.apiKey : ''),
       baseUrl: connection.baseUrl,
       userId: connection.userId,
     }),
     [
       connection.accountId,
       connection.adminApiKey,
+      connection.apiKey,
+      isGatewayHost,
       connection.baseUrl,
       connection.userId,
     ],
@@ -131,6 +139,12 @@ export function AccountSwitcher() {
 
     setSwitchingAccountId(accountId)
     try {
+      if (isGatewayHost) {
+        await switchManagementAccount(accountId)
+        setOpen(false)
+        toast.success(t('toast.switched', { account: accountId }))
+        return
+      }
       const users = await fetchAdminUsers(adminConnection, accountId)
       const firstUser = selectAccountUser(users, connection.userId, false)
       if (!firstUser) {
@@ -329,21 +343,23 @@ export function AccountSwitcher() {
               })
             )}
           </div>
-          <div className="border-t p-1.5">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="w-full justify-start px-2.5"
-              onClick={() => {
-                setOpen(false)
-                setCreateOpen(true)
-              }}
-            >
-              <PlusIcon />
-              {t('create')}
-            </Button>
-          </div>
+          {!isGatewayHost && (
+            <div className="border-t p-1.5">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="w-full justify-start px-2.5"
+                onClick={() => {
+                  setOpen(false)
+                  setCreateOpen(true)
+                }}
+              >
+                <PlusIcon />
+                {t('create')}
+              </Button>
+            </div>
+          )}
         </PopoverContent>
       </Popover>
 

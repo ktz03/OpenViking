@@ -1,4 +1,7 @@
 import base64
+import hashlib
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -7,14 +10,17 @@ from openviking.server.identity import RequestContext, Role
 from openviking.session.memory.dataclass import MemoryFile
 from openviking.session.memory.utils import MemoryFileUtils
 from openviking.storage.content_write import ContentWriteCoordinator
+from openviking.storage.context_update_plan import (
+    ContentTreeAction,
+    ContextUpdatePlan,
+    FileRefreshIntent,
+)
 from openviking.storage.queuefs.semantic_ops.freshness_policy import FreshnessAction
 from openviking.utils.content_hash import content_md5
 from openviking_cli.exceptions import (
-    AlreadyExistsError,
     InvalidArgumentError,
     NotFoundError,
     OpenVikingError,
-    ResourceExhaustedError,
 )
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -77,9 +83,20 @@ class _VFS:
         self.files[uri] = content
         self.writes.append(uri)
 
+    async def write_file_bytes(self, uri, content, ctx=None, lease_ref=None):
+        del ctx
+        assert lease_ref is not None
+        if uri == self.fail_uri:
+            raise OSError("injected write failure")
+        try:
+            self.files[uri] = content.decode("utf-8")
+        except UnicodeDecodeError:
+            self.files[uri] = content
+        self.writes.append(uri)
+
 
 @pytest.mark.asyncio
-async def test_batch_accepts_256_operations_and_rejects_257(monkeypatch):
+async def test_batch_accepts_more_than_256_operations(monkeypatch):
     root = "viking://resources/wiki"
     vfs = _VFS(root)
     coordinator = ContentWriteCoordinator(vfs)
@@ -109,51 +126,507 @@ async def test_batch_accepts_256_operations_and_rejects_257(monkeypatch):
     )
     assert len(result["created"]) == 256
 
-    with pytest.raises(ResourceExhaustedError, match="at most 256 operations"):
-        await coordinator.batch_write(
-            root_uri=root,
-            operations=operations("overflow", 257),
-            ctx=ctx,
-            wait=False,
-        )
+    overflow = await coordinator.batch_write(
+        root_uri=root,
+        operations=operations("overflow", 257),
+        ctx=ctx,
+        wait=False,
+    )
+    assert len(overflow["created"]) == 257
 
 
 @pytest.mark.asyncio
-async def test_batch_validates_all_modes_before_any_write(monkeypatch):
+async def test_batch_create_replace_and_upsert_overwrite_or_create(monkeypatch):
     root = "viking://resources/wiki"
     existing = f"{root}/existing.md"
-    created = f"{root}/new.md"
+    created_by_replace = f"{root}/replace.md"
+    created_by_upsert = f"{root}/upsert.md"
     vfs = _VFS(root, {existing: "newer"})
-    locks = vfs._async_agfs
     coordinator = ContentWriteCoordinator(vfs)
-    refreshed = []
 
     async def refresh(**kwargs):
-        refreshed.append(kwargs["refresh_kinds"])
+        del kwargs
 
     monkeypatch.setattr(coordinator, "_refresh_batch", refresh)
     ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
-    with pytest.raises(AlreadyExistsError):
-        await coordinator.batch_write(
-            root_uri=root,
-            operations=[
-                {
-                    "uri": existing,
-                    "content": "replacement",
-                    "mode": "create",
-                },
-                {
-                    "uri": created,
-                    "content": "created",
-                    "mode": "upsert",
-                },
-            ],
-            ctx=ctx,
-            wait=False,
+    result = await coordinator.batch_write(
+        root_uri=root,
+        operations=[
+            {"uri": existing, "content": "replacement", "mode": "create"},
+            {"uri": created_by_replace, "content": "created", "mode": "replace"},
+            {"uri": created_by_upsert, "content": "upsert", "mode": "upsert"},
+        ],
+        ctx=ctx,
+        wait=False,
+    )
+
+    assert result["updated"] == [existing]
+    assert result["created"] == [created_by_replace, created_by_upsert]
+    assert vfs.files == {
+        existing: "replacement",
+        created_by_replace: "created",
+        created_by_upsert: "upsert",
+    }
+
+
+@pytest.mark.asyncio
+async def test_batch_missing_append_creates_its_initial_body(monkeypatch):
+    root = "viking://resources/wiki"
+    page = f"{root}/page.md"
+    vfs = _VFS(root)
+    coordinator = ContentWriteCoordinator(vfs)
+
+    async def refresh(**kwargs):
+        del kwargs
+
+    monkeypatch.setattr(coordinator, "_refresh_batch", refresh)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    result = await coordinator.batch_write(
+        root_uri=root,
+        operations=[{"uri": page, "content": "initial body", "mode": "append"}],
+        ctx=ctx,
+        wait=False,
+    )
+
+    assert result["created"] == [page]
+    assert result["updated"] == []
+    assert vfs.files[page] == "initial body"
+
+
+@pytest.mark.asyncio
+async def test_batch_resource_files_compile_independent_rnfv_plans(monkeypatch):
+    root = "viking://resources/wiki"
+    first = f"{root}/docs/a.md"
+    second = f"{root}/docs/b.md"
+    vfs = _VFS(root, {first: "old A"})
+
+    class _VikingDB:
+        def __init__(self):
+            self.calls = []
+
+        async def get_incremental_inventory_by_uris(self, uris, **kwargs):
+            self.calls.append((list(uris), kwargs))
+            return {
+                uri: {
+                    "a-l2": {
+                        "id": "a-l2",
+                        "uri": uri,
+                        "level": 2,
+                        "md5": "old-md5",
+                        "abstract": "old abstract",
+                    }
+                }
+                for uri in uris
+            }
+
+    vikingdb = _VikingDB()
+    coordinator = ContentWriteCoordinator(vfs, vikingdb=vikingdb)
+    snapshots = []
+    commits = []
+    direct_actions = []
+    refresh_calls = []
+
+    async def build_snapshot(**kwargs):
+        snapshots.append(kwargs)
+        return SimpleNamespace(
+            request=kwargs["request_intent"],
+            vectors=SimpleNamespace(records_by_id={}),
         )
-    assert vfs.writes == []
-    assert refreshed == []
-    assert locks.held is False
+
+    async def build_plan(**kwargs):
+        uri = kwargs["request_intent"].target_uri
+        return ContextUpdatePlan(
+            root_uri=uri,
+            context_type="resource",
+            content_tree_actions=(
+                ContentTreeAction(
+                    "upsert",
+                    "",
+                    old_kind="file",
+                    new_kind="file",
+                    artifact_path="",
+                    md5="planned-md5",
+                ),
+            ),
+            file_refresh=FileRefreshIntent(file_uri=uri, md5="planned-md5"),
+        )
+
+    async def commit(actions, **kwargs):
+        assert vfs._async_agfs.held is True
+        commits.append((actions, kwargs))
+
+    async def enqueue(actions, **kwargs):
+        direct_actions.extend(actions)
+        return False
+
+    async def grouped_refresh(_self, **kwargs):
+        assert vfs._async_agfs.held is False
+        refresh_calls.append(kwargs["changes"])
+        return {
+            "status": "success",
+            "enqueued_count": 1,
+            "parent_actions": {f"{root}/docs": "refresh_now"},
+        }
+
+    monkeypatch.setattr(content_write_module, "build_rnfv_snapshot", build_snapshot)
+    monkeypatch.setattr(coordinator, "_build_deferred_batch_file_plan", build_plan)
+    monkeypatch.setattr(content_write_module, "execute_content_tree_actions", commit)
+    monkeypatch.setattr(content_write_module, "enqueue_direct_index_actions", enqueue)
+    monkeypatch.setattr(content_write_module.Summarizer, "refresh_file_parents", grouped_refresh)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    result = await coordinator.batch_write(
+        root_uri=root,
+        operations=[
+            {"uri": first, "content": "A", "mode": "replace"},
+            {"uri": second, "content": "B", "mode": "upsert"},
+        ],
+        ctx=ctx,
+        wait=False,
+    )
+
+    assert result["updated"] == [first]
+    assert result["created"] == [second]
+    assert vikingdb.calls[0][0] == [first]
+    assert len(snapshots) == 2
+    assert all(snapshot["root_is_file"] is True for snapshot in snapshots)
+    assert all(snapshot["vector_scope"] == "self" for snapshot in snapshots)
+    snapshots_by_uri = {snapshot["target_uri"]: snapshot for snapshot in snapshots}
+    assert snapshots_by_uri[first]["vector_inventory"]["a-l2"]["uri"] == first
+    assert snapshots_by_uri[second]["vector_inventory"] == {}
+    assert len(commits) == 2
+    assert direct_actions == []
+    assert len(refresh_calls) == 1
+    assert {change.file_uri for change in refresh_calls[0]} == {first, second}
+    assert {change.file_uri: change.vector_action for change in refresh_calls[0]} == {
+        first: "",
+        second: "upsert",
+    }
+
+
+@pytest.mark.asyncio
+async def test_batch_existing_files_defer_full_vector_reads_to_embedding_worker(monkeypatch):
+    root = "viking://resources/wiki"
+    operations = [
+        {"uri": f"{root}/docs/{index}.md", "content": f"new {index}", "mode": "replace"}
+        for index in range(64)
+    ]
+    vfs = _VFS(
+        root, {operation["uri"]: f"old {index}" for index, operation in enumerate(operations)}
+    )
+
+    class _VikingDB:
+        def __init__(self):
+            self.inventory_calls = []
+            self.hydrate_incremental_records = AsyncMock(
+                side_effect=AssertionError("batch preparation must not hydrate full vector records")
+            )
+
+        async def get_incremental_inventory_by_uris(self, uris, **kwargs):
+            self.inventory_calls.append((list(uris), kwargs))
+            return {
+                uri: {
+                    f"{index}-l2": {
+                        "id": f"{index}-l2",
+                        "uri": uri,
+                        "level": 2,
+                        "md5": content_md5(f"old {index}".encode()),
+                        "abstract": f"old abstract {index}",
+                    }
+                }
+                for index, uri in enumerate(uris)
+            }
+
+    vikingdb = _VikingDB()
+    coordinator = ContentWriteCoordinator(vfs, vikingdb=vikingdb)
+    monkeypatch.setattr(
+        content_write_module.Summarizer,
+        "refresh_file_parents",
+        AsyncMock(
+            return_value={"enqueued_count": 1, "parent_actions": {f"{root}/docs": "refresh_now"}}
+        ),
+    )
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    result = await coordinator.batch_write(
+        root_uri=root,
+        operations=operations,
+        ctx=ctx,
+        wait=False,
+        processing_mode="semantic_and_vectors",
+    )
+
+    assert result["updated"] == sorted(operation["uri"] for operation in operations)
+    assert len(vikingdb.inventory_calls) == 1
+    assert vikingdb.inventory_calls[0][0] == sorted(operation["uri"] for operation in operations)
+    vikingdb.hydrate_incremental_records.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_batch_same_content_with_missing_abstract_enqueues_file_refresh(monkeypatch):
+    root = "viking://resources/wiki"
+    uri = f"{root}/docs/a.md"
+    vfs = _VFS(root, {uri: "unchanged"})
+
+    class _VikingDB:
+        async def get_incremental_inventory_by_uris(self, uris, **kwargs):
+            del kwargs
+            return {
+                item: {
+                    "a-l2": {
+                        "id": "a-l2",
+                        "uri": item,
+                        "level": 2,
+                        "md5": content_md5(b"unchanged"),
+                        "abstract": "",
+                    }
+                }
+                for item in uris
+            }
+
+    refresh_file_parents = AsyncMock(
+        return_value={"enqueued_count": 1, "parent_actions": {f"{root}/docs": "refresh_now"}}
+    )
+    monkeypatch.setattr(
+        content_write_module.Summarizer,
+        "refresh_file_parents",
+        refresh_file_parents,
+    )
+    coordinator = ContentWriteCoordinator(vfs, vikingdb=_VikingDB())
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    await coordinator.batch_write(
+        root_uri=root,
+        operations=[{"uri": uri, "content": "unchanged", "mode": "replace"}],
+        ctx=ctx,
+        wait=False,
+        processing_mode="semantic_and_vectors",
+    )
+
+    changes = refresh_file_parents.await_args.kwargs["changes"]
+    assert [(change.file_uri, change.md5) for change in changes] == [
+        (uri, content_md5(b"unchanged"))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_batch_vectors_only_existing_file_enqueues_merge_patch_without_hydration(monkeypatch):
+    root = "viking://resources/wiki"
+    uri = f"{root}/a.md"
+    vfs = _VFS(root, {uri: "old"})
+
+    class _VikingDB:
+        hydrate_incremental_records = AsyncMock(
+            side_effect=AssertionError("batch preparation must not hydrate full vector records")
+        )
+
+        async def get_incremental_inventory_by_uris(self, uris, **kwargs):
+            del kwargs
+            return {
+                uri: {
+                    "existing-l2": {
+                        "id": "existing-l2",
+                        "uri": uri,
+                        "level": 2,
+                        "md5": content_md5(b"old"),
+                        "abstract": "old abstract",
+                    }
+                }
+                for uri in uris
+            }
+
+    actions = []
+
+    async def enqueue(direct_actions, **kwargs):
+        del kwargs
+        actions.extend(direct_actions)
+        return True
+
+    monkeypatch.setattr(content_write_module, "enqueue_direct_index_actions", enqueue)
+    coordinator = ContentWriteCoordinator(vfs, vikingdb=_VikingDB())
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    await coordinator.batch_write(
+        root_uri=root,
+        operations=[
+            {
+                "uri": uri,
+                "content": "new",
+                "tags": ["team=search"],
+                "tag_mode": "append",
+            }
+        ],
+        ctx=ctx,
+        wait=False,
+        processing_mode="vectors_only",
+    )
+
+    assert len(actions) == 1
+    action = actions[0]
+    assert action.action.value == "merge"
+    assert action.record_id == "existing-l2"
+    assert action.field_patch is not None
+    assert action.field_patch.values == {"search_tags": ["team=search"]}
+    assert action.field_patch.modes == {"search_tags": "append"}
+
+
+@pytest.mark.asyncio
+async def test_batch_resource_plan_uses_operation_processing_mode_and_tags(monkeypatch):
+    root = "viking://resources/wiki"
+    uri = f"{root}/a.md"
+    vfs = _VFS(root, {uri: "old"})
+
+    class _VikingDB:
+        async def get_incremental_inventory_by_uris(self, uris, **kwargs):
+            del kwargs
+            return {item: {} for item in uris}
+
+    coordinator = ContentWriteCoordinator(vfs, vikingdb=_VikingDB())
+    seen = {}
+
+    async def build_snapshot(**kwargs):
+        seen["request"] = kwargs["request_intent"]
+        return SimpleNamespace(
+            request=kwargs["request_intent"], vectors=SimpleNamespace(records_by_id={})
+        )
+
+    async def build_plan(**kwargs):
+        del kwargs
+        return ContextUpdatePlan(uri, "resource")
+
+    monkeypatch.setattr(content_write_module, "build_rnfv_snapshot", build_snapshot)
+    monkeypatch.setattr(coordinator, "_build_deferred_batch_file_plan", build_plan)
+    monkeypatch.setattr(coordinator, "_refresh_batch", AsyncMock(return_value=None))
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    await coordinator.batch_write(
+        root_uri=root,
+        operations=[
+            {
+                "uri": uri,
+                "content": "new",
+                "mode": "replace",
+                "tags": ["team=search"],
+                "tag_mode": "append",
+            }
+        ],
+        ctx=ctx,
+        wait=False,
+        processing_mode="vectors_only",
+    )
+
+    request = seen["request"]
+    assert request.processing_mode == "vectors_only"
+    assert request.scalar_intents[0].value == ("team=search",)
+    assert request.scalar_intents[0].mode == "append"
+
+
+@pytest.mark.asyncio
+async def test_batch_resource_plan_allows_clear_tags_without_tags(monkeypatch):
+    root = "viking://resources/wiki"
+    uri = f"{root}/a.md"
+    vfs = _VFS(root, {uri: "old"})
+
+    class _VikingDB:
+        async def get_incremental_inventory_by_uris(self, uris, **kwargs):
+            del kwargs
+            return {item: {} for item in uris}
+
+    coordinator = ContentWriteCoordinator(vfs, vikingdb=_VikingDB())
+    seen = {}
+
+    async def build_snapshot(**kwargs):
+        seen["request"] = kwargs["request_intent"]
+        return SimpleNamespace(
+            request=kwargs["request_intent"], vectors=SimpleNamespace(records_by_id={})
+        )
+
+    async def build_plan(**kwargs):
+        del kwargs
+        return ContextUpdatePlan(uri, "resource")
+
+    monkeypatch.setattr(content_write_module, "build_rnfv_snapshot", build_snapshot)
+    monkeypatch.setattr(coordinator, "_build_deferred_batch_file_plan", build_plan)
+    monkeypatch.setattr(coordinator, "_refresh_batch", AsyncMock(return_value=None))
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    await coordinator.batch_write(
+        root_uri=root,
+        operations=[{"uri": uri, "content": "new", "tag_mode": "clear"}],
+        ctx=ctx,
+        wait=False,
+    )
+
+    assert seen["request"].scalar_intents[0].value == ()
+    # The public ``clear`` spelling reaches RNFV as its backend-compatible
+    # equivalent: replace the scalar field with an empty tag list.
+    assert seen["request"].scalar_intents[0].mode == "replace"
+
+
+@pytest.mark.asyncio
+async def test_batch_applies_operation_acl_and_forwards_file_options(monkeypatch):
+    root = "viking://resources/wiki"
+    uri = f"{root}/a.md"
+    vfs = _VFS(root)
+    prepared_update = object()
+    vfs.prepare_acl_update = AsyncMock(return_value=prepared_update)
+    vfs.acl_manager = SimpleNamespace(apply_indexed_update=AsyncMock())
+    coordinator = ContentWriteCoordinator(vfs)
+    refresh = AsyncMock(return_value=None)
+    monkeypatch.setattr(coordinator, "_refresh_batch", refresh)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    await coordinator.batch_write(
+        root_uri=root,
+        operations=[
+            {
+                "uri": uri,
+                "content": "new",
+                "tags": ["team=search"],
+                "tag_mode": "append",
+                "acl": {"acl_mode": "restricted", "entries": []},
+            }
+        ],
+        ctx=ctx,
+        wait=False,
+    )
+
+    vfs.prepare_acl_update.assert_awaited_once()
+    vfs.acl_manager.apply_indexed_update.assert_awaited_once_with(prepared_update, ctx)
+    file_options = refresh.await_args.kwargs["file_ingest_options"]
+    assert file_options[uri].search_tags == ["team=search"]
+    assert file_options[uri].search_tag_mode == "append"
+    assert file_options[uri].acl_update is prepared_update
+
+
+@pytest.mark.asyncio
+async def test_batch_same_content_with_tags_is_not_skipped_as_a_conflict_noop(monkeypatch):
+    root = "viking://resources/wiki"
+    uri = f"{root}/a.md"
+    vfs = _VFS(root, {uri: "same"})
+    coordinator = ContentWriteCoordinator(vfs)
+    refresh = AsyncMock(return_value=None)
+    monkeypatch.setattr(coordinator, "_refresh_batch", refresh)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    await coordinator.batch_write(
+        root_uri=root,
+        operations=[
+            {
+                "uri": uri,
+                "content": "same",
+                "expected_sha256": hashlib.sha256(b"same").hexdigest(),
+                "tags": ["team=search"],
+            }
+        ],
+        ctx=ctx,
+        wait=False,
+        skip_conflicts=True,
+    )
+
+    assert vfs.writes == [uri]
+    assert refresh.await_args.kwargs["file_ingest_options"][uri].search_tags == ["team=search"]
 
 
 @pytest.mark.asyncio
@@ -431,7 +904,7 @@ async def test_batch_refresh_failure_retry_rewrites_and_refreshes(monkeypatch):
         await coordinator.batch_write(root_uri=root, operations=operations, ctx=ctx, wait=False)
     assert error.value.code == "REFRESH_FAILED"
     assert "injected refresh failure" in str(error.value)
-    assert "Re-run the same batch-write or ov compile command" in str(error.value)
+    assert "do not blindly retry an already-successful append" in str(error.value)
     assert error.value.details["created"] == [page]
     assert vfs.files[page] == "landed"
     assert vfs.writes == [page]
@@ -565,14 +1038,14 @@ async def test_batch_write_api_creates_binary_file(client_with_resource, filenam
 
 
 @pytest.mark.asyncio
-async def test_batch_write_api_mode_error_does_not_apply_other_operations(client_with_resource):
+async def test_batch_write_api_create_overwrites_and_batch_continues(client_with_resource):
     client, root = client_with_resource
     listing = await client.get(
         "/api/v1/fs/ls",
         params={"uri": root, "simple": True, "recursive": True},
     )
     existing = listing.json()["result"][0]
-    should_not_exist = f"{root}/compile-conflict-no-partial.md"
+    created = f"{root}/compile-created-by-upsert.md"
     response = await client.post(
         "/api/v1/content/batch-write",
         json={
@@ -581,23 +1054,54 @@ async def test_batch_write_api_mode_error_does_not_apply_other_operations(client
             "operations": [
                 {
                     "uri": existing,
-                    "content": "conflicting update",
+                    "content": "create aliases replace",
                     "mode": "create",
                 },
                 {
-                    "uri": should_not_exist,
-                    "content": "must not be written",
+                    "uri": created,
+                    "content": "created by upsert",
                     "mode": "upsert",
                 },
             ],
         },
     )
-    assert response.status_code == 409
-    assert response.json()["error"]["code"] == "ALREADY_EXISTS"
-    missing = await client.get(
-        "/api/v1/content/read", params={"uri": should_not_exist, "raw": True}
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["updated"] == [existing]
+    assert result["created"] == [created]
+    existing_body = await client.get("/api/v1/content/read", params={"uri": existing, "raw": True})
+    assert existing_body.status_code == 200
+    assert existing_body.json()["result"] == "create aliases replace"
+    created_body = await client.get("/api/v1/content/read", params={"uri": created, "raw": True})
+    assert created_body.status_code == 200
+    assert created_body.json()["result"] == "created by upsert"
+
+
+@pytest.mark.asyncio
+async def test_batch_write_api_missing_append_creates_file(client_with_resource):
+    client, root = client_with_resource
+    target = f"{root}/compile-created-by-append.md"
+
+    response = await client.post(
+        "/api/v1/content/batch-write",
+        json={
+            "root_uri": root,
+            "wait": False,
+            "operations": [
+                {
+                    "uri": target,
+                    "content": "initial append body",
+                    "mode": "append",
+                }
+            ],
+        },
     )
-    assert missing.status_code == 404
+
+    assert response.status_code == 200
+    assert response.json()["result"]["created"] == [target]
+    body = await client.get("/api/v1/content/read", params={"uri": target, "raw": True})
+    assert body.status_code == 200
+    assert body.json()["result"] == "initial append body"
 
 
 @pytest.mark.asyncio

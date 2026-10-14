@@ -3,7 +3,10 @@
 import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { ConnectionScopedRouteContent } from './app-shell'
+import {
+  ConnectionScopedRouteContent,
+  shouldShowGatewayNavigation,
+} from './app-shell'
 
 afterEach(cleanup)
 
@@ -30,4 +33,33 @@ describe('ConnectionScopedRouteContent', () => {
       expect(screen.getByTestId('identity-scoped-route')).toBeTruthy()
     },
   )
+})
+
+describe('gateway navigation', () => {
+  it.each([
+    ['dev', true, true],
+    ['api_key', true, true],
+    ['trusted', true, true],
+    ['api_key', false, false],
+    ['offline', true, false],
+    ['checking', true, false],
+  ] as const)('%s allowed %s: %s', (serverMode, allowed, visible) => {
+    expect(
+      shouldShowGatewayNavigation({
+        isGatewayHost: false,
+        serverMode,
+        allowed,
+      }),
+    ).toBe(visible)
+  })
+
+  it('always shows the entry on a standalone gateway', () => {
+    expect(
+      shouldShowGatewayNavigation({
+        isGatewayHost: true,
+        serverMode: 'offline',
+        allowed: false,
+      }),
+    ).toBe(true)
+  })
 })

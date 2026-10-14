@@ -3458,8 +3458,10 @@ wheels = [
 name = "openviking"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "apscheduler" },
     { name = "argon2-cffi" },
+    { name = "async-timeout" },
     { name = "charset-normalizer" },
     { name = "cryptography" },
     { name = "defusedxml" },
@@ -3481,6 +3483,8 @@ dependencies = [
     { name = "opentelemetry-instrumentation-asyncio" },
     { name = "opentelemetry-sdk" },
     { name = "openviking-sdk" },
+    { name = "orjson" },
+    { name = "packaging" },
     { name = "pathspec" },
     { name = "pdfminer-six" },
     { name = "pdfplumber" },
@@ -3591,12 +3595,6 @@ eval = [
     { name = "pandas", version = "3.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "ragas" },
 ]
-gateway = [
-    { name = "aiohttp" },
-    { name = "async-timeout" },
-    { name = "orjson" },
-    { name = "packaging" },
-]
 gateway-fast = [
     { name = "httptools" },
     { name = "uvloop", marker = "sys_platform != 'win32'" },
@@ -3639,11 +3637,11 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "agent-sandbox", marker = "extra == 'bot'", specifier = ">=0.0.23" },
-    { name = "aiohttp", marker = "extra == 'gateway'", specifier = ">=3.13.3" },
+    { name = "aiohttp", specifier = ">=3.13.3" },
     { name = "anyio", marker = "extra == 'gemini-async'", specifier = ">=4.0.0" },
     { name = "apscheduler", specifier = ">=3.11.0" },
     { name = "argon2-cffi", specifier = ">=23.0.0" },
-    { name = "async-timeout", marker = "extra == 'gateway'", specifier = ">=5.0.1" },
+    { name = "async-timeout", specifier = ">=5.0.1" },
     { name = "beautifulsoup4", marker = "extra == 'bot'", specifier = ">=4.12.0" },
     { name = "boto3", marker = "extra == 'test'", specifier = ">=1.42.44" },
     { name = "build", marker = "extra == 'build'" },
@@ -3696,9 +3694,9 @@ requires-dist = [
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.14" },
     { name = "opentelemetry-instrumentation-asyncio", specifier = ">=0.61b0" },
     { name = "opentelemetry-sdk", specifier = ">=1.14" },
-    { name = "openviking-sdk", specifier = ">=0.1.9" },
-    { name = "orjson", marker = "extra == 'gateway'", specifier = ">=3.11.7" },
-    { name = "packaging", marker = "extra == 'gateway'", specifier = ">=24.0" },
+    { name = "openviking-sdk", specifier = ">=0.1.15" },
+    { name = "orjson", specifier = ">=3.11.7" },
+    { name = "packaging", specifier = ">=24.0" },
     { name = "pandas", marker = "extra == 'benchmark'", specifier = ">=2.0.0" },
     { name = "pandas", marker = "extra == 'eval'", specifier = ">=2.0.0" },
     { name = "pandas", marker = "extra == 'test'", specifier = ">=2.0.0" },
@@ -3771,21 +3769,21 @@ requires-dist = [
     { name = "wheel", marker = "extra == 'build'" },
     { name = "xxhash", specifier = ">=3.0.0" },
 ]
-provides-extras = ["gateway", "gateway-fast", "test", "auth", "dev", "doc", "eval", "gemini", "gemini-async", "ocr", "build", "bot", "benchmark", "local-embed", "opengauss"]
+provides-extras = ["gateway-fast", "test", "auth", "dev", "doc", "eval", "gemini", "gemini-async", "ocr", "build", "bot", "benchmark", "local-embed", "opengauss"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=9.0.2" }]
 
 [[package]]
 name = "openviking-sdk"
-version = "0.1.9"
+version = "0.1.15"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d0/b0/75e49d6da4183165768a40db4876e75c4c9e4ff6ac9356d5bbabdbd51281/openviking_sdk-0.1.9.tar.gz", hash = "sha256:a4e66cd53cd7179d02332ffffb9116fc2feaa431b0bbd1eb93c6906751068e2a", size = 50752, upload-time = "2026-08-24T11:51:34.103Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ca/0d/4363876996c031976749c448ce449e3d5d1503c30745dba3127404664940/openviking_sdk-0.1.15.tar.gz", hash = "sha256:51586349329180d665ff9f33613aa2a33eff47d6f3e390f00077204ac139612d", size = 57632, upload-time = "2026-10-13T08:19:31.295Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/47/d6/aa82551f9c5d06ce682b9194c784beeb16478ce103d650ed8e8b487b1aa7/openviking_sdk-0.1.9-py3-none-any.whl", hash = "sha256:6057f3ab921cee4697a7b424948347669cb7b8e04439f305503d8ab7132af3ce", size = 30889, upload-time = "2026-08-24T11:51:33.092Z" },
+    { url = "https://files.pythonhosted.org/packages/26/c2/c95482ecfd3a77294f9396b57011c5b3d01aeda5f0493515413a13127f2e/openviking_sdk-0.1.15-py3-none-any.whl", hash = "sha256:0eeb296feb0c963b43a21fc4a59cab1a487960a7c647c684ca1562246be7bd57", size = 34783, upload-time = "2026-10-13T08:19:30.101Z" },
 ]
 
 [[package]]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -1276,6 +1277,24 @@ async def test_langgraph_store_structured_filters(filter, expected, query):
         (await store.abatch([op]))[0],
     ]
     assert all(sorted(item.key for item in items) == expected for items in results)
+
+
+@pytest.mark.parametrize("use_batch", [False, True])
+def test_langgraph_store_accepts_mapping_values(use_batch):
+    store = OpenVikingStore(client=InMemoryOpenVikingClient())
+    original = {"color": "azure", "nested": {"rank": 3}}
+    value = MappingProxyType(original)
+
+    if use_batch:
+        store.batch([PutOp(namespace=("users", "ada"), key="preferences", value=value)])
+    else:
+        store.put(("users", "ada"), "preferences", value)
+
+    item = store.get(("users", "ada"), "preferences")
+    assert item.value == original
+    assert isinstance(item.value, dict)
+    assert store.search(("users",), query="azure")[0].value == original
+    assert original == {"color": "azure", "nested": {"rank": 3}}
 
 
 def test_langgraph_store_semantic_search_keeps_peer_id_out_of_retrieval():

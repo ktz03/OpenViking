@@ -7,7 +7,6 @@ import json
 import logging
 import time
 import uuid
-from urllib.parse import urlsplit
 
 import aiohttp
 import orjson
@@ -21,7 +20,7 @@ from .tool_executor import ToolExecutor
 from .tool_loop import HiddenToolLoop, ToolLoopError
 from .tool_protocols import ResponseCapture, tool_protocol
 from .tool_protocols.common import SummaryError
-from .vendors import ARK_PATHS, ARK_VENDORS, apply_vendor, ark_url
+from .vendors import ARK_VENDORS, apply_vendor
 
 logger = logging.getLogger(__name__)
 HOP_HEADERS = {
@@ -63,18 +62,20 @@ def filtered_headers(headers, request=False):
 
 
 def upstream_url(upstream, path):
-    if upstream.get("vendor") in ARK_VENDORS:
-        return ark_url(upstream, path)
     base = upstream["base_url"].rstrip("/")
-    # Accept both https://host and https://host/v1 as a configured base URL.
-    if urlsplit(base).path.endswith("/v1") and path.startswith("/v1/"):
-        path = path[3:]
+    if upstream["protocol"] != "anthropic":
+        path = path.removeprefix("/v1")
     return base + path
 
 
 def upstream_headers(upstream, incoming):
     headers = filtered_headers(incoming, request=True)
     headers.update(upstream.get("headers", {}))
+    # Drop configured copies of the auth headers set below; other protocols keep x-api-key.
+    own = (
+        {"authorization", "x-api-key"} if upstream["protocol"] == "anthropic" else {"authorization"}
+    )
+    headers = {k: v for k, v in headers.items() if k.lower() not in own}
     key = (
         upstream.get("api_key", "")
         if upstream.get("auth_mode") != "passthrough"
@@ -86,7 +87,10 @@ def upstream_headers(upstream, incoming):
         )
     if not key:
         raise HTTPException(401, "Upstream API key is missing")
-    headers.update(tool_protocol(upstream["protocol"]).auth_header(key))
+    # Anthropic-compatible services accept either header; some require Bearer.
+    headers["Authorization"] = "Bearer " + key
+    if upstream["protocol"] == "anthropic":
+        headers["x-api-key"] = key
     headers["accept-encoding"] = "identity"
     return headers
 
@@ -118,9 +122,10 @@ class ProxyRequest:
             app.state.management,
         )
         self.path = "/" + path
-        if self.path.startswith("/api/v3/responses/"):
-            self.path = "/v1/responses/" + self.path.removeprefix("/api/v3/responses/")
-        self.path = ARK_PATHS.get(self.path, self.path)
+        for prefix in ("/api/v3/", "/api/compatible/v1/"):
+            if self.path.startswith(prefix):
+                self.path = "/v1/" + self.path.removeprefix(prefix)
+                break
         self.protocol = PATH_PROTOCOL.get(self.path)
         self.prepared = None
         self.metrics = {"request_id": uuid.uuid4().hex, "kind": "passthrough"}
@@ -128,8 +133,6 @@ class ProxyRequest:
     async def run(self):
         if self.request.headers.get("upgrade", "").lower() == "websocket":
             return Response(status_code=426, headers={"Upgrade": "HTTP/1.1"})
-        if self.path.startswith("/admin") or self.path == "/health":
-            raise HTTPException(404)
         raw = bytearray()
         async for chunk in self.request.stream():
             raw.extend(chunk)
@@ -319,10 +322,12 @@ class ProxyRequest:
                     self.credential["account"],
                     "responses",
                     digest(self.credential["id"] + self.capture.response_id),
-                    {"upstream_id": self.upstream["id"]},
+                    {"upstream_id": self.upstream["id"], "user_id": self.credential["user_id"]},
                     ttl=self.config.response_ttl_seconds,
                 )
-            await self.management.log(self.credential["account"], self.metrics)
+            await self.management.log(
+                self.credential["account"], self.metrics, user_id=self.credential["user_id"]
+            )
         except Exception:
             logger.exception("OpenViking Gateway response bookkeeping failed")
 

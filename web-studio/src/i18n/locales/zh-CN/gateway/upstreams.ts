@@ -1,4 +1,40 @@
 const upstreams = {
+  import: {
+    action: '从 OpenViking 导入',
+    useSettings: '使用 OpenViking 的模型配置',
+    hint: '即服务端的 VLM 配置',
+    running: '导入中…',
+    summary_one: '已导入或更新 {{count}} 个上游。',
+    summary_other: '已导入或更新 {{count}} 个上游。',
+    nothing: 'OpenViking 的模型配置里没有可导入的凭证。',
+    needsConfirmation:
+      '以下 Coding Plan 上游会拦截所有请求，确认套餐允许通过网关使用后才能启用：',
+    skipped_one: '{{count}} 个凭证未导入：',
+    skipped_other: '{{count}} 个凭证未导入：',
+    confirm: '去确认',
+    dismiss: '关闭',
+    repeat:
+      '再次导入会按 OpenViking 的配置更新地址和凭证，不会重复创建；你改过的启用状态、优先级和模型设置会保留。',
+    reasons: {
+      invalid_configuration: '模型配置无效，请检查服务端配置后重新导入。',
+      openai_codex:
+        'Codex 的 OAuth 凭证会定期刷新，网关无法长期使用。请手动添加上游。',
+      azure:
+        'Azure OpenAI 需要 api-version 参数，网关暂不支持。请手动添加上游。',
+      litellm_no_api_base:
+        '这个 LiteLLM 凭证没有填写 api_base，网关无法确定地址。请在服务端配置里补上 api_base 后重新导入。',
+      litellm_unsupported_route:
+        '这个 LiteLLM 路由不是 OpenAI 兼容协议，网关无法直接转发。请手动添加上游。',
+      unknown: '无法导入这个凭证，请检查服务端模型配置。',
+    },
+  },
+  readOnly: {
+    empty: '等待网关管理员添加上游。',
+    managedKey: 'API Key 由网关管理员保管。',
+    clientKey: 'API Key 由每个客户端自带。',
+    codingAllowed: 'Coding Plan，网关管理员已允许',
+    codingBlocked: 'Coding Plan，请求已拦截',
+  },
   description:
     '网关把请求转发给这些模型服务商。每个上游只支持一种协议，网关不做协议转换。',
   add: '添加上游',
@@ -49,6 +85,7 @@ const upstreams = {
     passthrough: '这个上游由客户端自带 API Key，网关没有可用于测试的 API Key。',
     noKey: '请先填写 API Key。',
     result: {
+      unverified: '可达，密钥未验证 · {{status}}',
       ok: '可连通 · {{status}}',
       failed: '失败 · {{status}}',
       unreachable: '无法连接',
@@ -57,20 +94,24 @@ const upstreams = {
     explain: {
       ok: '服务商接受了密钥，并返回了模型列表。',
       auth: '服务商拒绝了 API Key 或某个请求头。',
-      notFound:
-        '这个地址下没有模型列表。请检查 Base URL；如果服务商本来就不提供模型列表，实际请求可能仍然正常。',
+      rateLimited: '地址可达，但服务商限制了请求频率，密钥尚未验证。',
+      notFound: '地址可达，但服务商不提供模型列表，API Key 尚未验证。',
       status: '服务商返回了 HTTP {{status}}。',
       unreachable:
         '网关在 10 秒内没有连上服务商。请检查 Base URL，以及网关到服务商之间的网络。',
     },
   },
   delete: {
+    disable: '停用',
+    disableHint: '也可以先停用它，停用后这些密钥会立即请求不到这个上游。',
+    inUse_one: '仍有 {{count}} 个密钥在使用它。',
+    inUse_other: '仍有 {{count}} 个密钥在使用它。',
     action: '删除',
     blocked_one: '有 {{count}} 个密钥在使用，请先吊销',
     blocked_other: '有 {{count}} 个密钥在使用，请先吊销',
     title: '删除“{{name}}”？',
     description:
-      '上游会连同保存的 API Key 和请求头一起删除。目前没有网关密钥使用它，不会影响任何客户端。',
+      '上游会连同保存的 API Key 和请求头一起删除。还有密钥在使用它时无法删除。',
     confirm: '删除上游',
   },
   toast: {
@@ -88,7 +129,7 @@ const upstreams = {
       title: '这个上游已不存在',
       description: '它可能已被删除。请返回列表查看现有的上游。',
     },
-    missing: '还需填写：{{fields}}',
+    missing: '还需填写或修正：{{fields}}',
     separator: '、',
     create: '添加上游',
   },
@@ -133,16 +174,22 @@ const upstreams = {
       hints: {
         deepseek:
           '请求带工具时，DeepSeek 要求回传之前每条回复的推理内容。网关会补回客户端丢掉的部分，所以 OpenViking 工具可以正常使用；如果在下方关闭补全，只有请求关闭了思考模式才会提供这些工具。',
-        ark: '填写不带路径的方舟地址，例如 https://ark.cn-beijing.volces.com。网关会按协议补上 /api/v3 或 /api/compatible/v1，并让每段对话的 prompt_cache_key 保持不变，缓存才能持续命中。',
+        ark: 'Chat 和 Responses 填写 https://ark.cn-beijing.volces.com/api/v3，Anthropic 填写 https://ark.cn-beijing.volces.com/api/compatible；Coding Plan 分别填写 https://ark.cn-beijing.volces.com/api/coding/v3 和 https://ark.cn-beijing.volces.com/api/coding。网关会保持每段对话的 prompt_cache_key 不变，让缓存持续命中。',
         byteplus:
-          '填写不带路径的 BytePlus 方舟地址，例如 https://ark.ap-southeast.bytepluses.com。网关会按协议补上 /api/v3 或 /api/compatible/v1，并让每段对话的 prompt_cache_key 保持不变，缓存才能持续命中。',
+          'Chat 和 Responses 填写 https://ark.ap-southeast.bytepluses.com/api/v3，Anthropic 填写 https://ark.ap-southeast.bytepluses.com/api/compatible；Coding Plan 分别填写 https://ark.ap-southeast.bytepluses.com/api/coding/v3 和 https://ark.ap-southeast.bytepluses.com/api/coding。网关会保持每段对话的 prompt_cache_key 不变，让缓存持续命中。',
       },
     },
     baseUrl: {
       label: 'Base URL',
       description:
-        '服务商的 API 地址，选择服务商时会自动填入。末尾带不带 /v1 都可以。',
+        '照服务商 SDK 文档填写 base_url，网关在后面拼接 /chat/completions、/responses 或 /v1/messages。同一服务商的不同协议地址不同时，请分别添加上游。',
       preview: '请求将发往',
+      missingPath:
+        '这个服务商的 base_url 需要带路径，只填域名会请求到错误地址。',
+      anthropicVersion:
+        'Anthropic 的 base_url 不需要 /v1，网关会自动拼接 /v1/messages。',
+      removeVersion: '去掉 /v1',
+      correctPath: '改用 {{url}}',
       useDefault: '使用默认地址',
     },
     authMode: {
@@ -162,6 +209,8 @@ const upstreams = {
       placeholder: '粘贴服务商的 API Key',
       stored: '已保存',
       description: '加密保存，之后不再显示。',
+      addressChanged:
+        '地址已修改，请重新填写 API Key。原来保存的 API Key 不会发往新地址。',
       storedDescription: '已加密保存。留空则保留原密钥，填写新密钥会替换它。',
     },
     headers: {
@@ -171,14 +220,17 @@ const upstreams = {
       name: '请求头名称',
       value: '取值',
       add: '添加请求头',
+      addressChanged:
+        '地址已修改，请重新填写请求头的取值。原来保存的取值不会发往新地址。',
     },
     codingPlan: {
       label: '这是 Coding Plan 或订阅密钥',
       description: '订阅类密钥通常只授权在服务商自己的工具里使用。',
       warning:
-        '勾选后，网关会拒绝所有发往这个上游的请求。请改用模型 API Key；如果套餐允许在其他客户端使用，可以选择仍然允许。',
-      allow: '仍然允许',
-      allowDescription: '网关会用这个密钥转发请求，请先确认套餐允许这样使用。',
+        '网关默认拒绝所有发往这个上游的请求。请改用模型 API Key；如果套餐条款允许在服务商自己的工具之外使用，可以打开下面的选项。',
+      allow: '允许通过网关使用这个套餐',
+      allowDescription:
+        '部分 Coding Plan 只授权在服务商自己的工具里使用。打开前请确认套餐条款允许，否则账号可能被服务商限制。',
     },
     models: {
       label: '模型',
