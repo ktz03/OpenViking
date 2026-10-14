@@ -89,6 +89,7 @@ class DashScopeDenseEmbedder(DenseEmbedderBase):
         self._openai_client = openai.OpenAI(
             api_key=self.api_key,
             base_url=f"{self.api_base}/compatible-mode/v1",
+            max_retries=0,
         )
         # Multimodal mode: httpx
         self._httpx_client = httpx.Client(
@@ -208,6 +209,7 @@ class DashScopeDenseEmbedder(DenseEmbedderBase):
             lambda: openai.AsyncOpenAI(
                 api_key=self.api_key,
                 base_url=f"{self.api_base}/compatible-mode/v1",
+                max_retries=0,
             )
         )
 
@@ -246,7 +248,7 @@ class DashScopeDenseEmbedder(DenseEmbedderBase):
             return EmbedResult(dense_vector=truncate_and_normalize(vector, self._dimension))
 
         try:
-            return self._run_with_retry(_call, logger=logger, operation_name="DashScope embedding")
+            return self._run_once(_call, logger=logger, operation_name="DashScope embedding")
         except Exception as e:
             raise RuntimeError(f"DashScope embedding failed: {e}") from e
 
@@ -279,7 +281,7 @@ class DashScopeDenseEmbedder(DenseEmbedderBase):
             return EmbedResult(dense_vector=truncate_and_normalize(vector, self._dimension))
 
         try:
-            return await self._run_with_async_retry(
+            return await self._run_once_async(
                 _call, logger=logger, operation_name="DashScope async embedding"
             )
         except Exception as e:
@@ -318,7 +320,7 @@ class DashScopeDenseEmbedder(DenseEmbedderBase):
             return EmbedResult(dense_vector=truncate_and_normalize(vector, self._dimension))
 
         try:
-            return self._run_with_retry(
+            return self._run_once(
                 _call, logger=logger, operation_name="DashScope content embedding"
             )
         except Exception as e:
@@ -348,7 +350,7 @@ class DashScopeDenseEmbedder(DenseEmbedderBase):
             return EmbedResult(dense_vector=truncate_and_normalize(vector, self._dimension))
 
         try:
-            return await self._run_with_async_retry(
+            return await self._run_once_async(
                 _call, logger=logger, operation_name="DashScope async content embedding"
             )
         except Exception as e:

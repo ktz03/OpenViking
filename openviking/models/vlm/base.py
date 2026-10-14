@@ -346,8 +346,8 @@ class VLMFactory:
     """VLM factory class, creates corresponding VLM instance based on config"""
 
     @staticmethod
-    def create(config: Dict[str, Any]) -> VLMBase:
-        """Create VLM instance
+    def _create_provider(config: Dict[str, Any]) -> VLMBase:
+        """Create one concrete VLM provider without an outer retry decorator.
 
         Args:
             config: VLM config, must contain 'provider' field
@@ -390,6 +390,13 @@ class VLMFactory:
             from .backends.litellm_vlm import LiteLLMVLMProvider
 
             return LiteLLMVLMProvider(config)
+
+    @staticmethod
+    def create(config: Dict[str, Any]) -> VLMBase:
+        """Create one VLM target with the standard retry owner."""
+        from .retry_vlm import RetryVLM
+
+        return RetryVLM(VLMFactory._create_provider(config))
 
 
 def _annotate_vlm_error(exc: Exception, vlm_instance: "VLMBase") -> None:

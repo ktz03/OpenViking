@@ -126,6 +126,7 @@ class JinaDenseEmbedder(DenseEmbedderBase):
         self.client = openai.OpenAI(
             api_key=self.api_key,
             base_url=self.api_base,
+            max_retries=0,
         )
         self._async_client_cache = LoopScopedAsyncClientCache()
 
@@ -168,6 +169,7 @@ class JinaDenseEmbedder(DenseEmbedderBase):
             lambda: openai.AsyncOpenAI(
                 api_key=self.api_key,
                 base_url=self.api_base,
+                max_retries=0,
             )
         )
 
@@ -202,7 +204,7 @@ class JinaDenseEmbedder(DenseEmbedderBase):
             return EmbedResult(dense_vector=vector)
 
         try:
-            result = self._run_with_retry(
+            result = self._run_once(
                 _call,
                 logger=logger,
                 operation_name="Jina embedding",
@@ -230,7 +232,7 @@ class JinaDenseEmbedder(DenseEmbedderBase):
             return EmbedResult(dense_vector=response.data[0].embedding)
 
         try:
-            result = await self._run_with_async_retry(
+            result = await self._run_once_async(
                 _call,
                 logger=logger,
                 operation_name="Jina async embedding",
