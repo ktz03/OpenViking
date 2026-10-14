@@ -1,6 +1,5 @@
 import { readFile, readdir } from "node:fs/promises"
 import { join } from "node:path"
-import { parse as parseYaml } from "yaml"
 import { isRecallEnabled } from "./shared/recall-core.mjs"
 import { createOpenVikingV2McpConfig, openVikingSkillsDir } from "./mcp-config.mjs"
 import { contextMessageEvents, normalizeV2LifecycleEvent } from "./v2-events.mjs"
@@ -49,6 +48,7 @@ export async function startV2Plugin(ctx, runtime, { pluginRoot }) {
     })
     log("INFO", "mcp", "Registered OpenViking MCP server for OpenCode v2")
     if (registered && ctx?.skill?.transform) {
+      const { parse: parseYaml } = await import("yaml")
       const directory = openVikingSkillsDir(pluginRoot)
       const skills = await Promise.all((await readdir(directory, { withFileTypes: true }))
         .filter((entry) => entry.isDirectory())
