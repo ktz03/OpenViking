@@ -27,8 +27,6 @@ try:
 except ImportError:
     openai = None
 
-from openviking.utils.model_retry import retry_async, retry_sync
-
 from ..base import ToolCall, VLMBase, VLMResponse
 from ..registry import DEFAULT_AZURE_API_VERSION
 
@@ -67,7 +65,7 @@ def _build_openai_client_kwargs(
     else:
         kwargs = {"api_key": api_key, "base_url": api_base}
     kwargs["timeout"] = timeout
-    # OpenViking owns provider retry/backoff via retry_sync/retry_async.
+    # RetryVLM owns retry/backoff; the SDK performs exactly one request.
     kwargs["max_retries"] = 0
     if extra_headers:
         kwargs["default_headers"] = extra_headers
@@ -358,12 +356,7 @@ class OpenAIVLM(VLMBase):
                 return self._build_vlm_response(response, has_tools=True)
             return self._extract_completion_content(response, elapsed)
 
-        return retry_sync(
-            _call,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name="OpenAI VLM completion",
-        )
+        return _call()
 
     async def get_completion_async(
         self,
@@ -396,12 +389,7 @@ class OpenAIVLM(VLMBase):
             + format_messages(redact_image_data_urls(kwargs.get("messages", [])))
         )
 
-        return await retry_async(
-            _call,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name="OpenAI VLM async completion",
-        )
+        return await _call()
 
     def _detect_image_format(self, data: bytes) -> str:
         """Detect image format from magic bytes.
@@ -479,12 +467,7 @@ class OpenAIVLM(VLMBase):
                 return self._build_vlm_response(response, has_tools=True)
             return self._extract_completion_content(response, elapsed)
 
-        return retry_sync(
-            _call,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name="OpenAI VLM vision completion",
-        )
+        return _call()
 
     async def get_vision_completion_async(
         self,
@@ -511,9 +494,4 @@ class OpenAIVLM(VLMBase):
                 return self._build_vlm_response(response, has_tools=True)
             return await self._extract_completion_content_async(response, elapsed)
 
-        return await retry_async(
-            _call,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name="OpenAI VLM async vision completion",
-        )
+        return await _call()

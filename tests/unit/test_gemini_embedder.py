@@ -144,6 +144,37 @@ class TestGeminiDenseEmbedderEmbed:
             embedder.embed("hello")
 
     @patch("openviking.models.embedder.gemini_embedders.genai.Client")
+    def test_retry_embedder_retries_transient_429(self, mock_client_class, monkeypatch):
+        from google.genai.errors import APIError
+
+        from openviking.models.embedder.gemini_embedders import GeminiDenseEmbedder
+        from openviking.models.embedder.retry_embedder import RetryEmbedder
+
+        monkeypatch.setattr("openviking.utils.model_retry.time.sleep", lambda _delay: None)
+        mock_client = mock_client_class.return_value
+        mock_response = MagicMock()
+        mock_response.status_code = 429
+        mock_client.models.embed_content.side_effect = [
+            APIError(
+                429,
+                {"error": {"message": "Rate limit exceeded. Please retry."}},
+                response=mock_response,
+            ),
+            _make_mock_result([[0.1, 0.2, 0.3]]),
+        ]
+        inner = GeminiDenseEmbedder(
+            "gemini-embedding-2-preview",
+            api_key="key",
+            dimension=3,
+            config={"max_retries": 1},
+        )
+
+        result = RetryEmbedder(inner).embed("hello")
+
+        assert result.dense_vector == [0.1, 0.2, 0.3]
+        assert mock_client.models.embed_content.call_count == 2
+
+    @patch("openviking.models.embedder.gemini_embedders.genai.Client")
     def test_embed_empty_string_returns_zero_vector(self, mock_client_class):
         from openviking.models.embedder.gemini_embedders import GeminiDenseEmbedder
 
@@ -198,7 +229,7 @@ class TestGeminiErrorMessages:
             (401, "Invalid API key"),
             (403, "Permission denied"),
             (404, "Model not found"),
-            (429, "Quota exceeded"),
+            (429, "Resource exhausted"),
             (500, "service error"),
         ],
     )
