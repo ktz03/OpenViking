@@ -261,6 +261,17 @@ class RequestWaitTracker:
                 return True
             return not state.pending_semantic_roots and not state.pending_embedding_roots
 
+    def is_complete_except(self, telemetry_id: str, semantic_root_id: str) -> bool:
+        """Return whether all work except one coordinating semantic root has settled."""
+        if not telemetry_id:
+            return True
+        with self._lock:
+            state = self._states.get(telemetry_id)
+            if state is None:
+                return True
+            pending_semantic = state.pending_semantic_roots - {semantic_root_id}
+            return not pending_semantic and not state.pending_embedding_roots
+
     async def wait_for_request(
         self,
         telemetry_id: str,

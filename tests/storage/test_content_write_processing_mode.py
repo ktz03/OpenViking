@@ -14,8 +14,10 @@ from openviking.storage.abstract_overview import (
     render_abstract_overview,
 )
 from openviking.storage.content_write import ContentWriteCoordinator
-from openviking.storage.context_update_plan import ContextUpdatePlan
+from openviking.storage.context_update_plan import ContextUpdatePlan, FileRefreshIntent
 from openviking.storage.queuefs.semantic_ops.freshness_policy import FreshnessAction
+from openviking.telemetry.context import bind_telemetry
+from openviking.telemetry.operation import OperationTelemetry
 from openviking.utils.ingest_options import IngestOptions
 from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
@@ -27,6 +29,7 @@ class _FakePathLock:
     def __init__(self):
         self._lease = SimpleNamespace(id="lock-1")
         self.release_calls = []
+        self.handoff_calls = []
 
     async def pathlock_acquire_exact(self, lock_path):
         del lock_path
@@ -34,6 +37,15 @@ class _FakePathLock:
 
     async def pathlock_release(self, lease):
         self.release_calls.append(lease.id)
+
+    async def pathlock_to_handoff(self, lease):
+        return {
+            "owner_id": lease.id,
+            "covered_paths": [{"path": "/fake/file", "kind": "exact"}],
+        }
+
+    async def pathlock_handoff(self, lease):
+        self.handoff_calls.append(lease.id)
 
 
 class _FakeVikingFS:
@@ -240,6 +252,73 @@ async def test_direct_write_reads_target_once_after_lock_and_reuses_formal_state
         True,
     )
     assert captured["vector_inventory"] is None
+
+
+@pytest.mark.asyncio
+async def test_direct_write_hands_exact_lock_to_request_coordinator(monkeypatch, ctx):
+    uri = "viking://resources/demo.md"
+    fake_fs = _FakeVikingFS()
+    fake_fs.stat = AsyncMock(return_value={"isDir": False})
+    coordinator = ContentWriteCoordinator(viking_fs=fake_fs)
+    plan = ContextUpdatePlan(
+        uri,
+        "resource",
+        file_refresh=FileRefreshIntent(uri, "new-md5"),
+    )
+    coordinator._prepare_inline_resource_plan = AsyncMock(
+        return_value=SimpleNamespace(
+            plan=plan,
+            store=None,
+            artifact_ref=None,
+            target=None,
+        )
+    )
+    monkeypatch.setattr(
+        content_write_module,
+        "commit_and_enqueue_plan",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                semantic_requested=True,
+                vector_requested=True,
+                semantic_action=FreshnessAction.REFRESH_NOW.value,
+            )
+        ),
+    )
+    queue = SimpleNamespace(enqueue=AsyncMock(return_value="queued"))
+    manager = SimpleNamespace(SEMANTIC="semantic", get_queue=lambda *args, **kwargs: queue)
+    monkeypatch.setattr(content_write_module, "get_queue_manager", lambda: manager)
+    telemetry = OperationTelemetry(operation="content.write", enabled=False)
+
+    with bind_telemetry(telemetry):
+        result = await coordinator._write_direct_with_refresh(
+            uri=uri,
+            root_uri="viking://resources",
+            content="updated",
+            mode="replace",
+            response_mode="replace",
+            context_type="resource",
+            wait=False,
+            timeout=None,
+            ctx=ctx,
+            telemetry_id=telemetry.telemetry_id,
+            ingest_options=IngestOptions(),
+        )
+
+    coordinator_msg = queue.enqueue.await_args.args[0]
+    assert coordinator_msg.wait_for_request_completion is True
+    assert coordinator_msg.lock_handoff["covered_paths"] == [
+        {"path": "/fake/file", "kind": "exact"}
+    ]
+    assert fake_fs._async_agfs.release_calls == []
+    assert fake_fs._async_agfs.handoff_calls == ["lock-1"]
+    assert result["semantic_status"] == "queued"
+    assert result["vector_status"] == "queued"
+
+    content_write_module.get_request_wait_tracker().mark_semantic_done(
+        telemetry.telemetry_id,
+        coordinator_msg.id,
+        processed_delta=0,
+    )
 
 
 @pytest.mark.asyncio

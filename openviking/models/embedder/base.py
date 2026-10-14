@@ -21,8 +21,6 @@ from openviking.utils.exceptions import AllCredentialsFailedError
 from openviking.utils.model_retry import (
     OrderedCredentialSwitcher,
     classify_api_error,
-    retry_async,
-    retry_sync,
 )
 from openviking_cli.utils import get_logger
 
@@ -377,66 +375,58 @@ class EmbedderBase(ABC):
         """Release resources, subclasses can override as needed"""
         pass
 
-    def _run_with_retry(self, func: Callable[[], T], *, logger=None, operation_name: str) -> T:
-        def _wrapped() -> T:
-            previous_started_at = self._active_call_started_at
-            self._active_call_started_at = time.monotonic()
-            try:
-                return func()
-            finally:
-                self._active_call_started_at = previous_started_at
+    def _run_once(
+        self,
+        func: Callable[[], T],
+        *,
+        logger=None,
+        operation_name: str = "embedding",
+    ) -> T:
+        """Run one provider request with per-attempt timing state."""
+        previous_started_at = self._active_call_started_at
+        self._active_call_started_at = time.monotonic()
+        try:
+            return func()
+        finally:
+            self._active_call_started_at = previous_started_at
 
-        return retry_sync(
-            _wrapped,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name=operation_name,
-        )
-
-    async def _run_with_async_retry(
+    async def _run_once_async(
         self,
         func: Callable[[], Awaitable[T]],
         *,
         logger=None,
         operation_name: str,
     ) -> T:
-        async def _wrapped() -> T:
-            semaphore = getattr(self, "_account_semaphore", None)
-            if semaphore is None:
-                semaphore = _get_async_embed_semaphore(self.max_concurrent)
-            wait_started = time.monotonic()
-            await semaphore.acquire()
-            wait_elapsed = time.monotonic() - wait_started
-            telemetry = get_current_telemetry()
-            telemetry.set("embedding.async.max_concurrent", self.max_concurrent)
-            telemetry.set("embedding.async.wait_ms", round(wait_elapsed * 1000, 3))
+        """Run one async provider request with concurrency and telemetry guards."""
+        semaphore = getattr(self, "_account_semaphore", None)
+        if semaphore is None:
+            semaphore = _get_async_embed_semaphore(self.max_concurrent)
+        wait_started = time.monotonic()
+        await semaphore.acquire()
+        wait_elapsed = time.monotonic() - wait_started
+        telemetry = get_current_telemetry()
+        telemetry.set("embedding.async.max_concurrent", self.max_concurrent)
+        telemetry.set("embedding.async.wait_ms", round(wait_elapsed * 1000, 3))
 
-            started = time.monotonic()
-            previous_started_at = self._active_call_started_at
-            self._active_call_started_at = started
-            try:
-                return await func()
-            finally:
-                elapsed = time.monotonic() - started
-                telemetry.set("embedding.async.duration_ms", round(elapsed * 1000, 3))
-                if logger and elapsed >= 3.0:
-                    logger.warning(
-                        "%s slow call provider=%s model=%s wait_ms=%.2f duration_ms=%.2f",
-                        operation_name,
-                        self.provider,
-                        self.model_name,
-                        wait_elapsed * 1000,
-                        elapsed * 1000,
-                    )
-                self._active_call_started_at = previous_started_at
-                semaphore.release()
-
-        return await retry_async(
-            _wrapped,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name=operation_name,
-        )
+        started = time.monotonic()
+        previous_started_at = self._active_call_started_at
+        self._active_call_started_at = started
+        try:
+            return await func()
+        finally:
+            elapsed = time.monotonic() - started
+            telemetry.set("embedding.async.duration_ms", round(elapsed * 1000, 3))
+            if logger and elapsed >= 3.0:
+                logger.warning(
+                    "%s slow call provider=%s model=%s wait_ms=%.2f duration_ms=%.2f",
+                    operation_name,
+                    self.provider,
+                    self.model_name,
+                    wait_elapsed * 1000,
+                    elapsed * 1000,
+                )
+            self._active_call_started_at = previous_started_at
+            semaphore.release()
 
     @property
     def is_dense(self) -> bool:

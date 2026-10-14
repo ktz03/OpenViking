@@ -101,7 +101,7 @@ class LiteLLMDenseEmbedder(DenseEmbedderBase):
 
     def _build_kwargs(self, is_query: bool = False) -> Dict[str, Any]:
         """Build kwargs dict for litellm.embedding() call."""
-        kwargs: Dict[str, Any] = {"model": self.model_name}
+        kwargs: Dict[str, Any] = {"model": self.model_name, "num_retries": 0}
 
         if self.api_key:
             kwargs["api_key"] = self.api_key
@@ -191,7 +191,7 @@ class LiteLLMDenseEmbedder(DenseEmbedderBase):
             return EmbedResult(dense_vector=vector)
 
         try:
-            return self._run_with_retry(
+            return self._run_once(
                 _call,
                 logger=logger,
                 operation_name="LiteLLM embedding",
@@ -210,7 +210,7 @@ class LiteLLMDenseEmbedder(DenseEmbedderBase):
             return EmbedResult(dense_vector=vector)
 
         try:
-            return await self._run_with_async_retry(
+            return await self._run_once_async(
                 _call,
                 logger=logger,
                 operation_name="LiteLLM async embedding",
