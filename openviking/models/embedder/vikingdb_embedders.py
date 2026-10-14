@@ -197,7 +197,7 @@ class VikingDBDenseEmbedder(DenseEmbedderBase, VikingDBClientMixin):
 
             return EmbedResult(dense_vector=dense_vector)
 
-        result = self._run_with_retry(
+        result = self._run_once(
             _call,
             logger=logger,
             operation_name="VikingDB embedding",
@@ -224,7 +224,7 @@ class VikingDBDenseEmbedder(DenseEmbedderBase, VikingDBClientMixin):
                 dense_vector = self._truncate_and_normalize(item["dense_embedding"], self.dimension)
             return EmbedResult(dense_vector=dense_vector)
 
-        result = await self._run_with_async_retry(
+        result = await self._run_once_async(
             _call,
             logger=logger,
             operation_name="VikingDB async embedding",
@@ -277,7 +277,7 @@ class VikingDBSparseEmbedder(SparseEmbedderBase, VikingDBClientMixin):
 
             return EmbedResult(sparse_vector=sparse_vector)
 
-        result = self._run_with_retry(
+        result = self._run_once(
             _call,
             logger=logger,
             operation_name="VikingDB sparse embedding",
@@ -306,7 +306,7 @@ class VikingDBSparseEmbedder(SparseEmbedderBase, VikingDBClientMixin):
                 sparse_vector = self._process_sparse_embedding(item["sparse_embedding"])
             return EmbedResult(sparse_vector=sparse_vector)
 
-        result = await self._run_with_async_retry(
+        result = await self._run_once_async(
             _call,
             logger=logger,
             operation_name="VikingDB async sparse embedding",
@@ -383,7 +383,7 @@ class VikingDBHybridEmbedder(HybridEmbedderBase, VikingDBClientMixin):
 
             return EmbedResult(dense_vector=dense_vector, sparse_vector=sparse_vector)
 
-        result = self._run_with_retry(
+        result = self._run_once(
             _call,
             logger=logger,
             operation_name="VikingDB hybrid embedding",
@@ -419,7 +419,7 @@ class VikingDBHybridEmbedder(HybridEmbedderBase, VikingDBClientMixin):
                 sparse_vector = self._process_sparse_embedding(item["sparse_embedding"])
             return EmbedResult(dense_vector=dense_vector, sparse_vector=sparse_vector)
 
-        result = await self._run_with_async_retry(
+        result = await self._run_once_async(
             _call,
             logger=logger,
             operation_name="VikingDB async hybrid embedding",

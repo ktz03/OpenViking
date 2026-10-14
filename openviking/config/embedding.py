@@ -13,6 +13,7 @@ from openviking.concurrency import AsyncSemaphore
 from openviking.config.scope import ScopeKind
 from openviking.config.vector import AccountVectorConfigResolver, VectorRuntimeSettings
 from openviking.models.embedder.base import EmbedderBase
+from openviking.models.embedder.retry_embedder import RetryEmbedder
 from openviking.models.vlm.token_usage import TokenUsageTracker
 from openviking.service.task_tracker_concurrency import KeyedAsyncLockPool
 from openviking.utils.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
@@ -114,6 +115,8 @@ def _bind_account_state(
         child = getattr(embedder, name, None)
         if child is not None:
             children.append(child)
+    if isinstance(embedder, RetryEmbedder):
+        children.append(embedder.inner)
     for child in children:
         _bind_account_state(child, semaphore, tracker, account_id)
 
