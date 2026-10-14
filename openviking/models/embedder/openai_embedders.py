@@ -390,7 +390,7 @@ class OpenAIDenseEmbedder(DenseEmbedderBase):
             return EmbedResult(dense_vector=vector)
 
         try:
-            return self._run_with_retry(
+            return self._run_once(
                 _call,
                 logger=logger,
                 operation_name="OpenAI embedding",
@@ -412,7 +412,7 @@ class OpenAIDenseEmbedder(DenseEmbedderBase):
             return EmbedResult(dense_vector=self._truncate_vector(response.data[0].embedding))
 
         try:
-            return await self._run_with_async_retry(
+            return await self._run_once_async(
                 _call,
                 logger=logger,
                 operation_name="OpenAI async embedding",

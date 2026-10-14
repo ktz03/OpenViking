@@ -81,6 +81,7 @@ async def _measure_embedding_call_async(
 
 def _create_sync_ark(kwargs: Dict[str, Any]):
     client_kwargs = dict(kwargs)
+    client_kwargs["max_retries"] = 0
     http_client = create_optional_sync_httpx_client(
         client_kwargs.get("base_url"),
         timeout=60.0,
@@ -92,6 +93,7 @@ def _create_sync_ark(kwargs: Dict[str, Any]):
 
 def _create_async_ark(kwargs: Dict[str, Any]):
     client_kwargs = dict(kwargs)
+    client_kwargs["max_retries"] = 0
     http_client = create_optional_async_httpx_client(
         client_kwargs.get("base_url"),
         timeout=60.0,
@@ -302,7 +304,7 @@ class VolcengineDenseEmbedder(DenseEmbedderBase):
             return EmbedResult(dense_vector=vector)
 
         try:
-            return self._run_with_retry(
+            return self._run_once(
                 _embed_call,
                 logger=logger,
                 operation_name="Volcengine embedding",
@@ -350,7 +352,7 @@ class VolcengineDenseEmbedder(DenseEmbedderBase):
             return EmbedResult(dense_vector=truncate_and_normalize(vector, self.dimension))
 
         try:
-            return await self._run_with_async_retry(
+            return await self._run_once_async(
                 _embed_call,
                 logger=logger,
                 operation_name="Volcengine async embedding",
@@ -471,7 +473,7 @@ class VolcengineSparseEmbedder(SparseEmbedderBase):
             return EmbedResult(sparse_vector=process_sparse_embedding(sparse_vector))
 
         try:
-            return self._run_with_retry(
+            return self._run_once(
                 _embed_call,
                 logger=logger,
                 operation_name="Volcengine sparse embedding",
@@ -505,7 +507,7 @@ class VolcengineSparseEmbedder(SparseEmbedderBase):
             return EmbedResult(sparse_vector=process_sparse_embedding(sparse_vector))
 
         try:
-            return await self._run_with_async_retry(
+            return await self._run_once_async(
                 _embed_call,
                 logger=logger,
                 operation_name="Volcengine async sparse embedding",
@@ -656,7 +658,7 @@ class VolcengineHybridEmbedder(HybridEmbedderBase):
             )
 
         try:
-            return self._run_with_retry(
+            return self._run_once(
                 _embed_call,
                 logger=logger,
                 operation_name="Volcengine hybrid embedding",
@@ -694,7 +696,7 @@ class VolcengineHybridEmbedder(HybridEmbedderBase):
             )
 
         try:
-            return await self._run_with_async_retry(
+            return await self._run_once_async(
                 _embed_call,
                 logger=logger,
                 operation_name="Volcengine async hybrid embedding",
