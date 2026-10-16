@@ -182,10 +182,34 @@ describe('base URLs', () => {
     },
   )
 
+  it.each([
+    ['anthropic', '/v1/messages'],
+    ['chat', '/v1/chat/completions'],
+    ['responses', '/v1/responses'],
+  ] as const)('can use the exact URL for %s', (protocol, path) => {
+    expect(
+      upstreamUrl(
+        'https://api.example.com/custom/endpoint/',
+        protocol,
+        path,
+        false,
+      ),
+    ).toBe('https://api.example.com/custom/endpoint')
+  })
+
   it('previews the protocol endpoint once the URL is valid', () => {
     expect(endpointPreview(input({ protocol: 'responses' }))).toBe(
       'https://api.example.com/v1/responses',
     )
+    expect(
+      endpointPreview(
+        input({
+          protocol: 'responses',
+          base_url: 'https://api.example.com/custom/endpoint',
+          append_endpoint_path: false,
+        }),
+      ),
+    ).toBe('https://api.example.com/custom/endpoint')
     expect(endpointPreview(input({ base_url: 'api.example' }))).toBe('')
   })
 })
@@ -343,6 +367,9 @@ describe('URL corrections and changed secrets', () => {
     expect(validateUpstream(draft).base_url?.key).toBe(
       'validation.anthropicBaseUrl',
     )
+    const exact = { ...draft, append_endpoint_path: false }
+    expect(baseUrlCorrection(exact)).toBeUndefined()
+    expect(validateUpstream(exact)).toEqual({})
   })
   it('recognizes address changes but ignores trailing slashes', () => {
     expect(baseUrlChanged({ base_url: stored.base_url + '/' }, stored)).toBe(

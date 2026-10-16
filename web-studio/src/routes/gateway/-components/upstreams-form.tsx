@@ -382,6 +382,15 @@ export function UpstreamForm({
             ) : null}
           </div>
         </SettingField>
+        <ToggleRow
+          id="upstream-append-endpoint-path"
+          label={t('upstreams.form.appendEndpointPath.label')}
+          description={t('upstreams.form.appendEndpointPath.description')}
+          checked={draft.append_endpoint_path}
+          onCheckedChange={(enabled) =>
+            onChange('append_endpoint_path', enabled)
+          }
+        />
       </SettingSection>
 
       <SettingSection

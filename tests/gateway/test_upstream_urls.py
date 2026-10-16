@@ -21,6 +21,23 @@ def test_upstream_url_vectors(vector):
     assert upstream_url(upstream, vector["path"]) == vector["expected"]
 
 
+@pytest.mark.parametrize(
+    ("protocol", "path"),
+    [
+        ("anthropic", "/v1/messages"),
+        ("chat", "/v1/chat/completions"),
+        ("responses", "/v1/responses"),
+    ],
+)
+def test_upstream_url_can_skip_endpoint_path(protocol, path):
+    upstream = {
+        "protocol": protocol,
+        "base_url": "https://api.example.test/custom/endpoint/",
+        "append_endpoint_path": False,
+    }
+    assert upstream_url(upstream, path) == "https://api.example.test/custom/endpoint"
+
+
 @pytest.mark.parametrize("prefix", ["api/v3", "api/compatible/v1", "v1"])
 @pytest.mark.parametrize(
     "suffix", ["embeddings", "models", "responses/id/cancel", "messages/count_tokens"]
@@ -35,6 +52,18 @@ def test_all_client_prefixes_normalize(prefix, suffix):
 def test_anthropic_base_rejects_v1_suffix(base):
     with pytest.raises(ValidationError, match="appends /v1/messages"):
         Upstream(name="test", protocol="anthropic", base_url=base)
+
+
+def test_endpoint_path_defaults_on_and_allows_anthropic_v1_when_off():
+    default = Upstream(name="default", protocol="chat", base_url="https://example.test/v1")
+    exact = Upstream(
+        name="exact",
+        protocol="anthropic",
+        base_url="https://example.test/v1",
+        append_endpoint_path=False,
+    )
+    assert default.append_endpoint_path is True
+    assert exact.append_endpoint_path is False
 
 
 @pytest.mark.parametrize("protocol", ["chat", "responses", "anthropic"])

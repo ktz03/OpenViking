@@ -1733,10 +1733,11 @@ impl RAGFSBindingClient {
     }
 
     /// Restore a project_dir subtree to the state at source_commit.
-    #[pyo3(signature = (**kwargs))]
+    #[pyo3(signature = (*, ctx=None, **kwargs))]
     fn git_restore(
         &self,
         py: Python<'_>,
+        ctx: Option<HashMap<String, String>>,
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Py<PyAny>> {
         let svc = self.git_service.clone().ok_or_else(|| {
@@ -1745,7 +1746,8 @@ impl RAGFSBindingClient {
         let empty = PyDict::new(py);
         let kw = kwargs.unwrap_or(&empty);
         let req = git::parse_restore_request(kw)?;
-        let resp = py_detach_blocking(py, move || self.rt.block_on(svc.restore(req)))
+        let resp = self
+            .run_scoped(py, build_fs_context(ctx), || svc.restore(req))
             .map_err(|e| git::map_git_error(py, e))?;
         git::restore_response_to_pydict(py, resp)
     }

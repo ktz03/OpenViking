@@ -7,6 +7,7 @@ export const UPSTREAM_DEFAULTS: UpstreamInput = {
   name: '',
   protocol: 'chat',
   base_url: '',
+  append_endpoint_path: true,
   api_key: '',
   auth_mode: 'managed',
   headers: {},
@@ -221,13 +222,15 @@ export function isValidBaseUrl(value: string): boolean {
   )
 }
 
-/** SDK URL joining: OpenAI paths omit /v1; Anthropic paths retain it. */
+/** Upstream URL joining: OpenAI paths omit /v1; Anthropic paths retain it. */
 export function upstreamUrl(
   baseUrl: string,
   protocol: Protocol,
   path: string,
+  appendEndpointPath = true,
 ): string {
   const base = baseUrl.trim().replace(/\/+$/, '')
+  if (!appendEndpointPath) return base
   return (
     base + (protocol === 'anthropic' ? path : path.replace(/^\/v1(?=\/)/, ''))
   )
@@ -235,9 +238,13 @@ export function upstreamUrl(
 
 /** A likely URL mistake that the editor can fix without replacing a custom host. */
 export function baseUrlCorrection(
-  upstream: Pick<UpstreamInput, 'base_url' | 'vendor' | 'protocol'>,
+  upstream: Pick<
+    UpstreamInput,
+    'base_url' | 'vendor' | 'protocol' | 'append_endpoint_path'
+  >,
 ): { reason: 'anthropicVersion' | 'missingPath'; url: string } | undefined {
-  if (!isValidBaseUrl(upstream.base_url)) return undefined
+  if (!upstream.append_endpoint_path || !isValidBaseUrl(upstream.base_url))
+    return undefined
   const base = upstream.base_url.trim().replace(/\/+$/, '')
   const path = new URL(base).pathname.replace(/\/+$/, '')
   if (upstream.protocol === 'anthropic' && path.endsWith('/v1')) {
@@ -271,11 +278,19 @@ export function baseUrlChanged(
  * empty while the base URL is not valid yet.
  */
 export function endpointPreview(
-  upstream: Pick<UpstreamInput, 'base_url' | 'vendor' | 'protocol'>,
+  upstream: Pick<
+    UpstreamInput,
+    'base_url' | 'vendor' | 'protocol' | 'append_endpoint_path'
+  >,
   protocol: Protocol = upstream.protocol,
 ): string {
   if (!isValidBaseUrl(upstream.base_url)) return ''
-  return upstreamUrl(upstream.base_url, protocol, PROTOCOL_PATHS[protocol])
+  return upstreamUrl(
+    upstream.base_url,
+    protocol,
+    PROTOCOL_PATHS[protocol],
+    upstream.append_endpoint_path,
+  )
 }
 
 /**

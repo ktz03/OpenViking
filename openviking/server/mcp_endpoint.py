@@ -1200,7 +1200,6 @@ async def write(
     content: str,
     mode: Literal["replace", "append", "create"] = "replace",
     wait: bool = False,
-    timeout: Optional[float] = None,
     acl: Optional[AclSpec] = None,
 ) -> str:
     """Write text to a viking:// file. Use this for files you author yourself (notes, profiles, state), the same way you would use a working directory. To change part of an existing file, prefer the edit tool over a full rewrite. To store a file, document, URL, or repo the user gives you, use add_resource; for a skill, use add_skill. Do not copy its text into a file here instead.
@@ -1221,7 +1220,7 @@ async def write(
     uri = _resolve_mcp_workspace_uri(uri, ctx)
 
     result = await service.fs.write(
-        uri=uri, content=content, ctx=ctx, mode=mode, wait=wait, timeout=timeout, acl=acl
+        uri=uri, content=content, ctx=ctx, mode=mode, wait=wait, acl=acl
     )
     written = result.get("written_bytes", 0)
     message = (
@@ -1238,7 +1237,6 @@ async def edit(
     new_string: str,
     replace_all: bool = False,
     wait: bool = False,
-    timeout: Optional[float] = None,
 ) -> str:
     """Replace an exact string with new text in an existing viking:// file. Use this for targeted changes instead of rewriting the whole file with the write tool. old_string must match the file's current content exactly, including indentation and newlines; use the read tool first to see it. The edit fails and the file is left unchanged if old_string is not found, or if it matches more than once and replace_all is false (pass more surrounding context to make it unique, or set replace_all=true to replace every occurrence). Pass new_string="" to delete old_string.
 
@@ -1275,7 +1273,7 @@ async def edit(
     if updated == current:
         return f"No changes: {uri} already matches the requested edit."
     result = await service.fs.write(
-        uri=uri, content=updated, ctx=ctx, mode="replace", wait=wait, timeout=timeout
+        uri=uri, content=updated, ctx=ctx, mode="replace", wait=wait
     )
     written = result.get("written_bytes", 0)
     message = f"Edited {result.get('uri', uri)} ({written} bytes written)."
@@ -1424,11 +1422,22 @@ async def add_resource(
     resource and never becomes an installed skill. Copying a source's text into a file with
     write instead skips parsing and stores a plain file.
 
+    Preserve the existing Resource layout and account policy. Resource directory rules do not
+    apply to Memory, which is organized by the memory extraction system. Keep one stable root
+    per source; use ``parent`` for a new source and exact ``to`` for an in-place refresh.
+    Inspect the target space with ``list``/``tree`` before adding when practical and reuse its
+    existing directories; never create a synonymous category (e.g. ``documents/``, ``pdfs/``)
+    when one already fits. For a new category prefer the conventional names ``repos/``,
+    ``docs/``, ``sites/``, ``datasets/``, ``media/``, ``artifacts/``,
+    ``projects/<name>/`` for a multi-category project, or another plural domain noun for entity
+    collections (``items/``, ``people/``).
+
     Where it goes: ``viking://resources/`` is shared with the whole account and is the
     default when ``to`` and ``parent`` are empty (unless a default add target is
     configured). ``viking://~/resources/`` is the caller's own resources, visible only to
-    them; pass ``parent="viking://~/resources"`` to store it there. If the user has not
-    said, ask whether the resource is personal or shared with the account.
+    them. If visibility cannot be inferred, prefer the current identity's
+    ``parent="viking://~/resources/inbox"`` and report that choice; never silently put
+    identity-private material in the shared root.
 
     Remote URL: pass ``path`` as an http(s)://, git@, ssh://, or git:// URL. A sitemap /
     RSS / Atom URL ingests the WHOLE site as one resource tree; pass ``args={"site": true}``
@@ -1455,12 +1464,13 @@ async def add_resource(
             "vectors_only" to skip semantic understanding and only build vector indexes.
         to: Exact final URI including the leaf name (e.g.
             "viking://resources/volcengine/OpenViking", or
-            "viking://~/resources/OpenViking" for a personal copy). Written verbatim; an existing
+            "viking://~/resources/OpenViking" for an identity-private copy). Written verbatim; an existing
             target is synced to match the new source, so visible entries it does not
             contain are deleted. Required when ``add_type`` is set.
-        parent: Existing directory to store the resource under, for remote or
+        parent: Directory to store the resource under, for remote or
             local-file imports (e.g. "viking://~/resources" or "viking://resources");
-            the leaf name comes from the source. Never overwrites
+            missing directories are created automatically. The leaf name comes from the source.
+            Never overwrites
             — a collision reserves the next free name ("name_1", "name_2", ...) and
             returns a warning. Mutually exclusive with ``to``; not supported when
             ``add_type`` is set. Leaving both empty derives the directory and the name
@@ -1581,6 +1591,7 @@ async def add_resource(
                 add_type=add_type or None,
                 to=to or None,
                 parent=parent or None,
+                create_parent=bool(parent),
                 reason=description,
                 wait=False,
                 watch_interval=watch_interval,

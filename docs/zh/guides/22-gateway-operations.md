@@ -215,7 +215,7 @@ ov.example.com {
 用 OpenViking API 密钥连接 Studio 后，在侧边栏打开 **OpenViking 网关**。上游和上下文配置由整个账号共享，网关密钥和请求日志属于各个用户：
 
 - **没有设置管理密钥**：每个登录的用户都能添加和修改本账号的上游和上下文配置。
-- **设置了管理密钥**：“上游”和“上下文配置”标签页变为只读，OpenViking 的 admin 和 root 也一样。只读时仍能查看和测试上游（看不到 API Key 和请求头），并在给自己签发密钥时选用。点**输入网关管理密钥**解锁编辑，页头会显示“可修改上游和上下文配置”；解锁状态保持到点击**锁定**或关闭浏览器标签页。管理密钥被更换后，Studio 会自动锁定。
+- **设置了管理密钥**：“上游”和“上下文配置”标签页变为只读，OpenViking 的 admin 和 root 也一样。只读时仍能查看上游（看不到 API Key 和请求头），并在给自己签发密钥时选用；模型测试会真实请求服务商并可能计费，因此需要写权限。点**输入网关管理密钥**解锁编辑和测试，页头会显示“可修改上游和上下文配置”；解锁状态保持到点击**锁定**或关闭浏览器标签页。管理密钥被更换后，Studio 会自动锁定。
 - **网关密钥**：每个人都能给自己签发；账号管理员可以给本账号的用户签发；root 先在侧边栏切换账号。见[网关密钥](#网关密钥)。
 
 上游和上下文配置保存后，立即对使用它们的密钥生效（上下文配置只影响之后开始的对话）。还没有可用的上游或上下文配置、自己又不能修改时，请联系部署网关的人。
@@ -248,6 +248,7 @@ ov.example.com {
   - 末尾的斜杠会被去掉。`/api/paas/v4` 这类带版本路径的地址可以直接使用。
   - 客户端用方舟路径（`/gateway/api/v3/`、`/gateway/api/compatible/v1/`）发来的请求，按同样的规则拼接。
   - 一个上游只有一个 Base URL。同一服务商的不同协议地址不同时，要分别建上游：例如智谱 Chat Completions 用 `https://open.bigmodel.cn/api/paas/v4`，Responses 用 `https://open.bigmodel.cn/api/v1`。方舟 Coding Plan 的 Chat Completions 和 Responses 用 `…/api/coding/v3`，Anthropic Messages 用 `…/api/coding`。
+- **拼接协议接口路径**默认开启。如果 Base URL 已经是完整的请求地址，可以关闭它；关闭后，网关的所有上游请求都直接使用该 URL，不再拼接协议路径。
 
   编辑页会实时预览最终的请求地址；OpenAI、方舟这类地址漏掉路径，或者 Anthropic 地址多了 `/v1` 时，会给出提示和一键修正。
 
@@ -278,7 +279,7 @@ ov.example.com {
 
 #### 测试和删除
 
-在上游列表里点**测试**，网关用已存的凭证请求服务商的模型列表，告诉你地址是否有响应、密钥是否被接受。只读用户也能测试。测试不验证具体模型，也不代表允许使用 Coding Plan；各种结果的含义见[连接测试](../api/25-gateway.md#连接测试)。
+有写权限时，在上游列表里点**测试**，网关先检查已保存配置的连接。连接成功后，再选择或输入模型名运行模型测试。网关使用已存的凭证发送一次很小的生成请求，验证接口地址、密钥、模型名和协议能否一起正常工作。上游允许 Gateway 工具时会带上 OpenViking 工具，reasoning effort 使用模型默认值。服务商可能对模型请求计费。Coding Plan 上游在授权网关使用前仍会阻止模型测试。各种结果的含义见[上游测试](../api/25-gateway.md#上游测试)。
 
 有密钥在用的上游不能删除：先吊销这些密钥，或者改为停用这个上游。
 
@@ -719,6 +720,7 @@ URL 必须是 HTTP(S)，不能含凭证、查询参数或 fragment。未知字�
 | 协议 | `protocol` | | `anthropic`（Anthropic Messages）、`chat`（Chat Completions）或 `responses`（Responses）。 |
 | 服务商 | `vendor` | `generic` | `generic`、`anthropic`、`openai`、`deepseek`、`ark`（火山方舟）或 `byteplus`（BytePlus 方舟）。Studio 只提供服务商支持的协议，API 接受任意组合。 |
 | Base URL | `base_url` | | 服务商地址；默认地址和拼接规则见[上游](#上游)。 |
+| 拼接协议接口路径 | `append_endpoint_path` | `true` | 拼接所选协议的接口路径；关闭时把 `base_url` 直接作为完整请求地址。 |
 | API Key 由谁提供 | `auth_mode` | `managed` | `managed`（由网关保管 API Key）或 `passthrough`（每个客户端自带 API Key）。 |
 | API Key | `api_key` | | 只写，见[凭证](#凭证)。 |
 | 额外请求头 | `headers` | `{}` | 只写，见[凭证](#凭证)。 |

@@ -58,6 +58,8 @@ type UpstreamSettings = {
   name: string
   protocol: Protocol
   base_url: string
+  /** Append the selected protocol's endpoint path to base_url. */
+  append_endpoint_path: boolean
   auth_mode: AuthMode
   models: string[]
   /** Name clients use → model sent to the upstream. */
@@ -306,8 +308,17 @@ export type VlmImportResult = {
 export type UpstreamTestResult = {
   url?: string
   ok: boolean
+  kind?: 'connection' | 'model'
   status?: number
   reason?: string
+  response?: {
+    http_version: string
+    status: number
+    reason: string
+    headers: Record<string, string | string[]>
+    body: string
+    truncated?: boolean
+  }
 }
 
 /** Conversation to resync, taken from a log record. */
@@ -542,9 +553,15 @@ export const saveUpstream = (
 export const deleteUpstream = (connection: GatewayConnection, id: string) =>
   send<{ deleted: boolean }>(connection, 'DELETE', ['upstreams', id])
 
-/** Calls the upstream's model list with its stored credentials. */
-export const testUpstream = (connection: GatewayConnection, id: string) =>
-  send<UpstreamTestResult>(connection, 'POST', ['upstreams', id, 'test'])
+/** Checks connectivity, or sends one small generation request when a model is given. */
+export const testUpstream = (
+  connection: GatewayConnection,
+  id: string,
+  model?: string,
+) =>
+  send<UpstreamTestResult>(connection, 'POST', ['upstreams', id, 'test'], {
+    body: model ? { model } : {},
+  })
 
 export const listProfiles = (connection: GatewayConnection) =>
   send<Profile[]>(connection, 'GET', ['policies'])
