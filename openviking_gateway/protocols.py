@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import re
+from collections.abc import Sequence
 from decimal import Decimal
 from importlib.resources import files
 from typing import Any
@@ -20,6 +21,15 @@ _RULES = json.loads(files("openviking_gateway").joinpath("client-rules.json").re
 PLUGIN_TAGS = tuple(_RULES["plugin_tags"])
 NOISE_TAGS = tuple(_RULES["noise_tags"])
 AUXILIARY_PATTERNS = tuple(_RULES["auxiliary_patterns"])
+# re.I tries a pattern at every offset; plain ASCII patterns (no escapes, sets or flags),
+# lowercased, get re's literal search instead, the same match unless the text has one of
+# the only letters where lower() and re.I differ against ASCII (checked in the tests).
+REI_CASE_EXCEPTIONS = "İıſ"
+LOWERED_AUXILIARY = (
+    tuple(re.compile(p.lower()) for p in AUXILIARY_PATTERNS)
+    if all(p.isascii() and not re.search(r"[\\\[]|\(\?", p) for p in AUXILIARY_PATTERNS)
+    else ()
+)
 # Vendors whose models expect their reasoning back in later turns.
 REASONING_VENDORS = {"deepseek", "ark", "byteplus"}
 
@@ -138,8 +148,12 @@ def normalize(value: Any) -> Any:
     return value
 
 
-def prefix_chain(messages: list[dict]) -> list[str]:
-    previous = hashlib.sha256(NORMALIZATION_VERSION.encode()).digest()
+def prefix_chain(messages: list[dict], after: Sequence[str] = ()) -> list[str]:
+    """Anchors of ``messages``; ``after``, the chain of the history before them, continues it."""
+    previous = next(
+        (bytes.fromhex(a) for a in reversed(after) if a),
+        hashlib.sha256(NORMALIZATION_VERSION.encode()).digest(),
+    )
     result = []
     for message in messages:
         if (
@@ -163,6 +177,22 @@ def prefix_chain(messages: list[dict]) -> list[str]:
     return result
 
 
+def client_texts(body: dict) -> list[str]:
+    """The system prompt and the client-written messages, without replies or tool output."""
+    texts = [text_content({"content": body.get("system", "")}), body.get("instructions", "")]
+    for field in ("messages", "input"):
+        messages = body.get(field, [])
+        if isinstance(messages, str):
+            texts.append(messages)
+        elif isinstance(messages, list):
+            texts.extend(
+                text_content(m)
+                for m in messages
+                if isinstance(m, dict) and m.get("role") in {"user", "system", "developer"}
+            )
+    return [text for text in texts if isinstance(text, str)]
+
+
 def plugin_present(body: dict, headers: dict) -> bool:
     if headers.get("x-openviking-plugin"):
         return True
@@ -184,29 +214,74 @@ def plugin_present(body: dict, headers: dict) -> bool:
         )
         return any(re.search(rf"<{re.escape(tag)}(?:\s|>)", text, re.I) for tag in PLUGIN_TAGS)
 
-    texts = [text_content({"content": body.get("system", "")}), body.get("instructions", "")]
-    for field in ("messages", "input"):
-        messages = body.get(field, [])
-        if isinstance(messages, str):
-            texts.append(messages)
-        elif isinstance(messages, list):
-            texts.extend(
-                text_content(m)
-                for m in messages
-                if isinstance(m, dict) and m.get("role") in {"user", "system", "developer"}
-            )
-    if any(marked(text) for text in texts if isinstance(text, str)):
-        return True
-    # Only tool definitions identify plugin ownership. File names, tool results
-    # and assistant prose must never permanently disable a session.
-    for tool in [*body.get("tools", []), *body.get("additional_tools", [])]:
+    # Plugins mark the context they inject. OpenViking tools alone, as from an MCP
+    # connection, only keep the gateway's tools out (see client_openviking_tools).
+    return any(marked(text) for text in client_texts(body))
+
+
+OPENVIKING_WORD = r"(?<![a-z0-9])openviking(?![a-z0-9])"
+
+
+def client_openviking_tools(body: dict, names) -> bool:
+    """Whether the client already exposes OpenViking tools, whatever its MCP server is named.
+
+    ``names`` are the bare OpenViking tool names, such as ``read`` and ``add_resource``.
+    """
+    if not names:
+        return False
+    pending = []
+    for key in ("tools", "additional_tools", "mcp_servers"):
+        if isinstance(body.get(key), list):
+            pending.extend(("", tool) for tool in body[key])
+    if isinstance(body.get("input"), list):
+        for item in body["input"]:
+            if isinstance(item, dict) and item.get("type") == "additional_tools":
+                if isinstance(item.get("tools"), list):
+                    pending.extend(("", tool) for tool in item["tools"])
+    # Prefixed like mcp__ov__read or ov_read; a bare Read is a client's own tool.
+    alternatives = "|".join(map(re.escape, names))
+    ending = re.compile(rf"[^a-z0-9](?:{alternatives})$", re.I)
+    while pending:
+        parent, tool = pending.pop()
         if not isinstance(tool, dict):
             continue
         definition = tool.get("function", tool)
-        name = definition.get("name", definition.get("namespace", ""))
-        if isinstance(name, str) and re.search(r"(^|__)openviking(?:_|__|$)", name, re.I):
+        if not isinstance(definition, dict):
+            continue
+        labels = [
+            parent + definition[key]
+            for key in ("name", "namespace", "server_label", "mcp_server_name")
+            if isinstance(definition.get(key), str)
+        ]
+        if isinstance(definition.get("tools"), list):
+            # A namespace's tools are named without it, as in mcp__kb + glob; they
+            # decide, not the namespace name.
+            prefix = (labels[0] + "__") if labels else ""
+            pending.extend((prefix, child) for child in definition["tools"])
+            continue
+        # Hosted MCP servers (Responses mcp, Anthropic mcp_servers and mcp_toolset) list
+        # no tools, so their name is all there is.
+        server = definition.get("type") in {"mcp", "mcp_toolset", "url"}
+        named_tool = isinstance(definition.get("name"), str) and not server
+        # A tool must be one of OpenViking's, so a connector's authenticate tool is not.
+        if any(
+            re.search(OPENVIKING_WORD, label, re.I) and (not named_tool or ending.search(label))
+            for label in labels
+        ):
             return True
-    return False
+        # A renamed server's tools keep their names and mention viking:// URIs, while
+        # a container such as a skill list may quote an OpenViking description too.
+        if (
+            any(ending.search(label) for label in labels)
+            and "viking://" in orjson.dumps(definition).decode().lower()
+        ):
+            return True
+    # Deferred MCP tools, as in Claude Code's tool search, are listed only by name, one
+    # per line; a name mentioned in prose is not a tool. Most texts have no "__" at all.
+    deferred = rf"^[ \t]*mcp__[\w-]*?{OPENVIKING_WORD}[\w-]*__(?:{alternatives})[ \t]*$"
+    return any(
+        "__" in text and re.search(deferred, text, re.I | re.M) for text in client_texts(body)
+    )
 
 
 def is_user(message):
@@ -220,6 +295,14 @@ def is_user(message):
             )
         )
     )
+
+
+def auxiliary(text: str) -> bool:
+    """Whether ``text`` matches an auxiliary pattern, ignoring case."""
+    if LOWERED_AUXILIARY and not any(c in text for c in REI_CASE_EXCEPTIONS):
+        text = text.lower()
+        return any(pattern.search(text) for pattern in LOWERED_AUXILIARY)
+    return any(re.search(pattern, text, re.I) for pattern in AUXILIARY_PATTERNS)
 
 
 def classify(body: dict, headers: dict, messages: list[dict]) -> tuple[str, int]:
@@ -249,7 +332,7 @@ def classify(body: dict, headers: dict, messages: list[dict]) -> tuple[str, int]
     probe = str(body.get("system", "")) + str(body.get("instructions", ""))
     if anchor >= 0:
         probe += text_content(messages[anchor])
-    if any(re.search(pattern, probe, re.I) for pattern in AUXILIARY_PATTERNS):
+    if auxiliary(probe):
         return "auxiliary", anchor
     if anchor < 0:
         return "continuation", anchor
@@ -320,16 +403,21 @@ def usage_of(value: dict) -> dict:
 class SSEDecoder:
     """Incremental byte framing, including CRLF and frames split inside UTF-8."""
 
+    # A frame ends at a blank line. Only where it ends matters, so the pattern starts
+    # at the newline, which the scan finds much faster than an optional CR.
+    frame_end = re.compile(rb"\n\r?\n")
+
     def __init__(self, max_buffer=8 * 1024 * 1024):
         self.buffer = b""
         self.max_buffer = max_buffer
 
     def feed(self, chunk: bytes) -> list[bytes]:
-        self.buffer += chunk
-        frames = []
-        while match := re.search(rb"\r?\n\r?\n", self.buffer):
-            frames.append(self.buffer[: match.end()])
-            self.buffer = self.buffer[match.end() :]
+        # One pass and one copy of the rest, however many frames the chunk holds.
+        buffer, frames, start = self.buffer + chunk, [], 0
+        for match in self.frame_end.finditer(buffer):
+            frames.append(buffer[start : match.end()])
+            start = match.end()
+        self.buffer = buffer[start:]
         if len(self.buffer) > self.max_buffer:
             raise ValueError("SSE event exceeds capture limit")
         return frames
@@ -337,7 +425,7 @@ class SSEDecoder:
     @staticmethod
     def data(frame: bytes) -> dict | None:
         data = b"\n".join(
-            line[5:].lstrip(b" ") for line in frame.splitlines() if line.startswith(b"data:")
+            [line[5:].lstrip(b" ") for line in frame.splitlines() if line.startswith(b"data:")]
         )
         try:
             value = orjson.loads(data)

@@ -17,6 +17,12 @@ openviking-server --config /path/to/ov.conf
 
 The server reads the file at startup. Restart the server after changing models, retrieval, storage, or `server` settings, then run `openviking-server doctor`.
 
+Studio's **Server configuration** page offers **Save and restart** for a single-worker `openviking-server` process. The existing ROOT-only `GET /api/v1/admin/configuration?source=file` includes restart capability and instance identity. Only ROOT can request a restart (`POST /api/v1/admin/restart`, body `{"revision":"<saved file revision>"}`). The server validates the current file and its revision, returns HTTP 202, drains active requests, stops its managed Bot, then replaces itself using the original interpreter, arguments, environment and working directory. Studio waits for a new service instance before reporting success. **Save configuration** alone continues to save without restarting.
+
+Multi-worker or embedded ASGI applications report restart as unsupported; restart these through the deployment platform. Startup can still fail because of external dependencies even after schema validation. If the address, port or ROOT credential changes, update Studio's connection settings to reconnect. Account and cluster overrides continue to take precedence over file defaults.
+
+Configurations containing environment references are read-only in the Studio form. Use file mode to edit the original text; quoted/unquoted references, escapes and formatting are saved as submitted. Windows `%VAR%` references and dollar/percent literals (including `\u0024` and `\u0025`) also use file mode to avoid introducing new references during form serialization.
+
 ## Configuration Structure
 
 This outline shows common top-level groups, not a runnable configuration. For a first deployment, start with the [minimal example](#minimal-example) and supply your models and credentials. Merge later snippets into the same `ov.conf`.
@@ -307,7 +313,7 @@ When `base_url` is configured, OV sends the current user's OV API key in `X-API-
 | `with_bot` | boolean | `false` | Enable the VikingBot API proxy |
 | `bot_api_url` | URL | `http://localhost:18790` | VikingBot OpenAPI endpoint |
 | `public_base_url` | URL / `null` | `null` | Externally visible base URL |
-| `upload_signed_ttl_seconds` | integer | `600` | Signed upload URL lifetime |
+| `upload_signed_ttl_seconds` | integer | `600` | Signed upload and download URL lifetime |
 | `temp_upload.default_mode` | `"local"` / `"shared"` | `"local"` | Temporary upload storage |
 
 ### Encryption and API Key Hashing
