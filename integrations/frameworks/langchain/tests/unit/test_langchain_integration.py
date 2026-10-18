@@ -10,7 +10,6 @@ pytest.importorskip("langchain_core")
 pytest.importorskip("langgraph")
 pytest.importorskip("langchain_openviking")
 
-import langchain_openviking.client as client_helpers
 from langchain_core.messages import (
     AIMessage,
     HumanMessage,
@@ -19,6 +18,10 @@ from langchain_core.messages import (
     convert_to_openai_messages,
 )
 from langchain_core.runnables import RunnableLambda
+from langgraph.store.base import PutOp
+from openviking_sdk.errors import InvalidArgumentError
+
+import langchain_openviking.client as client_helpers
 from langchain_openviking import (
     InMemoryOpenVikingClient,
     OpenVikingChatMessageHistory,
@@ -42,8 +45,6 @@ from langchain_openviking.history import (
 )
 from langchain_openviking.middleware import _message_signature
 from langchain_openviking.tools import _archive_grep_pattern, _resolve_resource_source
-from langgraph.store.base import PutOp
-from openviking_sdk.errors import InvalidArgumentError
 
 
 def test_langchain_client_exposes_apply_commit_policy_without_legacy_alias():
