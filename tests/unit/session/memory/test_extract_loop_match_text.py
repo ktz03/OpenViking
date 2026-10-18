@@ -1208,18 +1208,21 @@ class TestPageIdInstruction:
 
         system_content = loop._call_llm.await_args.args[0][0]["content"]
         assert "## Page ID Rules" in system_content
-        assert "## Read Format Rules" in system_content
+        assert "## Read Format Rules" not in system_content
         assert 'Every memory item you create or edit MUST include "page_id".' in system_content
         assert (
             "The read tool accepts `uri`, optional `offset` (0-indexed), and optional `limit`."
-            in system_content
+            not in system_content
         )
-        assert "each visible line is prefixed with `line_number<TAB>`" in system_content
+        assert "each visible line is prefixed with `line_number<TAB>`" not in system_content
         assert (
             "Never include the line-number prefix itself in `search`, `replace`, or `delete`."
+            not in system_content
+        )
+        assert (
+            "For existing items, use the page_id shown in the supplied memory context."
             in system_content
         )
-        assert "For existing items, use the page_id shown in read/search results." in system_content
         assert "For new items, assign a unique page_id >= 100." in system_content
         assert "When editing an existing item, reuse its existing page_id." in system_content
         assert "Link fields" not in system_content
@@ -1283,10 +1286,10 @@ class TestPageIdInstruction:
 
         system_content = loop._call_llm.await_args.args[0][0]["content"]
         assert "## Page ID Rules" in system_content
-        assert "## Read Format Rules" in system_content
+        assert "## Read Format Rules" not in system_content
         assert "## Link Rules" in system_content
         assert "Link fields `f` and `t` must reference these page_id values." in system_content
-        assert "each visible line is prefixed with `line_number<TAB>`" in system_content
+        assert "each visible line is prefixed with `line_number<TAB>`" not in system_content
         assert "Only create links when the relationship is meaningful" in system_content
 
 
@@ -1367,20 +1370,13 @@ class TestExtractionMaxOutputTokens:
 
     def _loop(self, *, vlm_max_tokens, per_loop=None):
         loop = ExtractLoop(
-            vlm=Mock(model="test-model"),
+            vlm=Mock(model="test-model", max_tokens=vlm_max_tokens),
             viking_fs=Mock(),
             context_provider=Mock(),
             isolation_handler=Mock(),
             max_output_tokens=per_loop,
         )
-        with patch(
-            "openviking.session.memory.extract_loop.get_openviking_config"
-        ) as mock_config:
-            mock_config.return_value = SimpleNamespace(
-                memory=SimpleNamespace(link_enabled=False, extraction_output_format="python"),
-                vlm=SimpleNamespace(max_tokens=vlm_max_tokens),
-            )
-            loop._resolve_effective_max_output_tokens()
+        loop._resolve_effective_max_output_tokens()
         return loop
 
     def test_default_floor_used_when_unconfigured(self):

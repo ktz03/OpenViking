@@ -140,7 +140,7 @@ def test_codex_vision_completion_converts_images(mock_resolve, mock_openai_class
     )
     mock_openai_class.return_value = mock_real_client
 
-    vlm = CodexVLM({"provider": "openai-codex", "model": "gpt-5.3-codex"})
+    vlm = CodexVLM({"provider": "openai-codex", "model": "gpt-5.6-terra"})
     result = vlm.get_vision_completion("describe", [b"\x89PNG\r\n\x1a\n0000"])
 
     assert result == "image result"
@@ -219,10 +219,14 @@ async def test_codex_async_stream_uses_text_deltas_when_completed_output_is_none
 
 @patch("openviking.models.vlm.backends.codex_auth.has_codex_auth_available", return_value=True)
 def test_vlm_config_accepts_codex_without_api_key(_mock_auth_available):
+    from openviking.models.vlm.retry_vlm import RetryVLM
+
     config = VLMConfig(provider="openai-codex", model="gpt-5.3-codex")
 
     assert config.is_available() is True
-    assert config.get_vlm_instance().__class__.__name__ == "CodexVLM"
+    instance = config.get_vlm_instance()
+    assert isinstance(instance, RetryVLM)
+    assert instance.inner.__class__.__name__ == "CodexVLM"
 
 
 @patch("openviking.models.vlm.backends.codex_auth.has_codex_auth_available", return_value=True)

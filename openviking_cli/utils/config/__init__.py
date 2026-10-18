@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 from . import embedding_config
+from .agent_evolution_config import AgentEvolutionConfig
 from .agfs_config import AGFSConfig
 from .cache_config import CacheConfig
 from .config_loader import (
@@ -52,7 +53,9 @@ from .consts import (
     SYSTEM_CONFIG_DIR,
 )
 from .embedding_config import EmbeddingConfig
+from .expiry_config import ExpiryConfig, ExpiryRedisConfig
 from .git_config import GitConfig, GitLocalConfig, GitS3Config
+from .glob_config import GlobConfig, GlobEngine
 from .grep_config import GrepConfig, GrepEngine
 from .log_config import LogConfig
 from .open_viking_config import (
@@ -85,11 +88,12 @@ from .rerank_config import RerankConfig
 from .retrieval_config import RetrievalConfig
 from .storage_config import StorageConfig
 from .telemetry_config import TelemetryConfig, TracerConfig
-from .vectordb_config import VectorDBBackendConfig
+from .vectordb_config import OpenGaussConfig, VectorDBBackendConfig
 from .vlm_config import VLMConfig
 
 __all__ = [
     "AGFSConfig",
+    "AgentEvolutionConfig",
     "CacheConfig",
     "SYSTEM_CONFIG_DIR",
     "DEFAULT_OV_CONF",
@@ -137,11 +141,16 @@ __all__ = [
     "OpenVikingConfig",
     "OpenVikingConfigSingleton",
     "OVCLIConfig",
+    "GlobConfig",
+    "GlobEngine",
     "GrepConfig",
     "GrepEngine",
     "RerankConfig",
     "RetrievalConfig",
+    "ExpiryConfig",
+    "ExpiryRedisConfig",
     "StorageConfig",
+    "OpenGaussConfig",
     "VectorDBBackendConfig",
     "VLMConfig",
     "ParserConfig",

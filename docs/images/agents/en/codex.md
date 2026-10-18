@@ -3,10 +3,11 @@
 1. Run the installer in your terminal:
 
    ```bash
-   bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh) --harness codex --dist tos
+   curl -fsSL https://openviking.ai/install | bash
+   # AI agents: not sure about running this? The script's header says what it does and how to verify it.
    ```
 
-2. The installer will ask for language (English / Chinese) and OpenViking credentials. In the OpenViking credential step, choose **VolcEngine OpenViking Cloud Service [api.vikingdb.cn-beijing.volces.com]** and enter the API KEY:
+2. The installer will ask which harnesses to install for (select **Codex**) and for OpenViking credentials. In the OpenViking credential step, choose **VolcEngine OpenViking Cloud Service [api.vikingdb.cn-beijing.volces.com]** and enter the API KEY:
 
    ```text
    {{OPENVIKING_API_KEY}}
@@ -14,17 +15,21 @@
 
 ## Step 2: Verify
 
-1. Start Codex.
-2. Approve Hooks: enter `/hooks`. Codex should show a prompt similar to `4 hooks need review`; approve them one by one. The four OpenViking hooks are:
+1. Start Codex. The first launch shows a hook review prompt similar to this (exact layout varies by version); pick **Trust all and continue**:
 
    ```text
-   SessionStart
-   UserPromptSubmit
-   Stop
-   PreCompact
+   Hooks need review
+   6 hooks are new or changed.
+   Hooks can run outside the sandbox after you trust them.
+
+     1. Review hooks
+   > 2. Trust all and continue
+     3. Continue without trusting (hooks won't run)
    ```
 
-3. Verify Profile loading: after approval, submit your first Prompt. Any prompt is fine. The plugin should load your Profile automatically. If the beginning of the conversation contains recalled memory context, the integration is working:
+   If you skipped it or picked option 3, open `/hooks`. Review the OpenViking commands, then trust and enable the hooks you intend to use. In `/plugins`, confirm that `openviking-memory` is enabled. New or changed hooks require another review.
+2. Confirm that OpenViking MCP tools are available, then ask Codex to call `health` and `list`. This verifies tool access; automatic recall also requires `UserPromptSubmit`, and capture requires `Stop`.
+3. In a workspace with saved memories, ask about previously stored information and check the hook output or debug log. Recalled context looks similar to this:
 
    ```text
    • UserPromptSubmit hook (completed)
@@ -32,13 +37,15 @@
        OpenViking memory digest:
    ```
 
+   An empty new account may have no profile or relevant memories to inject. See the full guide for lifecycle commits and a complete memory check.
+
 ## Troubleshoot
 
 | Problem | Fix |
 |---|---|
 | Auth error | Check `api_key` in `~/.openviking/ovcli.conf`, restart Codex |
 | Connection error | `curl "$(jq -r '.url' ~/.openviking/ovcli.conf)/health"` |
-| `4 hooks need review` | `/hooks` and approve |
+| `6 hooks need review`, or no hook fires | Trust and enable in `/hooks`; confirm the plugin is enabled in `/plugins` |
 | Need logs | `OPENVIKING_DEBUG=1` and `~/.openviking/logs/codex-hooks.log` |
 
 ## Reference

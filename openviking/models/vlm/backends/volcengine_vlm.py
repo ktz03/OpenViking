@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: AGPL-3.0
 """VolcEngine VLM backend implementation."""
 
-import asyncio
 import base64
 import json
 import time
@@ -10,6 +9,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
+from openviking.models.model_error import model_error_boundary
+from openviking.models.network import (
+    create_optional_async_httpx_client,
+    create_optional_sync_httpx_client,
+)
 from openviking.telemetry import tracer
 from openviking.utils.message_format import format_messages, sanitize_openai_messages
 from openviking.utils.multimodal import redact_image_data_urls
@@ -22,6 +26,7 @@ logger = get_logger(__name__)
 
 VOLCENGINE_CLIENT_REQUEST_ID_HEADER = "X-Client-Request-Id"
 VOLCENGINE_CLIENT_REQUEST_ID = "ToB-direct,OpenViking_Service,openviking-service_cn-beijing"
+DEFAULT_VOLCENGINE_API_BASE = "https://ark.cn-beijing.volces.com/api/v3"
 
 
 def _build_volcengine_headers(extra_headers: Optional[Dict[str, str]]) -> Dict[str, str]:
@@ -59,7 +64,7 @@ class VolcEngineVLM(OpenAIVLM):
         self.extra_headers = _build_volcengine_headers(self.extra_headers)
 
         if not self.api_base:
-            self.api_base = "https://ark.cn-beijing.volces.com/api/v3"
+            self.api_base = DEFAULT_VOLCENGINE_API_BASE
         if not self.model:
             self.model = "doubao-seed-2-0-lite-260428"
 
@@ -94,6 +99,9 @@ class VolcEngineVLM(OpenAIVLM):
                     "completion_tokens": response.usage.completion_tokens,
                     "total_tokens": response.usage.total_tokens,
                     "prompt_tokens_details": getattr(response.usage, "prompt_tokens_details", None),
+                    "completion_tokens_details": getattr(
+                        response.usage, "completion_tokens_details", None
+                    ),
                 }
 
             return VLMResponse(
@@ -113,12 +121,19 @@ class VolcEngineVLM(OpenAIVLM):
                 raise ImportError(
                     "Please install volcenginesdkarkruntime: pip install volcenginesdkarkruntime"
                 )
-            self._sync_client = volcenginesdkarkruntime.Ark(
-                api_key=self.api_key,
-                base_url=self.api_base,
+            kwargs = {
+                "api_key": self.api_key,
+                "base_url": self.api_base,
+                "timeout": self.timeout,
+                "max_retries": 0,
+            }
+            http_client = create_optional_sync_httpx_client(
+                self.api_base,
                 timeout=self.timeout,
-                max_retries=0,
             )
+            if http_client is not None:
+                kwargs["http_client"] = http_client
+            self._sync_client = volcenginesdkarkruntime.Ark(**kwargs)
         return self._sync_client
 
     def _build_async_client(self):
@@ -129,12 +144,19 @@ class VolcEngineVLM(OpenAIVLM):
             raise ImportError(
                 "Please install volcenginesdkarkruntime: pip install volcenginesdkarkruntime"
             )
-        return volcenginesdkarkruntime.AsyncArk(
-            api_key=self.api_key,
-            base_url=self.api_base,
+        kwargs = {
+            "api_key": self.api_key,
+            "base_url": self.api_base,
+            "timeout": self.timeout,
+            "max_retries": 0,
+        }
+        http_client = create_optional_async_httpx_client(
+            self.api_base,
             timeout=self.timeout,
-            max_retries=0,
         )
+        if http_client is not None:
+            kwargs["http_client"] = http_client
+        return volcenginesdkarkruntime.AsyncArk(**kwargs)
 
     def supports_media(
         self,
@@ -169,6 +191,7 @@ class VolcEngineVLM(OpenAIVLM):
             media_type=media_type,
         )
 
+    @model_error_boundary
     def get_completion(
         self,
         prompt: str = "",
@@ -189,6 +212,8 @@ class VolcEngineVLM(OpenAIVLM):
             "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
             "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
+        if self.extra_request_body:
+            kwargs["extra_body"] = dict(self.extra_request_body)
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
         if tools:
@@ -209,6 +234,7 @@ class VolcEngineVLM(OpenAIVLM):
             return result
         return self._clean_response(str(result))
 
+    @model_error_boundary
     async def get_completion_async(
         self,
         prompt: str = "",
@@ -217,8 +243,9 @@ class VolcEngineVLM(OpenAIVLM):
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
         max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> Union[str, VLMResponse]:
-        """Get text completion asynchronously via Chat Completions API."""
+        """Get text completion; per-call reasoning effort applies only with thinking enabled."""
         effective_thinking = self.thinking if thinking is None else thinking
         effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
         kwargs_messages = sanitize_openai_messages(
@@ -231,8 +258,12 @@ class VolcEngineVLM(OpenAIVLM):
             "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
             "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
+        if self.extra_request_body:
+            kwargs["extra_body"] = dict(self.extra_request_body)
         if effective_max_tokens is not None:
             kwargs["max_tokens"] = effective_max_tokens
+        if effective_thinking and reasoning_effort is not None:
+            kwargs["reasoning_effort"] = reasoning_effort
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
@@ -248,30 +279,24 @@ class VolcEngineVLM(OpenAIVLM):
 
         client = self.get_async_client()
 
-        last_error = None
-        for attempt in range(self.max_retries + 1):
+        async def _call() -> Union[str, VLMResponse]:
+            t0 = time.perf_counter()
             try:
-                t0 = time.perf_counter()
                 response = await client.chat.completions.create(**kwargs)
-                elapsed = time.perf_counter() - t0
-                self._update_token_usage_from_response(response, duration_seconds=elapsed)
-                result = self._build_vlm_response(response, has_tools=bool(tools))
-                if tools:
-                    return result
-                content = self._clean_response(str(result))
-                if content:
-                    tracer.info(f"message.content={content}")
-                return content
-            except Exception as e:
-                self.record_failed_call(duration_seconds=time.perf_counter() - t0, error=e)
-                last_error = e
-                if attempt < self.max_retries:
-                    await asyncio.sleep(2**attempt)
+            except Exception as error:
+                self.record_failed_call(duration_seconds=time.perf_counter() - t0, error=error)
+                raise
+            elapsed = time.perf_counter() - t0
+            self._update_token_usage_from_response(response, duration_seconds=elapsed)
+            result = self._build_vlm_response(response, has_tools=bool(tools))
+            if tools:
+                return result
+            content = self._clean_response(str(result))
+            if content:
+                tracer.info(f"message.content={content}")
+            return content
 
-        if last_error:
-            raise last_error
-        else:
-            raise RuntimeError("Unknown error in async completion")
+        return await _call()
 
     def _detect_image_format(self, data: bytes) -> str:
         """Detect image format from magic bytes.
@@ -387,6 +412,7 @@ class VolcEngineVLM(OpenAIVLM):
         else:
             return {"type": "image_url", "image_url": {"url": image}}
 
+    @model_error_boundary
     def get_vision_completion(
         self,
         prompt: str = "",
@@ -415,6 +441,8 @@ class VolcEngineVLM(OpenAIVLM):
             "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
             "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
+        if self.extra_request_body:
+            kwargs["extra_body"] = dict(self.extra_request_body)
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
         if tools:
@@ -435,6 +463,7 @@ class VolcEngineVLM(OpenAIVLM):
             return result
         return self._clean_response(str(result))
 
+    @model_error_boundary
     async def get_vision_completion_async(
         self,
         prompt: str = "",
@@ -463,6 +492,8 @@ class VolcEngineVLM(OpenAIVLM):
             "thinking": {"type": "disabled" if not effective_thinking else "enabled"},
             "extra_headers": build_volcengine_request_headers(self.extra_headers),
         }
+        if self.extra_request_body:
+            kwargs["extra_body"] = dict(self.extra_request_body)
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
         if tools:

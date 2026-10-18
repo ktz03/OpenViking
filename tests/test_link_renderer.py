@@ -608,6 +608,22 @@ class TestStripLinks:
         result = LinkRenderer.strip_all_links(content)
         assert result == "用户上传了一张越前龙马的照片。"
 
+    def test_strip_managed_links_preserves_external_and_unrelated_links(self):
+        source = "viking://user/u/memories/events/visit.md"
+        old_target = "viking://user/u/memories/entities/person/阿珍.md"
+        content = (
+            "[阿珍](../entities/person/阿珍.md) visited "
+            "[GitHub](https://github.com) and [notes](./notes.md)."
+        )
+
+        result = LinkRenderer.strip_managed_links(
+            content,
+            source,
+            [{"from_uri": source, "to_uri": old_target, "match_text": "阿珍"}],
+        )
+
+        assert result == "阿珍 visited [GitHub](https://github.com) and [notes](./notes.md)."
+
 
 class TestRoundTrip:
     def test_render_then_strip(self):

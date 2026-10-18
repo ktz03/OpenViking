@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from openviking.server.auth import get_request_context
 from openviking.server.identity import RequestContext, Role
 from openviking.server.routers import filesystem
+from openviking.service.fs_service import ListingPage
 from openviking_cli.exceptions import InvalidURIError
 from openviking_cli.session.user_id import UserIdentifier
 
@@ -20,8 +21,11 @@ from openviking_cli.session.user_id import UserIdentifier
 async def test_rm_preserves_memory_cleanup(monkeypatch):
     cleanup = {"status": "success", "memory_uris": ["viking://user/alice/memories/entities/a.md"]}
 
-    async def fake_rm(uri, ctx=None, recursive=False, wait=False, timeout=None):
-        return {"estimated_deleted_count": 1, "memory_cleanup": cleanup}
+    async def fake_rm(uri, ctx=None, recursive=False, wait=False):
+        return {
+            "estimated_deleted_count": 1,
+            "memory_cleanup": cleanup,
+        }
 
     monkeypatch.setattr(
         filesystem,
@@ -169,7 +173,7 @@ async def test_attrs_returns_memory_fields_and_tags(monkeypatch):
         "-->"
     )
 
-    async def fake_stat(uri, ctx=None):
+    async def fake_stat(uri, ctx=None, skip_count=False):
         return {"isDir": False}
 
     async def fake_read(uri, ctx=None):
@@ -368,6 +372,7 @@ async def test_ls_user_container_lists_only_caller_space(app, client, service):
     assert response.status_code == 200, response.text
     names = {entry["name"] for entry in response.json()["result"]}
     assert names == {"alice"}
+    assert response.json()["has_more"] is False
 
 
 @pytest.mark.asyncio
@@ -376,11 +381,11 @@ async def test_ls_and_tree_forward_pagination_to_filesystem_service(monkeypatch)
 
     async def fake_ls(uri, **kwargs):
         seen["ls"].update(uri=uri, **kwargs)
-        return []
+        return ListingPage(entries=[{"name": "a.md"}], has_more=True)
 
     async def fake_tree(uri, **kwargs):
         seen["tree"].update(uri=uri, **kwargs)
-        return []
+        return ListingPage(entries=[{"name": "b.md"}], has_more=False)
 
     monkeypatch.setattr(
         filesystem,
@@ -388,14 +393,17 @@ async def test_ls_and_tree_forward_pagination_to_filesystem_service(monkeypatch)
         lambda: SimpleNamespace(fs=SimpleNamespace(ls=fake_ls, tree=fake_tree)),
     )
 
-    await filesystem.ls(
+    ls_response = await filesystem.ls(
         uri="viking://resources",
         tags=["team=search", "env=prod"],
         offset=4,
         limit=9,
+        include_abstract=False,
+        include_overview=True,
+        overview_limit=512,
         _ctx=RequestContext(user=UserIdentifier("acct", "alice"), role=Role.USER),
     )
-    await filesystem.tree(
+    tree_response = await filesystem.tree(
         uri="viking://resources",
         offset=3,
         limit=5,
@@ -405,5 +413,12 @@ async def test_ls_and_tree_forward_pagination_to_filesystem_service(monkeypatch)
     assert seen["ls"]["tags"] == ["team=search", "env=prod"]
     assert seen["ls"]["offset"] == 4
     assert seen["ls"]["node_limit"] == 9
+    assert seen["ls"]["include_abstract"] is False
+    assert seen["ls"]["include_overview"] is True
+    assert seen["ls"]["overview_limit"] == 512
     assert seen["tree"]["offset"] == 3
     assert seen["tree"]["node_limit"] == 5
+    assert ls_response.result == [{"name": "a.md"}]
+    assert ls_response.has_more is True
+    assert tree_response.result == [{"name": "b.md"}]
+    assert tree_response.has_more is False

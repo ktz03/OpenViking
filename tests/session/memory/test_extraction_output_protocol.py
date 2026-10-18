@@ -4,16 +4,26 @@
 
 import json
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from openviking.session.memory.dataclass import MemoryField, MemoryFile, MemoryTypeSchema
+from openviking.session.memory.dataclass import (
+    MemoryField,
+    MemoryFile,
+    MemoryTypeSchema,
+    ResolvedOperations,
+)
+from openviking.session.memory.extract_loop import ExtractLoop
 from openviking.session.memory.extraction_output_protocol import (
     ExtractionOutputContext,
     create_extraction_output_protocol,
 )
 from openviking.session.memory.memory_isolation_handler import RoleScope
+from openviking.session.memory.memory_type_registry import (
+    MemoryTypeRegistry,
+    resolve_memory_templates_dir,
+)
 from openviking.session.memory.merge_op import FieldType, MergeOp
 from openviking.session.memory.page_id_map import PageIdMap
 from openviking.session.memory.schema_model_generator import SchemaModelGenerator
@@ -67,6 +77,32 @@ def _project_schema() -> MemoryTypeSchema:
     )
 
 
+def _renameable_entity_schema() -> MemoryTypeSchema:
+    return MemoryTypeSchema(
+        memory_type="entities",
+        description="Entities",
+        directory="viking://user/{{ user_space }}/memories/entities",
+        filename_template="{{ category }}/{{ name }}.md",
+        fields=[
+            MemoryField(
+                name="category",
+                field_type=FieldType.STRING,
+                merge_op=MergeOp.REPLACE,
+            ),
+            MemoryField(
+                name="name",
+                field_type=FieldType.STRING,
+                merge_op=MergeOp.REPLACE,
+            ),
+            MemoryField(
+                name="content",
+                field_type=FieldType.STRING,
+                merge_op=MergeOp.PATCH,
+            ),
+        ],
+    )
+
+
 def _profile_schema() -> MemoryTypeSchema:
     return MemoryTypeSchema(
         memory_type="profile",
@@ -90,12 +126,13 @@ def _context(
     link_enabled: bool = False,
     role_scope: RoleScope | None = None,
     available_tools: tuple[str, ...] = ("read",),
+    template_context: dict[str, str] | None = None,
 ) -> ExtractionOutputContext:
     config = SimpleNamespace(memory=SimpleNamespace(link_enabled=link_enabled))
     with patch("openviking_cli.utils.config.get_openviking_config", return_value=config):
-        operations_model = SchemaModelGenerator(schemas).create_structured_operations_model(
-            role_scope
-        )
+        operations_model = SchemaModelGenerator(
+            schemas, template_context=template_context
+        ).create_structured_operations_model(role_scope)
     page_id_map = PageIdMap()
     read_file_contents = {}
     for memory_file in files or []:
@@ -109,6 +146,7 @@ def _context(
         link_enabled=link_enabled,
         role_scope=role_scope,
         available_tools=available_tools,
+        template_context=dict(template_context or {}),
     )
 
 
@@ -144,6 +182,11 @@ def test_json_protocol_preserves_stable_parser_and_empty_contract():
     assert '"preferences": []' in protocol.render_final_instruction(context)
     assert '"delete_ids": []' in protocol.render_final_instruction(context)
 
+    assert protocol.parse('{"memory_operations": [{"type": "edit"}]}', context) == (
+        None,
+        "No expected fields found; got fields: memory_operations",
+    )
+
 
 def test_python_contract_and_bindings_expose_only_selected_schema_fields():
     uri = "viking://user/alice/memories/preferences/editor.md"
@@ -166,6 +209,28 @@ def test_python_contract_and_bindings_expose_only_selected_schema_fields():
     assert protocol.render_new_bindings(context, source="duplicate read") == ""
 
 
+def test_python_update_preserves_unchanged_mutable_identity_fields():
+    uri = "viking://user/alice/memories/entities/person/阿珍.md"
+    file = MemoryFile(
+        uri=uri,
+        memory_type="entities",
+        content="大学室友",
+        extra_fields={"category": "person", "name": "阿珍"},
+    )
+    context = _context([_renameable_entity_schema()], files=[file])
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+
+    operations, error = protocol.parse(
+        "entities_1.update(name='陈静娴')\nsdk.commit()",
+        context,
+    )
+
+    assert error is None
+    assert operations.entities[0].category == "person"
+    assert operations.entities[0].name == "陈静娴"
+
+
 def test_python_contract_includes_link_rules_when_enabled():
     context = _context([_preference_schema()], link_enabled=True)
     protocol = create_extraction_output_protocol("python")
@@ -174,9 +239,147 @@ def test_python_contract_includes_link_rules_when_enabled():
 
     assert "## Link Rules" in contract
     assert "obj.link(target" in contract
+    assert "weight=0.5" in contract
+    assert "description=''" in contract
     assert "match_text" in contract
     assert "obj_a.link(" in contract
     assert "assign the create/set call to a variable first" in contract
+
+
+@pytest.mark.parametrize("language", ["en", "zh-CN"])
+@pytest.mark.parametrize(
+    ("memory_type", "field_name"),
+    [("preferences", "topic"), ("entities", "category"), ("events", "event_name")],
+)
+def test_python_contract_renders_builtin_field_descriptions_like_json(
+    language, memory_type, field_name
+):
+    registry = MemoryTypeRegistry(load_schemas=False)
+    registry.load_from_yaml(str(resolve_memory_templates_dir() / f"{memory_type}.yaml"))
+    schema = registry.get(memory_type)
+    original = next(field.description for field in schema.fields if field.name == field_name)
+    assert "{{ language }}" in original
+    context = _context([schema], template_context={"language": language})
+
+    python_contract = create_extraction_output_protocol("python").render_contract(context)
+    json_contract = create_extraction_output_protocol("json").render_contract(context)
+    json_schema = json.loads(json_contract.split("```json\n", 1)[1].split("```", 1)[0])
+    model_ref = json_schema["properties"][memory_type]["items"]["$ref"].rsplit("/", 1)[1]
+    rendered = json_schema["$defs"][model_ref]["properties"][field_name]["description"]
+
+    assert " ".join(rendered.split()) in python_contract
+    assert language in rendered
+    assert "{{ language }}" not in python_contract
+    assert "{% if language" not in python_contract
+    assert ("Use lowercase with underscores" in rendered) == (language == "en")
+    assert (
+        next(field.description for field in schema.fields if field.name == field_name) == original
+    )
+
+
+def test_python_field_description_keeps_dsl_patch_instructions():
+    schema = _preference_schema()
+    schema.fields[1].description = "Write content in {{ language.upper() }}."
+    context = _context([schema], template_context={"language": "en"})
+
+    protocol = create_extraction_output_protocol("python")
+    contract = protocol.render_contract(context)
+
+    assert "content [editable string: obj.field.edit/drop/update]: Write content in EN." in contract
+    assert "obj.content.edit(search=..., replace=...)" in contract
+    assert "PATCH operation for" not in contract
+    assert "Use a DELETE block" not in contract
+    assert "copied verbatim" in contract
+    assert "occur exactly once" in contract
+    assert "## Patch Context Rules" in protocol.render_context_rules(context)
+
+
+@pytest.mark.parametrize("output_format", ["python", "json"])
+def test_output_contract_preserves_core_add_only_and_upsert_capabilities(output_format):
+    context = _context([_preference_schema(operation_mode="add_only")], available_tools=())
+    protocol = create_extraction_output_protocol(output_format)
+    contract = protocol.render_contract(context)
+    rules = protocol.render_reference_rules(context)
+    assert "Create new memories only, with complete field values" in contract + rules
+    assert protocol.render_context_rules(context) == ""
+    for unsupported in (
+        "obj.update",
+        "obj.content.edit",
+        "obj.content.drop",
+        "replacement=",
+    ):
+        assert unsupported not in contract + rules + protocol.render_final_instruction(context)
+    assert "delete_ids" not in rules + protocol.render_final_instruction(context)
+
+    program = (
+        'sdk.create_preferences(topic="editor", content="""Use Vim""", score=1)\nsdk.commit()'
+        if output_format == "python"
+        else '{"preferences": [{"page_id": 100, "topic": "editor", "content": "Use Vim", "score": 1}]}'
+    )
+    operations, error = protocol.parse(program, context)
+    assert error is None
+    assert operations.preferences[0].content == "Use Vim"
+
+    # A mixed batch must retain upsert/delete support, without teaching patches
+    # from an add-only schema or exposing inspection tools it does not have.
+    mixed = _context(
+        [_preference_schema(operation_mode="add_only"), _project_schema()], available_tools=()
+    )
+    rules = protocol.render_reference_rules(mixed)
+    contract = protocol.render_contract(mixed)
+    assert "replacement" in rules
+    assert "preserving every unaffected fact" in rules
+    assert protocol.render_context_rules(mixed) == ""
+    if output_format == "python":
+        assert "obj.content.update(" in contract
+        assert "obj.delete(replacement=None)" in contract
+        assert "obj.content.edit" not in contract
+        assert "obj.content.drop" not in contract
+        assert "call the available native" not in contract.lower()
+        assert "never drop a unique fact" in rules
+    else:
+        assert "When editing an existing item" in rules
+        assert "DELETE blocks" not in rules
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("language", ["en", "zh-CN"])
+async def test_default_python_extract_loop_passes_language_to_field_descriptions(language):
+    schema = _preference_schema()
+    schema.description = "Preferences in {{ language }}."
+    schema.fields[1].description = "Write content in {{ language }}."
+    provider = MagicMock()
+    provider.get_memory_schemas.return_value = [schema]
+    provider.get_output_language.return_value = language
+    provider.get_tools.return_value = []
+    provider.get_extract_context.return_value = SimpleNamespace(page_id_map=PageIdMap())
+    provider.read_file_contents = {}
+    provider.instruction.return_value = "Extract memory operations."
+    provider.prefetch = AsyncMock(return_value=[])
+    vlm = SimpleNamespace(
+        model="test-model", get_completion_async=AsyncMock(return_value="sdk.commit()")
+    )
+    loop = ExtractLoop(vlm=vlm, viking_fs=MagicMock(), context_provider=provider, max_iterations=1)
+    empty = ResolvedOperations(upsert_operations=[], delete_file_contents=[], errors=[])
+    loop.resolve_operations = AsyncMock(return_value=(empty, []))
+    loop._check_unread_existing_files = AsyncMock(return_value={})
+    # Exercise the default protocol selection rather than explicitly choosing Python.
+    config = SimpleNamespace(memory=SimpleNamespace(link_enabled=False))
+    with (
+        patch("openviking.session.memory.extract_loop.get_openviking_config", return_value=config),
+        patch("openviking_cli.utils.config.get_openviking_config", return_value=config),
+    ):
+        operations, _ = await loop.run()
+
+    assert operations is empty
+    prompt = vlm.get_completion_async.call_args.kwargs["messages"][0]["content"]
+    assert "restricted Python memory SDK" in prompt
+    assert f"Preferences in {language}." in prompt
+    assert f"Write content in {language}." in prompt
+    assert "{{ language }}" not in prompt
+    assert "## Read Format Rules" not in prompt
+    assert "## Patch Context Rules" in prompt
+
 
 def test_python_contract_omits_link_rules_when_disabled():
     context = _context([_preference_schema()], link_enabled=False)
@@ -447,9 +650,7 @@ def test_python_reserved_existing_retry_explains_new_replacement_binding():
 def test_python_string_literal_retry_pushes_triple_quotes():
     protocol = create_extraction_output_protocol("python")
 
-    retry = protocol.render_format_retry(
-        "Line 33: invalid syntax. Perhaps you forgot a comma?"
-    )
+    retry = protocol.render_format_retry("Line 33: invalid syntax. Perhaps you forgot a comma?")
 
     assert "offending line is shown above" in retry
     assert 'triple-quoted string ("""...""")' in retry
@@ -633,8 +834,26 @@ def test_python_syntax_error_includes_offending_source_line():
 
     assert error is not None
     assert "invalid Python syntax" in error
-    assert 'Little Women' in error
+    assert "Little Women" in error
     assert "^" in error
+
+
+@pytest.mark.parametrize("ending", ["sdk.commit(", "sdk.commit())"])
+@pytest.mark.parametrize(
+    "wrapper", ["{}", "```python\n{}\n```", "Explanation\n```python\n{}\n```\nDone."]
+)
+def test_python_rejects_invalid_program_containing_fenced_example(ending, wrapper):
+    context = _context([_profile_schema()])
+    protocol = create_extraction_output_protocol("python")
+    program = (
+        'sdk.set_profile(content="""Example:\n```python\nsdk.commit()\n```\n'
+        f'Keep this example.""")\n{ending}'
+    )
+
+    operations, error = protocol.parse(wrapper.format(program), context)
+
+    assert operations is None
+    assert error is not None
 
 
 def test_memory_schema_identity_fields_follow_scope_and_uri_template():
@@ -684,17 +903,31 @@ def test_memory_schema_identity_fields_ignore_jinja_token_collisions():
     assert events.identity_fields() == ("peer_id", "event_name", "ranges")
 
 
-def test_python_set_single_file_memory_compiles_to_same_operations_as_json():
+@pytest.mark.parametrize(
+    "content",
+    [
+        "Engineer",
+        'Config:\n```nginx\nadd_header Cache-Control "no-cache";\n```\nDone.',
+        "Example:\n```python\nsdk.commit()\n```\nKeep this example.",
+        "Use the literal ``` marker.",
+        "```text\nfirst\n```\n```python\nsdk.commit()\n```",
+    ],
+)
+@pytest.mark.parametrize(
+    "wrapper",
+    ["{}", "```python\n{}\n```", "Explanation\n```python\n{}\n```\nDone."],
+)
+def test_python_set_single_file_memory_compiles_to_same_operations_as_json(content, wrapper):
     context = _context([_profile_schema()])
     python_protocol = create_extraction_output_protocol("python")
     json_protocol = create_extraction_output_protocol("json")
 
     python_operations, python_error = python_protocol.parse(
-        "sdk.set_profile(content='Engineer')\nsdk.commit()",
+        wrapper.format(f'sdk.set_profile(content="""{content}""")\nsdk.commit()'),
         context,
     )
     json_operations, json_error = json_protocol.parse(
-        '{"profile":[{"page_id":100,"content":"Engineer"}],"delete_ids":[]}',
+        json.dumps({"profile": [{"page_id": 100, "content": content}], "delete_ids": []}),
         context,
     )
 
@@ -981,6 +1214,56 @@ sdk.commit()
     ]
 
 
+@pytest.mark.parametrize("memory_type", ["experiences", "entities"])
+@pytest.mark.parametrize("method", ['edit(search="old", replace="new")', 'drop(text="old")'])
+def test_python_builtin_content_edit_respects_merge_op_and_offers_valid_repair(memory_type, method):
+    registry = MemoryTypeRegistry(load_schemas=False)
+    registry.load_from_yaml(str(resolve_memory_templates_dir() / f"{memory_type}.yaml"))
+    schema = registry.get(memory_type)
+    assert schema is not None
+    context = _context(
+        [schema],
+        files=[
+            MemoryFile(
+                uri=f"viking://user/alice/memories/{memory_type}/one.md",
+                memory_type=memory_type,
+                content="old text",
+                extra_fields=(
+                    {"experience_name": "one", "supersedes": ""}
+                    if memory_type == "experiences"
+                    else {"category": "concept", "name": "one"}
+                ),
+            )
+        ],
+    )
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+    operations, error = protocol.parse(f"{memory_type}_1.content.{method}", context)
+
+    if memory_type == "entities":
+        assert error is None
+        assert operations is not None
+        assert operations.model_dump()[memory_type][0]["content"]["blocks"]
+    else:
+        contract = protocol.render_contract(context)
+        rules = protocol.render_reference_rules(context)
+        assert "obj.content.update(" in contract
+        assert "obj.content.edit(" not in contract
+        assert "obj.content.drop(" not in contract
+        assert "delete(replacement=canonical)" in rules
+        assert "never drop a unique fact" in rules
+        assert operations is None
+        assert error is not None
+        assert "merge_op=replace" in error
+        retry = protocol.render_format_retry(error)
+        correction = retry.split("`")[1]
+        assert correction.startswith("experiences_1.content.update(")
+        operations, error = protocol.parse(correction, context)
+        assert error is None
+        assert operations is not None
+        assert operations.model_dump()[memory_type][0]["content"] == "complete new value"
+
+
 def test_python_field_update_replaces_whole_field():
     uri = "viking://user/alice/memories/preferences/editor.md"
     context = _context(
@@ -1028,7 +1311,7 @@ sdk.commit()
     assert blocks == [{"search": "Prefers Neovim", "replace": "Prefers Emacs"}]
 
 
-def test_python_field_edit_rejects_literal_field_placeholder():
+def test_python_unknown_field_is_silently_ignored():
     uri = "viking://user/alice/memories/preferences/editor.md"
     context = _context(
         [_preference_schema()],
@@ -1042,9 +1325,39 @@ def test_python_field_edit_rejects_literal_field_placeholder():
         context,
     )
 
-    assert operations is None
-    assert "memory field 'field' is unavailable" in error
-    assert "not the literal word 'field'" in error
+    # Unknown field access is a no-op: the statement compiles without
+    # touching server state and the whole program still commits.
+    assert error is None
+    assert operations is not None
+    assert operations.preferences == []
+
+
+def test_python_unknown_field_does_not_block_sibling_updates():
+    uri = "viking://user/alice/memories/preferences/editor.md"
+    context = _context(
+        [_preference_schema()],
+        files=[_existing_preference(uri, "editor", "Use Vim", 0)],
+    )
+    protocol = create_extraction_output_protocol("python")
+    _bind(protocol, context)
+
+    operations, error = protocol.parse(
+        """
+preferences_1.bogus.update("ignored")
+preferences_1.bogus.edit(search="Use Vim", replace="Use Neovim")
+preferences_1.bogus.drop(text="Tabs")
+preferences_1.content.edit(search="Use Vim", replace="Use Neovim")
+sdk.commit()
+""",
+        context,
+    )
+
+    assert error is None
+    item = operations.model_dump()["preferences"][0]
+    # The bogus field is silently dropped; the real content edit still applies.
+    assert item["content"]["blocks"] == [
+        {"search": "Use Vim", "replace": "Use Neovim"},
+    ]
 
 
 def test_python_field_edit_emits_block_regardless_of_uniqueness():
@@ -1349,7 +1662,7 @@ def test_python_read_search_errors_keep_native_tools_available_for_retry(
     assert error_fragment in error
     assert protocol.keep_tools_enabled_after_parse_error(error)
     retry = protocol.render_format_retry(error)
-    assert "native search/read tool" in retry
+    assert "native read tool" in retry
     assert "Do not emit sdk.search(), sdk.read()" in retry
 
 
@@ -1589,7 +1902,7 @@ def test_python_rejects_fstring_width_format_spec():
     # A width format spec turns a small integer literal into a huge padded string
     # with no repeat operator; format specs are disallowed.
     operations, error = protocol.parse(
-        'sdk.set_profile(content=f"{\'x\':>1000001}")\nsdk.commit()',
+        "sdk.set_profile(content=f\"{'x':>1000001}\")\nsdk.commit()",
         context,
     )
 

@@ -1,7 +1,6 @@
-import { createUserMessage } from "@deepseek-ai/dsh-llm";
+import { isCaptureEnabled } from "./shared/capture-utils.mjs";
 import { buildProfileBlock } from "./shared/profile-inject.mjs";
-import { buildRecallBlock } from "./shared/recall-core.mjs";
-import { deriveHarnessSessionId } from "./shared/session-model.mjs";
+import { buildRecallBlock, isRecallEnabled } from "./shared/recall-core.mjs";
 import {
   dequeue,
   enqueue,
@@ -12,15 +11,18 @@ import { isRetryableFailure } from "./shared/retryable.mjs";
 import { resolveEffectivePeerId } from "./shared/workspace-peer.mjs";
 import {
   captureEvent,
-  OPENVIKING_PLUGIN_SOURCE,
+  isOpenVikingPluginMessage,
+  pluginMessage,
   promptText,
 } from "./capture.mjs";
+import { deriveDshSessionId } from "./session-id.mjs";
 
 export class OpenVikingRuntime {
-  constructor(client, config, logger = console) {
+  constructor(client, config, logger = console, resolveSessionPeer = null) {
     this.client = client;
     this.config = config;
     this.logger = logger;
+    this.resolveSessionPeer = resolveSessionPeer;
     this.states = new Map();
     this.drainTimer = null;
     this.drainRunning = false;
@@ -32,7 +34,7 @@ export class OpenVikingRuntime {
     let state = this.states.get(session.id);
     if (state) return state;
     const cwd = session.header?.cwd || process.cwd();
-    const peer = resolveEffectivePeerId({
+    const peer = this.resolveSessionPeer?.(cwd) ?? resolveEffectivePeerId({
       cfg: {
         peerId: this.config.explicitPeerId,
         peerSource: this.config.peerSource,
@@ -43,7 +45,7 @@ export class OpenVikingRuntime {
     });
     state = {
       dshSessionId: String(session.id),
-      ovSessionId: deriveHarnessSessionId("dsh-", String(session.id)),
+      ovSessionId: deriveDshSessionId(session.id),
       config: { ...this.config, peerId: peer.peerId, legacyPeerId: peer.legacyPeerId },
       ready: false,
       profileBlock: "",
@@ -93,7 +95,7 @@ export class OpenVikingRuntime {
     }
     // Replay is a write, so it stays behind the same toggle: a backlog queued
     // while capture was on waits for a session that still writes.
-    if (state.config.syncTurns) {
+    if (isCaptureEnabled(state.config)) {
       await this.replayPendingQueue();
     }
     await this.refreshPendingState(state);
@@ -101,6 +103,7 @@ export class OpenVikingRuntime {
       (path, init, options) => this.client.fetchJSON(path, init, options),
       state.config.profileTokenBudget,
       state.config.peerId,
+      state.config,
     );
     state.profileBlock = profile?.block
       ? [
@@ -121,14 +124,14 @@ export class OpenVikingRuntime {
       return null;
     }
     state.profileDelivered = true;
-    return pluginMessage(state.profileBlock, "instructions");
+    return pluginMessage(state.profileBlock, { form: "instructions" });
   }
 
   async recallMessage(agent, messages) {
     const state = await this.initialize(agent);
-    if (!state.ready) return null;
+    if (!state.ready || !isRecallEnabled(state.config)) return null;
     const query = promptText(messages);
-    if (query.length < state.config.minQueryLength) return null;
+    if (!query || query.length < state.config.minQueryLength) return null;
     const block = await buildRecallBlock(
       (path, init, options) => this.client.fetchJSON(path, init, options),
       state.config,
@@ -137,15 +140,16 @@ export class OpenVikingRuntime {
         actorPeerId: state.config.peerId,
         legacyPeerId: state.config.legacyPeerId,
         sessionId: state.ovSessionId,
+        excludeUris: state.config.recallExcludeUris,
         log: (stage, data) => this.log(stage, data),
       },
     );
-    return block ? pluginMessage(block, "recall") : null;
+    return block ? pluginMessage(block, { form: "recall" }) : null;
   }
 
   capture(session, event) {
     const state = this.stateFor(session);
-    if (!state.config.syncTurns) return;
+    if (!isCaptureEnabled(state.config)) return;
     const payload = captureEvent(event, state.config, state.toolNames);
     if (!payload) return;
     this.enqueueWrite(state, async () => {
@@ -175,31 +179,34 @@ export class OpenVikingRuntime {
   }
 
   maybeCommit(session, event) {
-    if (event.type !== "turn/end") return;
+    // DSH appends compaction/start before it summarizes and rewrites history,
+    // so commit there regardless of the threshold, like PreCompact elsewhere.
+    const boundary = event.type === "compaction/start";
+    if (event.type !== "turn/end" && !boundary) return;
     const state = this.stateFor(session);
-    if (!state.config.syncTurns) return;
+    if (!isCaptureEnabled(state.config)) return;
     this.enqueueWrite(state, async () => {
       if (state.hasPendingWrites) return;
       if (!state.ready && !(await this.ensureState(state)).ready) return;
-      const metadata = await this.client.getSession(
-        state.ovSessionId,
-        state.config.peerId,
-      );
-      if (Number(metadata?.pending_tokens || 0) < state.config.commitTokenThreshold) return;
+      if (!boundary) {
+        const metadata = await this.client.getSession(
+          state.ovSessionId,
+          state.config.peerId,
+        );
+        if (Number(metadata?.pending_tokens || 0) < state.config.commitTokenThreshold) return;
+      }
       const response = await this.client.commitSession(
         state.ovSessionId,
         state.config.peerId,
       );
-      this.log("commit", {
+      this.log(boundary ? "compaction_commit" : "commit", {
         sessionId: state.ovSessionId,
         ok: response.ok,
         trace_id: response.result?.trace_id || response.traceId,
         error: response.ok ? undefined : response.error?.message || response.error?.code,
       });
       if (isRetryableFailure(response)) {
-        await this.enqueueFinalCommit(state, {
-          keep_recent_count: state.config.commitKeepRecentCount,
-        });
+        await this.enqueueFinalCommit(state, { keep_recent_count: 0 });
       }
     });
   }
@@ -210,10 +217,8 @@ export class OpenVikingRuntime {
     if (state.disposing) return state.disposing;
     state.disposing = (async () => {
       this.enqueueWrite(state, async () => {
-        if (!state.config.syncTurns) return;
-        const commitPayload = {
-          keep_recent_count: state.config.commitKeepRecentCount,
-        };
+        if (!isCaptureEnabled(state.config)) return;
+        const commitPayload = { keep_recent_count: 0 };
         if (state.hasPendingWrites) {
           await this.enqueueFinalCommit(state, commitPayload);
           return;
@@ -403,22 +408,11 @@ export class OpenVikingRuntime {
   }
 }
 
-function pluginMessage(content, form) {
-  // dsh's own constructor: identity, normalization, and any future Message
-  // invariants come from the pinned peer instead of a hand-built object.
-  return createUserMessage({
-    content: [{ type: "text", text: content }],
-    source: {
-      kind: "plugin",
-      plugin: OPENVIKING_PLUGIN_SOURCE,
-      form,
-    },
-  });
-}
-
 function hasStartupProfile(agent) {
   const session = agent.session;
-  const ownEvents = (session?.events || []).slice(session?.header?.seedLength ?? 0);
+  const ownEvents = typeof session?.ownEvents === "function"
+    ? session.ownEvents()
+    : (session?.events || []).slice(session?.header?.seedLength ?? 0);
   const inHistory = ownEvents.some(event => (
     event?.type === "user/message" && isStartupProfile(event.data)
   ));
@@ -429,7 +423,6 @@ function hasStartupProfile(agent) {
 }
 
 function isStartupProfile(message) {
-  return message?.source?.kind === "plugin"
-    && message.source.plugin === OPENVIKING_PLUGIN_SOURCE
+  return isOpenVikingPluginMessage(message)
     && message.source.form === "instructions";
 }

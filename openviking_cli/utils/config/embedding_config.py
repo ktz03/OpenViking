@@ -4,10 +4,13 @@ from typing import Any, ClassVar, List, Literal, Optional, Tuple, cast
 
 from pydantic import BaseModel, Field, model_validator
 
+from openviking_cli.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
 TEXT_SOURCE_CONTENT_ONLY = "content_only"
 TEXT_SOURCE_SUMMARY_FIRST = "summary_first"
-TEXT_SOURCE_SUMMARY_ONLY = "summary_only"
-SUMMARY_TEXT_SOURCES = frozenset({TEXT_SOURCE_SUMMARY_FIRST, TEXT_SOURCE_SUMMARY_ONLY})
+SUMMARY_TEXT_SOURCES = frozenset({TEXT_SOURCE_SUMMARY_FIRST})
 TEXT_SOURCES = SUMMARY_TEXT_SOURCES | {TEXT_SOURCE_CONTENT_ONLY}
 
 
@@ -32,8 +35,6 @@ class EmbeddingCredential(BaseModel):
     region: Optional[str] = Field(default=None, description="Region for VikingDB API")
     host: Optional[str] = Field(default=None, description="Host for VikingDB API")
     extra_headers: Optional[dict[str, str]] = Field(default=None, description="Extra HTTP headers")
-
-    model_config = {"extra": "forbid"}
 
 
 class EmbeddingModelConfig(BaseModel):
@@ -147,8 +148,6 @@ class EmbeddingModelConfig(BaseModel):
     failback_request_count: int = Field(
         default=50, description="Number of backup requests after which to attempt failback"
     )
-
-    model_config = {"extra": "forbid"}
 
     @model_validator(mode="before")
     @classmethod
@@ -455,6 +454,13 @@ class EmbeddingModelConfig(BaseModel):
 
             return get_cohere_model_default_dimension(model)
 
+        if provider == "jina":
+            from openviking.models.embedder.jina_embedders import (
+                get_jina_model_default_dimension,
+            )
+
+            return get_jina_model_default_dimension(model)
+
         if provider == "gemini":
             from openviking.models.embedder.gemini_embedders import GeminiDenseEmbedder
 
@@ -477,7 +483,7 @@ class EmbeddingModelConfig(BaseModel):
             except ImportError:
                 return 1024
 
-        # Providers without a known dimension lookup (volcengine, jina,
+        # Providers without a known dimension lookup (volcengine,
         # vikingdb, ollama for unlisted models, etc.) cannot be cross-checked
         # here without an explicit dimension. Return None so validation skips
         # them; same-provider credentials are typically dimension-compatible
@@ -540,6 +546,13 @@ class EmbeddingModelConfig(BaseModel):
             )
 
             return get_cohere_model_default_dimension(effective_model)
+
+        if provider == "jina":
+            from openviking.models.embedder.jina_embedders import (
+                get_jina_model_default_dimension,
+            )
+
+            return get_jina_model_default_dimension(effective_model)
 
         if provider == "gemini":
             from openviking.models.embedder.gemini_embedders import GeminiDenseEmbedder
@@ -649,7 +662,7 @@ class EmbeddingConfig(BaseModel):
     )
     text_source: str = Field(
         default=TEXT_SOURCE_CONTENT_ONLY,
-        description="Text source for file vectorization: summary_first|summary_only|content_only",
+        description="Text source for file vectorization: summary_first|content_only",
     )
     max_input_tokens: int = Field(
         default=4096,
@@ -669,8 +682,6 @@ class EmbeddingConfig(BaseModel):
             "actually changed; only enable when you understand the implication."
         ),
     )
-
-    model_config = {"extra": "forbid"}
 
     @model_validator(mode="before")
     @classmethod
@@ -695,10 +706,14 @@ class EmbeddingConfig(BaseModel):
             raise ValueError(
                 "At least one embedding configuration (dense, sparse, or hybrid) is required"
             )
-        if self.text_source not in TEXT_SOURCES:
-            raise ValueError(
-                "embedding.text_source must be one of: summary_first, summary_only, content_only"
+        if self.text_source == "summary_only":
+            logger.warning(
+                "embedding.text_source=summary_only is deprecated; use summary_first instead. "
+                "Files without a summary still fall back to content for vectorization."
             )
+            self.text_source = TEXT_SOURCE_SUMMARY_FIRST
+        if self.text_source not in TEXT_SOURCES:
+            raise ValueError("embedding.text_source must be one of: summary_first, content_only")
         return self
 
     def _create_embedder(
@@ -729,6 +744,7 @@ class EmbeddingConfig(BaseModel):
             LocalDenseEmbedder,
             MinimaxDenseEmbedder,
             OpenAIDenseEmbedder,
+            RetryEmbedder,
             VikingDBDenseEmbedder,
             VikingDBHybridEmbedder,
             VikingDBSparseEmbedder,
@@ -1006,7 +1022,12 @@ class EmbeddingConfig(BaseModel):
                 "google-genai is not installed. Install it with: pip install openviking[gemini]"
             )
         params = param_builder(config)
-        return embedder_class(**params)
+        embedder = embedder_class(**params)
+        if provider == "local":
+            return embedder
+        if isinstance(embedder, RetryEmbedder):
+            return embedder
+        return RetryEmbedder(embedder)
 
     def get_embedder(self):
         """Get embedder instance based on configuration.
@@ -1037,6 +1058,9 @@ class EmbeddingConfig(BaseModel):
 
         if self.dense:
             return self._create_single_or_failover_embedder("dense", self.dense)
+
+        if self.sparse:
+            return self._create_single_or_failover_embedder("sparse", self.sparse)
 
         raise ValueError("No embedding configuration found (dense, sparse, or hybrid)")
 
@@ -1111,6 +1135,8 @@ class EmbeddingConfig(BaseModel):
             return self.hybrid.get_effective_dimension()
         if self.dense:
             return self.dense.get_effective_dimension()
+        if self.sparse:
+            return self.sparse.get_effective_dimension()
         return 2048
 
     @staticmethod

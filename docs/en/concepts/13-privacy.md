@@ -4,7 +4,7 @@ This page explains OpenViking privacy configs and how they work with skill write
 
 ## Goal
 
-Privacy configs separate sensitive values (such as `api_key`, `token`, `base_url`) from skill body content so plaintext is not permanently stored in `SKILL.md`, while keeping full version management and rollback.
+Privacy configs separate sensitive values (such as `api_key`, `token`, `base_url`) from skill body content to reduce plaintext storage of recognized values in `SKILL.md`, with version lookup and switching. Extraction relies on a model and replaces only recognized, matched spans; it does not guarantee discovery of every sensitive value.
 
 Core goals:
 
@@ -24,7 +24,7 @@ Privacy configs are keyed by `category + target_key`.
 Storage layout in user space:
 
 ```
-viking://user/{user_space}/privacy/{category}/{target_key}/
+viking://user/{user_id}/privacy/{category}/{target_key}/
 ├── .meta.json                 # metadata (active_version/latest_version/labels, etc.)
 ├── current.json               # active version snapshot
 └── history/
@@ -45,11 +45,13 @@ viking://user/{user_space}/privacy/{category}/{target_key}/
 - If `values` is identical to current `values`, no new version is created
 - Otherwise a new version is created and activated
 - New keys are allowed (no unknown-key rejection)
+- `values` is a full snapshot, not a patch; omitted old keys are absent from the new version
 
 ### activate
 
 - Sets a historical version as active (writes back to `current.json`)
 - Updates `active_version` in `.meta.json`
+- Does not rotate or revoke credentials at an external service; it only selects the values OpenViking uses
 
 ---
 
@@ -74,7 +76,7 @@ add_skill
 3. **Block mapping captured**:
    - `original_content_blocks`
    - `replacement_content_blocks`
-4. **Persisted content**: stored `SKILL.md` contains placeholders, not plaintext values.
+4. **Persisted content**: matched spans become placeholders; unmatched content remains unchanged. This processes the skill body, not every attached file.
 
 ---
 
@@ -110,14 +112,15 @@ Current matching is suffix-based: `/skills/{name}/SKILL.md`, so it supports user
    -> add to extra-config notice (`Configured but not referenced in content`).
 
 4. If `unresolved_entries` or extra-config entries exist, append notice block:
-   - `[OpenViking Privacy Notice]`
-   - `Related configured privacy values: ...`
-   - `Not replaced (missing config): ...` (if any)
+   - `[Privacy Config Notice]`
+   - `Missing config: ...` (if any)
    - `Configured but not referenced in content: ...` (if any)
 
 > Current implementation only runs restore when a `current` privacy config exists for that skill. If no current config exists, no notice is appended.
 
 ---
+
+`read` returns restored values, and extra-config notices also include values. Privacy APIs and historical snapshots can return full values as well. This feature does not redact responses or encrypt storage; see [Storage Encryption](./10-encryption.md) for encryption.
 
 ## Relationship with CLI/API
 
@@ -125,15 +128,30 @@ Current matching is suffix-based: `/skills/{name}/SKILL.md`, so it supports user
 - Content plane: `read` automatically restores placeholders
 - Separation of concerns: content files hold placeholders; privacy service holds sensitive values and versions
 
-Common commands:
+PrivacySanitizer does not infer sensitivity from field names. String values in the active Privacy catalog participate in automatic content scanning and reference replacement only when they contain at least 6 Unicode characters. Shorter values can still be stored, referenced, and explicitly resolved, but are excluded from global substring replacement to reduce false positives in ordinary text. Python owns catalog loading, reference generation, and cache policy; matcher construction, leftmost-longest matching, and text rewriting run in RAGFS's Rust Aho-Corasick implementation through a reusable PyO3 matcher that releases the GIL while scanning. The matcher catalog is cached per user and process-local revision; local changes invalidate it immediately, and a 3600-second TTL bounds staleness after changes made by another worker or node.
+
+Using a GitHub Personal Access Token (PAT) as an example:
 
 ```bash
-openviking privacy categories
-openviking privacy list skill
-openviking privacy skill <target_key>
-openviking privacy upsert skill <target_key> --values-json '{"api_key":"..."}'
-openviking privacy activate skill <target_key> <version>
-openviking read viking://user/default/skills/<target_key>/SKILL.md
+# Create or rotate the PAT; credential/github is the target and pat is the field
+ov privacy upsert credential github --field-pat 'github_pat_...'
+
+# Omit the field when pat is the target's only field
+ov privacy reference credential github
+ov privacy resolve credential github
+
+# Equivalent explicit-field forms
+ov privacy reference credential github pat
+ov privacy resolve credential github pat
+ov privacy resolve '{{ov_privacy:alice:viking://~/privacy/credential/github#/values/pat}}'
+
+# Inspect/activate history, or remove pat (the final field also removes the target)
+ov privacy versions credential github
+ov privacy activate credential github 1
+ov privacy delete credential github pat --yes
+
+# Scan one explicit URI; the default only reports, while --fix replaces plaintext PATs
+ov privacy scan --uri viking://~/resources/project-a
 ```
 
 ---
@@ -141,7 +159,7 @@ openviking read viking://user/default/skills/<target_key>/SKILL.md
 ## Benefits
 
 - Reduces plaintext sensitive data exposure in skill content
-- Versioning supports key rotation and fast rollback
+- Version history supports configuration changes after external credential rotation
 - Transparent to callers: `read` returns restored executable skill text
 - Notice block improves troubleshooting when config is incomplete or over-provisioned
 

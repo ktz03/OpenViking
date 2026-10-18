@@ -12,7 +12,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Dict, Mapping, Optional, Sequence, TypeVar
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 import yaml
 
@@ -29,9 +29,14 @@ logger = get_logger(__name__)
 ABSTRACT_OVERVIEW_FILENAMES = frozenset({".abstract.md", ".overview.md"})
 EMBEDDING_METADATA_FIELDS = ("directory",)
 _METADATA_ORDER = ("directory", "source", "generated_by", "freshness")
+_MARKDOWN_URI_SAFE_ASCII = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/:"
+)
 _MAX_SOURCE_URI_CHARS = 4096
 _MAX_LABEL_CHARS = 128
 _T = TypeVar("_T")
+_VIKING_URI_BODY_DELIMITERS = frozenset(" \t\r\n)]}>,'\"`")
+_VIKING_URI_TRAILING_PUNCTUATION = frozenset(".,;:!?")
 
 
 class AbstractOverviewFormatError(ValueError):
@@ -250,6 +255,41 @@ def render_abstract_overview(
     return f"---\n{frontmatter}\n---\n\n{body.strip()}\n"
 
 
+def markdown_safe_viking_uri(uri: str) -> str:
+    """Encode ASCII-only URI syntax hazards while preserving Unicode path text."""
+
+    if not isinstance(uri, str):
+        raise TypeError("URI must be a string")
+    return "".join(
+        char if ord(char) > 127 or char in _MARKDOWN_URI_SAFE_ASCII else f"%{ord(char):02X}"
+        for char in uri
+    )
+
+
+def _normalize_markdown_viking_uris(text: str) -> str:
+    """Normalize embedded Viking URIs to the canonical Markdown-safe form."""
+
+    normalized: list[str] = []
+    cursor = 0
+    while True:
+        start = text.find("viking://", cursor)
+        if start < 0:
+            normalized.append(text[cursor:])
+            return "".join(normalized)
+        normalized.append(text[cursor:start])
+        end = start + len("viking://")
+        while end < len(text) and text[end] not in _VIKING_URI_BODY_DELIMITERS:
+            end += 1
+        raw_uri = text[start:end]
+        trailing = ""
+        while raw_uri and raw_uri[-1] in _VIKING_URI_TRAILING_PUNCTUATION:
+            trailing = raw_uri[-1] + trailing
+            raw_uri = raw_uri[:-1]
+        normalized.append(markdown_safe_viking_uri(unquote(raw_uri)))
+        normalized.append(trailing)
+        cursor = end
+
+
 def rewrite_viking_uri_references(text: str, source_uri: str, target_uri: str) -> str:
     """Rewrite generated raw or URL-encoded URI references within one transfer scope."""
 
@@ -260,9 +300,11 @@ def rewrite_viking_uri_references(text: str, source_uri: str, target_uri: str) -
     if not source or source == target:
         return text
 
+    markdown_safe_target = markdown_safe_viking_uri(target)
     variants = (
-        (quote(source, safe=":/"), quote(target, safe=":/")),
-        (source, target),
+        (quote(source, safe=":/"), markdown_safe_target),
+        (markdown_safe_viking_uri(source), markdown_safe_target),
+        (source, markdown_safe_target),
     )
     rewritten = text
     seen: set[str] = set()
@@ -278,7 +320,7 @@ def rewrite_viking_uri_references(text: str, source_uri: str, target_uri: str) -
             lambda _match, replacement=new: replacement,
             rewritten,
         )
-    return rewritten
+    return _normalize_markdown_viking_uris(rewritten)
 
 
 def rewrite_abstract_overview_for_transfer(
@@ -355,6 +397,62 @@ def body_for_preview(raw: str | bytes) -> str:
     return document.body.rstrip("\r\n")
 
 
+def parse_overview_file_summaries(overview_content: str | bytes) -> Dict[str, str]:
+    """Extract direct-file summaries from an overview body."""
+    overview = body_for_preview(overview_content)
+    if not overview.strip():
+        return {}
+
+    summaries: Dict[str, str] = {}
+    current_file = ""
+    current_summary_lines: list[str] = []
+
+    def save_current() -> None:
+        if current_file and current_summary_lines:
+            summaries[current_file] = " ".join(current_summary_lines).strip()
+
+    for line in overview.split("\n"):
+        header_match = re.match(r"^###\s+(.+?)\s*$", line)
+        if header_match:
+            save_current()
+            heading = header_match.group(1).strip()
+            file_name = _overview_heading_file_name(heading)
+            parts = file_name.split()
+            current_file = parts[0] if len(parts) >= 2 and parts[0] == parts[1] else file_name
+            current_summary_lines = []
+            continue
+
+        numbered_match = re.match(r"^\[(\d+)\]\s+(.+?):\s*(.+)$", line)
+        if numbered_match:
+            save_current()
+            current_file = numbered_match.group(2).strip()
+            current_summary_lines = [numbered_match.group(3).strip()]
+            continue
+
+        if current_file:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#"):
+                current_summary_lines.append(stripped)
+
+    save_current()
+    return summaries
+
+
+def _overview_heading_file_name(heading: str) -> str:
+    """Return the direct entry name represented by an overview H3 heading."""
+    if heading.startswith("[") and heading.endswith(")"):
+        destination_start = heading.rfind("](")
+        if destination_start > 0:
+            target = heading[destination_start + 2 : -1].strip()
+            if target.startswith("<") and target.endswith(">"):
+                target = target[1:-1].strip()
+            if target.startswith("viking://"):
+                path = unquote(urlsplit(target).path).rstrip("/")
+                if path:
+                    return path.rsplit("/", 1)[-1]
+    return heading
+
+
 def body_for_embedding(
     raw: str | bytes,
     whitelist: Sequence[str] = EMBEDDING_METADATA_FIELDS,
@@ -425,7 +523,11 @@ async def _read_existing_document(
     viking_fs: Any, uri: str, ctx: Optional[RequestContext]
 ) -> Optional[AbstractOverviewDocument]:
     raw = await _raw_if_exists(viking_fs, uri, ctx)
-    return parse_abstract_overview(raw) if raw is not None else None
+    try:
+        return parse_abstract_overview(raw) if raw is not None else None
+    except AbstractOverviewFormatError as exc:
+        logger.warning("[Semantic] Ignoring malformed sidecar %s: %s", uri, exc)
+        return None
 
 
 async def write_abstract_overview(
@@ -440,6 +542,7 @@ async def write_abstract_overview(
     consume_pending: Optional[int] = None,
     lock: Optional[Dict[str, Any]] = None,
     log_prefix: str = "[Semantic]",
+    existing_raw: Optional[Mapping[int, str | bytes]] = None,
 ) -> AbstractOverviewWriteResult:
     """Render and atomically write sidecars while preserving source metadata.
 
@@ -466,8 +569,20 @@ async def write_abstract_overview(
             logger.info("%s Skipping stale semantic write for %s", log_prefix, dir_uri)
             return AbstractOverviewWriteResult(wrote=False)
 
-        existing_overview = await _read_existing_document(viking_fs, overview_uri, ctx)
-        existing_abstract = await _read_existing_document(viking_fs, abstract_uri, ctx)
+        existing_overview = (
+            parse_abstract_overview(existing_raw[1])
+            if existing_raw is not None and 1 in existing_raw
+            else await _read_existing_document(viking_fs, overview_uri, ctx)
+            if existing_raw is None
+            else None
+        )
+        existing_abstract = (
+            parse_abstract_overview(existing_raw[0])
+            if existing_raw is not None and 0 in existing_raw
+            else await _read_existing_document(viking_fs, abstract_uri, ctx)
+            if existing_raw is None
+            else None
+        )
         merged_metadata = dict(metadata or {})
         for existing in (existing_overview, existing_abstract):
             if existing and "source" in existing.metadata and "source" not in merged_metadata:
@@ -503,8 +618,20 @@ async def write_abstract_overview(
         rendered_abstract = render_abstract_overview(
             ContextLevel.ABSTRACT, dir_uri, abstract, merged_metadata
         )
-        current_overview = await _raw_if_exists(viking_fs, overview_uri, ctx)
-        current_abstract = await _raw_if_exists(viking_fs, abstract_uri, ctx)
+        current_overview = (
+            existing_raw.get(1)
+            if existing_raw is not None
+            else await _raw_if_exists(viking_fs, overview_uri, ctx)
+        )
+        current_abstract = (
+            existing_raw.get(0)
+            if existing_raw is not None
+            else await _raw_if_exists(viking_fs, abstract_uri, ctx)
+        )
+        if isinstance(current_overview, bytes):
+            current_overview = current_overview.decode("utf-8")
+        if isinstance(current_abstract, bytes):
+            current_abstract = current_abstract.decode("utf-8")
 
         if current_overview != rendered_overview:
             await viking_fs.write_file(
@@ -658,6 +785,7 @@ async def read_abstract_overview_pending_snapshot(
     dir_uri: str,
     ctx: Optional[RequestContext],
     lock: Optional[Dict[str, Any]] = None,
+    existing_raw: Optional[Mapping[int, str | bytes]] = None,
 ) -> int:
     """Read the pending counter captured at the start of an aggregation."""
 
@@ -665,19 +793,36 @@ async def read_abstract_overview_pending_snapshot(
         f"{dir_uri.rstrip('/')}/.overview.md",
         f"{dir_uri.rstrip('/')}/.abstract.md",
     ]
-    owns_lease = lock is None
-    snapshot_lease = lock
-    if owns_lease:
-        lock_paths = [viking_fs._uri_to_path(uri, ctx=ctx) for uri in uris]
-        snapshot_lease = await viking_fs._async_agfs.pathlock_acquire_exact_batch(lock_paths)
-    try:
+
+    def _pending_of(documents: Sequence[Optional[AbstractOverviewDocument]]) -> int:
         pending_values = []
-        for uri in uris:
-            document = await _read_existing_document(viking_fs, uri, ctx)
+        for document in documents:
             freshness = document.metadata.get("freshness") if document else None
             if document is not None and not document.legacy and isinstance(freshness, Mapping):
                 pending_values.append(int(freshness["pending_child_changes"]))
         return max(pending_values, default=0)
+
+    if existing_raw is not None:
+        return _pending_of(
+            [
+                parse_abstract_overview(existing_raw[level]) if level in existing_raw else None
+                for level in (1, 0)
+            ]
+        )
+
+    owns_lease = lock is None
+    snapshot_lease = lock
+    if owns_lease:
+        # Read-only: when neither sidecar exists there is no counter to
+        # snapshot, and acquiring exact locks there would create the parent
+        # directory just to hold lock metadata (a deleted directory reappears).
+        preliminary = [await _read_existing_document(viking_fs, uri, ctx) for uri in uris]
+        if all(document is None for document in preliminary):
+            return 0
+        lock_paths = [viking_fs._uri_to_path(uri, ctx=ctx) for uri in uris]
+        snapshot_lease = await viking_fs._async_agfs.pathlock_acquire_exact_batch(lock_paths)
+    try:
+        return _pending_of([await _read_existing_document(viking_fs, uri, ctx) for uri in uris])
     finally:
         if owns_lease:
             await viking_fs._async_agfs.pathlock_release(snapshot_lease)

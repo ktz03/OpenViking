@@ -22,6 +22,8 @@ Agent Runtime Server 负责执行 Agent 任务，当前支持 Compile。应用�
 
 `args` 整体可省略，模型 Endpoint ID 也不是顶层字段。需要指定模型时使用 `args.model_name`；不传时由执行端使用其默认模型配置。
 
+下面的模型选择示例要求执行端支持 `args.model_name`。使用内置 VikingBot 时，省略 `args` 和 CLI 的 `--args`，它不接受非空扩展参数。Python 示例使用 `SyncHTTPClient`；使用 `AsyncHTTPClient` 时需 `await compile()`。
+
 **HTTP API**
 
 ```http
@@ -32,6 +34,7 @@ POST /api/v1/compile
 curl -X POST http://localhost:1933/api/v1/compile \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key" \
+  -H "Idempotency-Key: studio-compile-001" \
   -d '{
     "from": ["viking://resources/research"],
     "to": "viking://resources/research-wiki",
@@ -107,9 +110,65 @@ task, err := client.Compile(
 
 :::
 
+### 检查 Compile 可用性
+
+```http
+GET /api/v1/compile/capabilities
+```
+
+使用当前认证上下文，无需请求参数。返回 `200 OK`：
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "configured": true,
+    "can_create": true,
+    "reason_code": null
+  }
+}
+```
+
+| 字段 | 含义 |
+|------|------|
+| `configured` | 是否已配置 Compile 执行端点 |
+| `can_create` | 当前认证上下文是否允许向该端点提交任务 |
+| `reason_code` | 未配置端点时为 `NOT_CONFIGURED`；远程端点需要可转发的 OV API Key 时为 `API_KEY_REQUIRED`；其他情况为 `null` |
+
+配置不可用时，在结果中返回 `can_create: false`，不会因此返回 HTTP 错误。此接口仅检查配置和凭证，不探测执行后端的健康状态，也不校验具体 Compile 请求。
+
+### Compile 路由向量
+
+`POST /api/v1/compile/embeddings` 使用当前认证上下文生成临时路由文本的向量，不建立索引或保留文本。
+
+请求体：必填 `target_uri`（已存在且有读取权限的资源或 Skill 命名空间目标）；可选 `texts`（字符串数组，默认 `[]`，最多 32 条，每条 1–1024 个字符且不能仅含空白）；可选 `expected_model`（模型指纹，非空值必须与当前模型一致）。
+
+返回 `200 OK`，包含 `status: "ok"` 和 `result: {"model": "...", "vectors": [...]}`。向量按输入顺序排列；`texts` 为空时仅返回模型指纹和空向量数组。
+
+### 按提交键查询任务
+
+```http
+GET /api/v1/compile/submissions/{key}
+```
+
+创建任务的响应丢失或超时时，可通过此接口找回任务。传入的键必须与 `POST /api/v1/compile` 请求中可选的 `Idempotency-Key` 请求头一致。
+
+| 参数 | 位置 | 类型 | 必填 | 说明 |
+|------|------|------|------|------|
+| `key` | 路径 | string | 是 | 长度为 16–128 个字符；仅允许字母、数字、`:`、`.`、`_` 和 `-` |
+
+```bash
+curl http://localhost:1933/api/v1/compile/submissions/studio-compile-001 \
+  -H "X-API-Key: your-key"
+```
+
+返回 `200 OK`，其中 `status` 为 `"ok"`，`result` 为已有的 OV 任务记录，结构与上方创建任务响应一致。查询范围限定为当前账号和用户，不会创建任务。提交不存在（包括键仅被其他用户使用）时返回 `404`；键格式不合法时返回 `400 INVALID_ARGUMENT`。
+
+需要安全重试创建请求时，应复用相同的 `Idempotency-Key` 和请求参数。使用同一键提交不同参数会返回 `409`。未传入该请求头的创建请求，不提供用于此查询的提交键。
+
 ### 查询任务
 
-任务仅对创建它的 principal 可见；任务不存在或属于其他 principal 时均返回 `404`。
+普通用户只能查询自己创建的任务；任务不存在或属于其他用户时均返回 `404`。ROOT 查询使用独立的管理可见范围，且不能取消任务。
 
 ```http
 GET /api/v1/tasks/{task_id}

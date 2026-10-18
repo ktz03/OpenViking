@@ -12,13 +12,32 @@ logger = get_logger(__name__)
 class SessionAutoCommitConfig(BaseModel):
     """Server-wide controls for automatic session commits."""
 
-    default_enabled: bool = False
-    idle_enabled: bool = False
-    check_interval_seconds: float = Field(default=60.0, gt=0)
-    scan_batch_size: int = Field(default=16, gt=0)
-    scan_batch_pause_seconds: float = Field(default=0.0, ge=0)
-
-    model_config = {"extra": "forbid"}
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Master switch for automatic session commits. When enabled, newly "
+            "created sessions without an explicit auto_commit_policy get a "
+            "default policy, and the idle-timeout background scheduler is "
+            "started. When disabled, neither happens."
+        ),
+    )
+    idle_backend: Literal["local", "redis"] = Field(
+        default="local",
+        description=(
+            "Idle timeout discovery backend. 'local' scans session metadata; "
+            "'redis' uses distributed expiry scheduling."
+        ),
+    )
+    check_interval_seconds: float = Field(default=600.0, gt=0)
+    scan_rate_limit_files_per_second: float = Field(
+        default=2.0,
+        gt=0,
+        description=(
+            "Maximum number of session .meta.json files read per second during the "
+            "idle auto-commit scan. Used to bound background IO pressure when the "
+            "sessions directory is very large."
+        ),
+    )
 
 
 class MemoryConfig(BaseModel):
@@ -101,8 +120,6 @@ class MemoryConfig(BaseModel):
         default_factory=SessionAutoCommitConfig,
         description="Server-wide controls for automatic session commits.",
     )
-
-    model_config = {"extra": "forbid"}
 
     @model_validator(mode="before")
     @classmethod

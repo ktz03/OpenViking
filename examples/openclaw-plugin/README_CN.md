@@ -244,6 +244,14 @@ preflight 阶段的 `assemble()` 并不是简单地把旧聊天记录塞回来�
 
 这条自动路径是 best-effort，并且依赖 commit。短但重要的事实可能会先停留在 live session 里，直到阈值 commit、`/compact` 或显式存储发生后，才进入长期记忆抽取流程。
 
+自动 commit 默认保留最近 10 条消息（`commitKeepRecentCount`），这个按条数切分的窗口可能从一轮对话中间开始。如果服务端支持按轮保留，可在插件配置中设置 `"commitRetentionMode": "turn_budget"` 来启用：
+
+- 忽略 `commitKeepRecentCount`，采用服务端默认值：最多保留最近 3 轮用户对话、12,000 Token 保留预算，以及至少最后一个 assistant/tool 步骤。
+- 最新一轮过长时，服务端保留用户问题与最近步骤，将更早的步骤归档并生成检查点；必须保留的尾部可能超过保留预算。
+- `pending_tokens` 只计算将离开活跃窗口的消息，不重复计入归档与活跃窗口共有的用户问题。
+
+手动 commit 和 `/compact` 仍然全部归档。不设置该选项（或使用 `"message_count"`）即可保持原有行为。
+
 ### 显式长期记忆写入
 
 当用户明确要求 Agent “记住”“保存”“存一下”某个重要长期事实、偏好、项目或决定时，应优先使用 `memory_store`，而不是等待普通 auto-capture 自然触发。`memory_store` 会把文本写入 OpenViking session 并调用 `commit(wait=true)`，因此是集成侧让重要事实尽快进入长期记忆的可靠路径。
@@ -252,7 +260,7 @@ preflight 阶段的 `assemble()` 并不是简单地把旧聊天记录塞回来�
 
 - auto-capture 继续负责普通对话流，并通过批处理平衡成本和延迟
 - `memory_store` 面向明确的长期记忆意图，例如“记住我的主项目是 X”或“保存这个偏好”
-- 如果 `memory_store` 已提交但抽取出 0 条记忆，应检查 OpenViking 服务端抽取模型/配置；显式路径已经触发抽取，但 extractor 没有产出记忆
+- 如果 `memory_store` 已提交但抽取出 0 条记忆，工具会返回 `action: "failed"` 和 `error: "no_memories_extracted"`，Agent 会告诉用户没有新增记忆；可能是内容已经存过、抽取未开启，或需要检查 OpenViking 服务端抽取模型/配置
 
 ### `compact()` 负责什么
 
@@ -352,17 +360,9 @@ Recall trace 默认关闭。可通过插件配置 `traceRecall`、`traceRecallPe
 
 OpenViking 服务需要独立部署并运行，插件才能连接到它。
 
-## 与旧设计稿的关系
+## 上下文生命周期参考
 
-仓库里还有一份更偏"未来演进方向"的设计稿：`docs/design/openclaw-context-engine-refactor.md`。阅读时需要区分两者的口径：
-
-- 本文描述的是当前实现已经落地的行为。
-- 旧设计稿讨论的是"进一步把更多主链路迁入 context-engine 生命周期"的目标态。
-- 当前版本里，自动 recall 的主入口已经迁到 `assemble()`：preflight 重建历史，transformContext 注入长期记忆。
-- 当前版本里，`afterTurn()` 已经负责增量写入 OpenViking session，但它仍然依赖阈值触发异步 commit。
-- 当前版本里，`compact()` 已经走 `commit(wait=true)`，但它的职责仍以"同步提交 + 结果回读"为主，而不是承载一切上层编排。
-
-这段区分很重要，否则很容易把未来设计误读成现状。
+当前 assemble、召回、捕获和压缩行为见 [OpenClaw 接入指南](../../docs/zh/agent-integrations/03-openclaw.md#assemble-如何组装上下文)。指南也说明了保留的 `agentExperience` 配置及其当前限制。
 
 ## 运维与调试入口
 

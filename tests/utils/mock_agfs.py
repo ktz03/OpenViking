@@ -1,8 +1,11 @@
+import asyncio
 import shutil
 import threading
 import uuid
 from pathlib import Path
 from unittest.mock import MagicMock
+
+from openviking.pyagfs import AGFSNotFoundError
 
 
 class MockLocalAGFS:
@@ -126,7 +129,7 @@ class MockLocalAGFS:
     def read_file(self, path, ctx=None, **kwargs):
         p = self._resolve(path)
         if not p.exists():
-            raise FileNotFoundError(path)
+            raise AGFSNotFoundError(path)
         return p.read_bytes()
 
     def read(self, path, ctx=None, **kwargs):
@@ -158,7 +161,7 @@ class MockLocalAGFS:
     def stat(self, path, ctx=None):
         p = self._resolve(path)
         if not p.exists():
-            raise FileNotFoundError(path)
+            raise AGFSNotFoundError(path)
         s = p.stat()
         return {
             "size": s.st_size,
@@ -170,18 +173,20 @@ class MockLocalAGFS:
     def bind_request_context(self, ctx):
         return MagicMock(__enter__=lambda x: None, __exit__=lambda x, y, z: None)
 
-    def pathlock_acquire_tree(
+    async def pathlock_acquire_batch_async(
         self,
         ctx,
-        path,
+        requests,
         timeout_secs=0.0,
         owner_lease_ref=None,
     ):
         del ctx, owner_lease_ref
+        (request,) = requests
+        path = request["path"]
         with self._pathlocks_guard:
             lock = self._pathlocks.setdefault(path, threading.Lock())
 
-        acquired = lock.acquire(timeout=timeout_secs)
+        acquired = await asyncio.to_thread(lock.acquire, timeout=timeout_secs)
         if not acquired:
             raise TimeoutError(f"timed out acquiring test path lock: {path}")
 
@@ -195,8 +200,6 @@ class MockLocalAGFS:
         with self._pathlocks_guard:
             self._pathlock_leases[lease_ref] = lock
         return lease
-
-    pathlock_acquire_exact = pathlock_acquire_tree
 
     def pathlock_release(self, ctx, owned_lease_ref):
         del ctx

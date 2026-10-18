@@ -29,7 +29,9 @@ from openviking.server.mcp_endpoint import (
     _mcp_ctx,
     _resolve_mcp_workspace_uri,
     add_resource,
+    add_skill,
     cancel_watch,
+    download,
     edit,
     forget,
     glob,
@@ -43,8 +45,8 @@ from openviking.server.mcp_endpoint import (
     write,
 )
 from openviking.server.mcp_endpoint import ls as list_tool
+from openviking.service.fs_service import ListingPage
 from openviking_cli.exceptions import (
-    AlreadyExistsError,
     FailedPreconditionError,
     InvalidArgumentError,
     InvalidURIError,
@@ -307,6 +309,318 @@ async def test_find_tool_calls_lightweight_find(service, monkeypatch):
     }
 
 
+@pytest.mark.parametrize(
+    ("context_type", "expected_targets", "expected_route"),
+    [
+        ("skill", ["viking://user/test_user/skills", "viking://agent/skills"], "find_skills"),
+        (["skill"], ["viking://user/test_user/skills", "viking://agent/skills"], "find_skills"),
+        (["skill", "memory"], "", "find"),
+        (None, "", "find"),
+    ],
+)
+async def test_find_tool_skill_only_searches_both_skill_roots(
+    service, monkeypatch, context_type, expected_targets, expected_route
+):
+    captured = {}
+
+    def _record(route):
+        async def fake(**kwargs):
+            captured["route"] = route
+            captured.update(kwargs)
+            return SimpleNamespace(memories=[], resources=[], skills=[])
+
+        return fake
+
+    monkeypatch.setattr(service.search, "find", _record("find"))
+    monkeypatch.setattr(service.search, "find_skills", _record("find_skills"))
+    token = _mcp_ctx.set(RequestContext(DEFAULT_CTX.user, Role.USER))
+    try:
+        await mcp_endpoint.find(query="review a PR", context_type=context_type)
+    finally:
+        _mcp_ctx.reset(token)
+
+    assert captured["route"] == expected_route
+    assert captured["target_uri"] == expected_targets
+
+
+async def test_find_tool_points_skill_hits_at_their_skill_md(service, monkeypatch):
+    hit = SimpleNamespace(
+        uri="viking://agent/skills/deploy-runbook/.abstract.md",
+        abstract="name: deploy-runbook\ndescription: Shared runbook",
+        score=0.61,
+    )
+    read_uris = []
+
+    async def fake_find_skills(**kwargs):
+        return SimpleNamespace(memories=[], resources=[], skills=[hit])
+
+    async def fake_read_visible(uri, ctx):
+        read_uris.append(uri)
+        return "# Deploy runbook"
+
+    monkeypatch.setattr(service.search, "find_skills", fake_find_skills)
+    monkeypatch.setattr(service.fs, "read_visible", fake_read_visible)
+
+    result = await mcp_endpoint.find(query="roll back", context_type="skill", read_content=True)
+
+    assert "- [skill 61%] viking://agent/skills/deploy-runbook/SKILL.md" in result
+    assert ".abstract.md" not in result
+    assert "# Deploy runbook" in result
+    assert read_uris == ["viking://agent/skills/deploy-runbook/SKILL.md"]
+
+
+async def test_find_tool_points_an_auxiliary_file_hit_at_the_skill_md(service, monkeypatch):
+    hit = SimpleNamespace(
+        uri="viking://user/test_user/skills/pdf-forms/scripts/fill.py",
+        abstract="Fill a PDF form field by field",
+        score=0.52,
+    )
+
+    async def fake_find_skills(**kwargs):
+        return SimpleNamespace(memories=[], resources=[], skills=[hit])
+
+    monkeypatch.setattr(service.search, "find_skills", fake_find_skills)
+
+    result = await mcp_endpoint.find(query="fill a pdf", context_type="skill")
+
+    assert "- [skill 52%] viking://user/test_user/skills/pdf-forms/SKILL.md" in result
+    assert "scripts/fill.py" not in result
+
+
+async def test_find_tool_keeps_same_named_skills_from_both_roots(service, monkeypatch):
+    hits = [
+        SimpleNamespace(
+            uri="viking://user/test_user/skills/review/.abstract.md",
+            abstract="My own review skill",
+            score=0.70,
+        ),
+        SimpleNamespace(
+            uri="viking://agent/skills/review/.abstract.md",
+            abstract="The shared review skill",
+            score=0.60,
+        ),
+    ]
+
+    async def fake_find_skills(**kwargs):
+        return SimpleNamespace(memories=[], resources=[], skills=hits)
+
+    monkeypatch.setattr(service.search, "find_skills", fake_find_skills)
+
+    result = await mcp_endpoint.find(query="review", context_type="skill")
+
+    assert "Found 2 item(s)" in result
+    assert "viking://user/test_user/skills/review/SKILL.md" in result
+    assert "viking://agent/skills/review/SKILL.md" in result
+
+
+async def test_find_tool_collapses_several_hits_from_one_skill_package(service, monkeypatch):
+    hits = [
+        SimpleNamespace(
+            uri="viking://agent/skills/deploy/scripts/rollback.sh",
+            abstract="Roll back the last release",
+            score=0.44,
+        ),
+        SimpleNamespace(
+            uri="viking://agent/skills/deploy/.overview.md",
+            abstract="How the deploy skill works",
+            score=0.71,
+        ),
+    ]
+
+    async def fake_find(**kwargs):
+        return SimpleNamespace(memories=[], resources=[], skills=hits)
+
+    monkeypatch.setattr(service.search, "find", fake_find)
+
+    result = await mcp_endpoint.find(query="roll back", context_type=["skill", "memory"])
+
+    assert "Found 1 item(s)" in result
+    assert "- [skill 71%] viking://agent/skills/deploy/SKILL.md" in result
+    assert "How the deploy skill works" in result
+
+
+async def test_find_tool_forwards_its_bounds_to_find_skills(service, monkeypatch):
+    captured = {}
+
+    async def fake_find_skills(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(memories=[], resources=[], skills=[])
+
+    async def fail_find(**kwargs):
+        raise AssertionError("A skill-only find should call find_skills, not find")
+
+    monkeypatch.setattr(service.search, "find_skills", fake_find_skills)
+    monkeypatch.setattr(service.search, "find", fail_find)
+
+    await mcp_endpoint.find(
+        query="review a PR", limit=3, min_score=0.5, level=[0], context_type="skill"
+    )
+
+    assert captured["query"] == "review a PR"
+    assert captured["ctx"] == DEFAULT_CTX
+    assert captured["limit"] == 3
+    assert captured["score_threshold"] == 0.5
+    assert captured["level"] == [0]
+    # find_skills restricts by context type itself and takes no filter.
+    assert "filter" not in captured
+
+
+async def test_find_tool_forwards_an_explicit_skill_target_to_find_skills(service, monkeypatch):
+    captured = {}
+
+    async def fake_find_skills(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(memories=[], resources=[], skills=[])
+
+    monkeypatch.setattr(service.search, "find_skills", fake_find_skills)
+    token = _mcp_ctx.set(RequestContext(DEFAULT_CTX.user, Role.USER))
+    try:
+        await mcp_endpoint.find(
+            query="review a PR", target_uri="viking://~/skills", context_type="skill"
+        )
+    finally:
+        _mcp_ctx.reset(token)
+
+    assert captured["target_uri"] == "viking://user/test_user/skills"
+
+
+async def test_find_tool_keeps_a_filter_only_skill_query_on_the_generic_find(service, monkeypatch):
+    captured = {}
+
+    async def fake_find(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(memories=[], resources=[], skills=[])
+
+    async def fail_find_skills(**kwargs):
+        raise AssertionError("find_skills rejects an empty query")
+
+    monkeypatch.setattr(service.search, "find", fake_find)
+    monkeypatch.setattr(service.search, "find_skills", fail_find_skills)
+
+    await mcp_endpoint.find(query="", context_type="skill")
+
+    assert captured["filter"] == {"op": "must", "field": "context_type", "conds": ["skill"]}
+
+
+@pytest.mark.parametrize(
+    "hit_uri",
+    [
+        "viking://user/test_user/skills/.review.update-backup-ab12/SKILL.md",
+        "viking://agent/skills",
+    ],
+)
+async def test_find_tool_leaves_a_uri_outside_a_skill_package_alone(service, monkeypatch, hit_uri):
+    hit = SimpleNamespace(uri=hit_uri, abstract="Not an installed skill", score=0.4)
+
+    async def fake_find_skills(**kwargs):
+        return SimpleNamespace(memories=[], resources=[], skills=[hit])
+
+    monkeypatch.setattr(service.search, "find_skills", fake_find_skills)
+
+    result = await mcp_endpoint.find(query="review", context_type="skill")
+
+    assert f"- [skill 40%] {hit_uri}\n" in result
+    assert "SKILL.md/SKILL.md" not in result
+
+
+async def test_find_tool_describes_a_package_file_hit_with_the_skill_abstract(service, monkeypatch):
+    hit = SimpleNamespace(
+        uri="viking://agent/skills/pdf-forms/scripts/fill.py",
+        abstract="Iterate the AcroForm fields and write each value",
+        score=0.52,
+    )
+    abstract_uris = []
+
+    async def fake_find_skills(**kwargs):
+        return SimpleNamespace(memories=[], resources=[], skills=[hit])
+
+    async def fake_abstract(uri, ctx):
+        abstract_uris.append(uri)
+        return "name: pdf-forms\ndescription: Fill in a PDF form"
+
+    monkeypatch.setattr(service.search, "find_skills", fake_find_skills)
+    monkeypatch.setattr(service.fs, "abstract", fake_abstract)
+
+    result = await mcp_endpoint.find(query="fill a pdf", context_type="skill")
+
+    assert abstract_uris == ["viking://agent/skills/pdf-forms"]
+    assert "description: Fill in a PDF form" in result
+    assert "AcroForm" not in result
+
+
+async def test_find_tool_keeps_the_file_abstract_when_the_package_has_none(service, monkeypatch):
+    hit = SimpleNamespace(
+        uri="viking://agent/skills/pdf-forms/scripts/fill.py",
+        abstract="Iterate the AcroForm fields and write each value",
+        score=0.52,
+    )
+
+    async def fake_find_skills(**kwargs):
+        return SimpleNamespace(memories=[], resources=[], skills=[hit])
+
+    async def fake_abstract(uri, ctx):
+        return f"# {uri} [Directory abstract is not ready]"
+
+    monkeypatch.setattr(service.search, "find_skills", fake_find_skills)
+    monkeypatch.setattr(service.fs, "abstract", fake_abstract)
+
+    result = await mcp_endpoint.find(query="fill a pdf", context_type="skill")
+
+    assert "is not ready" not in result
+    assert "Iterate the AcroForm fields" in result
+
+
+async def test_find_tool_keeps_the_package_abstract_of_a_sidecar_hit(service, monkeypatch):
+    hit = SimpleNamespace(
+        uri="viking://agent/skills/pdf-forms/.abstract.md",
+        abstract="name: pdf-forms\ndescription: Fill in a PDF form",
+        score=0.52,
+    )
+
+    abstract_uris = []
+
+    async def fake_find_skills(**kwargs):
+        return SimpleNamespace(memories=[], resources=[], skills=[hit])
+
+    async def fake_abstract(uri, ctx):
+        abstract_uris.append(uri)
+        return ""
+
+    monkeypatch.setattr(service.search, "find_skills", fake_find_skills)
+    monkeypatch.setattr(service.fs, "abstract", fake_abstract)
+
+    result = await mcp_endpoint.find(query="fill a pdf", context_type="skill")
+
+    # A package-level hit already carries the skill's abstract.
+    assert abstract_uris == []
+    assert "description: Fill in a PDF form" in result
+
+
+async def test_search_tool_collapses_skill_package_hits(service, monkeypatch):
+    hits = [
+        SimpleNamespace(
+            uri="viking://agent/skills/deploy/scripts/rollback.sh",
+            abstract="Roll back the last release",
+            score=0.44,
+        ),
+        SimpleNamespace(
+            uri="viking://agent/skills/deploy/.overview.md",
+            abstract="How the deploy skill works",
+            score=0.71,
+        ),
+    ]
+
+    async def fake_search(**kwargs):
+        return SimpleNamespace(memories=[], resources=[], skills=hits)
+
+    monkeypatch.setattr(service.search, "search", fake_search)
+
+    result = await search(query="roll back", context_type="skill")
+
+    assert "Found 1 item(s)" in result
+    assert "- [skill 71%] viking://agent/skills/deploy/SKILL.md" in result
+
+
 async def test_find_tool_inlines_visible_content_when_requested(service, monkeypatch):
     async def fake_find(**kwargs):
         del kwargs
@@ -408,6 +722,7 @@ async def test_search_context_mode_returns_assembled_context(service, monkeypatc
     result = await search(
         query="what happened",
         mode="context",
+        events_time_decay_protection="2d",
         quotas={"events": 1, "entities": 0},
         purpose="coding",
         min_score=0.1,
@@ -429,6 +744,7 @@ async def test_search_context_mode_returns_assembled_context(service, monkeypatc
     assert params.quotas == {"events": 1, "entities": 0}
     assert params.purpose == "coding"
     assert params.score_threshold == 0.1
+    assert params.events_time_decay_protection == "2d"
     assert params.max_tokens == 800
     assert params.detail == {"events": "overview"}
     assert params.dedup_turns == 5
@@ -878,7 +1194,7 @@ async def test_read_rejects_images_too_large_for_common_clients(monkeypatch):
 
     assert "too large to inline" in result
     assert 'ov get "viking://resources/huge.png" "./huge.png"' in result
-    assert "/api/v1/content/download?uri=viking%3A%2F%2Fresources%2Fhuge.png" in result
+    assert 'Call the download tool with uri="viking://resources/huge.png"' in result
     read_file_bytes.assert_not_awaited()
 
 
@@ -944,6 +1260,10 @@ async def test_list_root(service):
     assert isinstance(result, str)
 
 
+async def test_list_defaults_to_viking_root(service):
+    assert await list_tool() == await list_tool("viking://")
+
+
 async def test_list_empty_dir(service):
     ctx = DEFAULT_CTX
     await service.viking_fs.mkdir(
@@ -953,6 +1273,15 @@ async def test_list_empty_dir(service):
     assert isinstance(result, str)
 
 
+async def test_list_reports_more_entries(service):
+    await write(uri="viking://resources/test_list_limit/f1.md", content="1\n")
+    await write(uri="viking://resources/test_list_limit/f2.md", content="2\n")
+
+    result = await list_tool("viking://resources/test_list_limit", limit=1)
+
+    assert "(more entries available;" in result
+
+
 # ---------------------------------------------------------------------------
 # store tool
 # ---------------------------------------------------------------------------
@@ -960,8 +1289,9 @@ async def test_list_empty_dir(service):
 
 async def test_store_single_message(service):
     result = await remember(messages=[StoreMessage(role="user", content="The sky is blue")])
-    assert "stored" in result.lower()
-    assert "1 message" in result
+    assert "Submitted 1 message(s) for memory extraction" in result
+    assert "task_id=" in result
+    assert "decides which memories to create or update" in result
 
 
 async def test_store_batch_messages(service):
@@ -971,8 +1301,45 @@ async def test_store_batch_messages(service):
             StoreMessage(role="assistant", content="Noted, your favorite color is blue."),
         ]
     )
-    assert "stored" in result.lower()
-    assert "2 message" in result
+    assert "Submitted 2 message(s)" in result
+
+
+async def test_store_reports_extraction_in_progress(service, monkeypatch):
+    monkeypatch.setattr(
+        service.sessions,
+        "commit_async",
+        AsyncMock(return_value={"session_id": "s", "status": "accepted", "task_id": "task-123"}),
+    )
+
+    result = await remember(messages=[StoreMessage(role="user", content="The sky is blue")])
+
+    assert "Submitted 1 message(s) for memory extraction" in result
+    assert "task_id=task-123" in result
+    assert "session mcp-store-" in result
+    assert "runs in the background" in result
+    assert "decides which memories to create or update" in result
+    assert "committed for memory extraction" not in result
+
+
+async def test_store_reports_skipped_commit(service, monkeypatch):
+    monkeypatch.setattr(
+        service.sessions,
+        "commit_async",
+        AsyncMock(
+            return_value={
+                "session_id": "s",
+                "status": "skipped",
+                "task_id": None,
+                "reason": "no_messages",
+            }
+        ),
+    )
+
+    result = await remember(messages=[StoreMessage(role="user", content="")])
+
+    assert "Nothing was committed" in result
+    assert "no_messages" in result
+    assert "Submitted" not in result
 
 
 async def test_store_does_not_autofill_peer_id_from_ctx(service, monkeypatch):
@@ -1011,7 +1378,11 @@ async def test_store_skips_empty_message_content(service, monkeypatch):
 
     fake_session = FakeSession()
     monkeypatch.setattr(service.sessions, "get", AsyncMock(return_value=fake_session))
-    monkeypatch.setattr(service.sessions, "commit_async", AsyncMock())
+    monkeypatch.setattr(
+        service.sessions,
+        "commit_async",
+        AsyncMock(return_value={"status": "accepted", "task_id": "task-1"}),
+    )
 
     result = await remember(
         messages=[
@@ -1020,7 +1391,7 @@ async def test_store_skips_empty_message_content(service, monkeypatch):
         ]
     )
 
-    assert "2 message" in result
+    assert "Submitted 1 message(s)" in result
     assert len(fake_session.messages) == 1
     role, parts, peer_id, created_at = fake_session.messages[0]
     assert role == "assistant"
@@ -1028,6 +1399,151 @@ async def test_store_skips_empty_message_content(service, monkeypatch):
     assert peer_id is None
     assert created_at is None
     service.sessions.commit_async.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# add_skill tool
+# ---------------------------------------------------------------------------
+
+
+def _skill_md(name: str, description: str = "Review a PR diff before approving") -> str:
+    return f"---\nname: {name}\ndescription: {description}\n---\n\n# {name}\n\nSteps.\n"
+
+
+async def test_add_skill_inline_data_installs_into_user_skills(service):
+    ctx = RequestContext(DEFAULT_CTX.user, Role.USER)
+    token = _mcp_ctx.set(ctx)
+    try:
+        result = await add_skill(data=_skill_md("mcp-inline-skill"))
+    finally:
+        _mcp_ctx.reset(token)
+
+    assert "Skill added: viking://user/test_user/skills/mcp-inline-skill" in result
+    body = await service.fs.read(
+        "viking://user/test_user/skills/mcp-inline-skill/SKILL.md", ctx=ctx
+    )
+    assert "# mcp-inline-skill" in body
+
+
+async def test_add_skill_forwards_git_source_to_shared_installer(monkeypatch):
+    captured = {}
+
+    async def fake_install_skills(data, ctx, **kwargs):
+        captured.update(kwargs, data=data)
+        return {
+            "skills": [{"name": "pdf", "description": "Fill PDF\nforms", "path": "pdf"}],
+            "total": 1,
+        }
+
+    monkeypatch.setattr(mcp_endpoint, "install_skills", fake_install_skills)
+
+    result = await add_skill(
+        path="https://github.com/org/skills",
+        skills=["pdf"],
+        target_uri="viking://agent/skills",
+        list_only=True,
+    )
+
+    assert captured["data"] == "https://github.com/org/skills"
+    assert captured["names"] == ["pdf"]
+    assert captured["list_only"] is True
+    assert captured["target_uri"] == "viking://agent/skills"
+    assert captured["source_metadata"] is None
+    assert "nothing was installed" in result
+    assert "- pdf (pdf): Fill PDF forms" in result
+
+
+async def test_add_skill_reports_every_installed_skill(monkeypatch):
+    async def fake_install_skills(data, ctx, **kwargs):
+        return {
+            "installed": [
+                {"root_uri": "viking://user/test_user/skills/a"},
+                {"root_uri": "viking://user/test_user/skills/b"},
+            ],
+            "total": 2,
+        }
+
+    monkeypatch.setattr(mcp_endpoint, "install_skills", fake_install_skills)
+
+    result = await add_skill(path="https://github.com/org/skills")
+
+    assert "Skill added: viking://user/test_user/skills/a" in result
+    assert "Skill added: viking://user/test_user/skills/b" in result
+
+
+async def test_add_skill_local_path_issues_skill_upload_token(service):
+    from openviking.server.upload_token_store import upload_token_store
+
+    upload_token_store.clear()
+    result = await add_skill(
+        path="/tmp/skills/pdf",
+        skills=["pdf"],
+        target_uri="viking://agent/skills",
+    )
+
+    assert "local skill detected" in result.lower()
+    assert "zip -r" in result
+    match = re.search(r"/api/v1/resources/temp_upload\?token=([A-Za-z0-9]+)", result)
+    assert match
+    info = upload_token_store.peek(match.group(1))
+    assert info.kind == "skill"
+    assert info.skill_target_uri == "viking://agent/skills"
+    assert info.skill_names == ["pdf"]
+    upload_token_store.clear()
+
+
+async def test_add_skill_rejects_a_target_below_a_skill_root_before_minting_a_token(service):
+    from openviking.server.upload_token_store import upload_token_store
+
+    upload_token_store.clear()
+    token = _mcp_ctx.set(RequestContext(DEFAULT_CTX.user, Role.USER))
+    try:
+        result = await add_skill(path="/tmp/skills/pdf", target_uri="viking://~/skills/pdf")
+    finally:
+        _mcp_ctx.reset(token)
+
+    assert result.startswith("INVALID_ARGUMENT: Unsupported skill root URI")
+    assert "viking://agent/skills" in result
+    assert upload_token_store._store == {}
+
+
+async def test_add_skill_maps_a_shared_subpath_to_the_shared_root(service):
+    from openviking.server.upload_token_store import upload_token_store
+
+    upload_token_store.clear()
+    result = await add_skill(path="/tmp/skills/pdf", target_uri="viking://agent/skills/pdf")
+
+    token = re.search(r"temp_upload\?token=([A-Za-z0-9]+)", result).group(1)
+    assert upload_token_store.peek(token).skill_target_uri == "viking://agent/skills"
+    upload_token_store.clear()
+
+
+async def test_add_skill_list_only_upload_says_nothing_is_installed(service):
+    from openviking.server.upload_token_store import upload_token_store
+
+    upload_token_store.clear()
+    result = await add_skill(path="/tmp/skills", list_only=True)
+
+    assert "upload it to list the skills it contains" in result
+    assert "installs nothing" in result
+    assert "do NOT need to call add_skill" not in result
+    upload_token_store.clear()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"path": "tos://bucket/skills/pdf"}, "unsupported skill source"),
+        ({}, "provide 'data'"),
+        ({"data": _skill_md("x"), "path": "/tmp/x"}, "not both"),
+        ({"data": "/tmp/skills/pdf/SKILL.md"}, 'add_skill(path="/tmp/skills/pdf/SKILL.md")'),
+        ({"path": "viking://agent/skills/pdf"}, "read its SKILL.md"),
+        ({"data": _skill_md("x"), "target_uri": "viking://resources/x"}, "INVALID_URI:"),
+    ],
+)
+async def test_add_skill_rejects_invalid_arguments(kwargs, expected):
+    result = await add_skill(**kwargs)
+    assert expected in result
 
 
 # ---------------------------------------------------------------------------
@@ -1050,6 +1566,23 @@ async def test_add_resource_local_path_returns_upload_instruction(service):
     # Default fixture sets neither env nor config.public_base_url → URL is auto-inferred
     # and the troubleshooting hint must appear.
     assert "OPENVIKING_PUBLIC_BASE_URL" in result
+    upload_token_store.clear()
+
+
+async def test_add_resource_local_path_mentions_gateway_headers(service):
+    """The prose must warn agents that private-gateway headers apply to the upload too.
+
+    Prevents the "no API key needed" line from being read as "no headers needed" when
+    the deployment sits behind a gateway that enforces tenant/vault headers.
+    """
+    from openviking.server.upload_token_store import upload_token_store
+
+    upload_token_store.clear()
+    result = await add_resource(path="/tmp/sample_local_file_xyz.pdf")
+    lower = result.lower()
+    assert "gateway" in lower or "reverse proxy" in lower
+    assert "openviking_name" in lower or "extra request headers" in lower
+    assert "replay" in lower or "same headers" in lower
     upload_token_store.clear()
 
 
@@ -1105,6 +1638,144 @@ async def test_add_resource_local_path_infers_from_x_forwarded_headers(service, 
     # Inferred → hint must appear
     assert "OPENVIKING_PUBLIC_BASE_URL" in result
     upload_token_store.clear()
+
+
+# ---------------------------------------------------------------------------
+# download tool
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _clear_download_tokens():
+    from openviking.server.upload_token_store import download_token_store
+
+    download_token_store.clear()
+    yield download_token_store
+    download_token_store.clear()
+
+
+def _stat_service(monkeypatch, stat):
+    monkeypatch.setattr(
+        mcp_endpoint, "get_service", lambda: SimpleNamespace(fs=SimpleNamespace(stat=stat))
+    )
+
+
+async def test_download_tool_is_registered_read_only():
+    tools = {tool.name: tool for tool in await mcp_endpoint.mcp.list_tools()}
+
+    tool = tools["download"]
+    assert set(tool.inputSchema["properties"]) == {"uri"}
+    assert tool.annotations.readOnlyHint is True
+    assert tool.description.startswith("Get a short-lived URL for downloading")
+
+
+async def test_download_mints_token_bound_to_identity_and_uri(monkeypatch, _clear_download_tokens):
+    store = _clear_download_tokens
+    stat = AsyncMock(return_value={"name": "design.pdf", "size": 2_516_582, "isDir": False})
+    _stat_service(monkeypatch, stat)
+    ctx = RequestContext(
+        UserIdentifier("acct", "alice"), Role.USER, actor_peer_id="bot-a", from_oauth=True
+    )
+    monkeypatch.setenv("OPENVIKING_PUBLIC_BASE_URL", "https://ov.example.com/")
+    token_ctx = _mcp_ctx.set(ctx)
+    try:
+        result = await download("viking://~/specs/design.pdf")
+    finally:
+        _mcp_ctx.reset(token_ctx)
+
+    stat.assert_awaited_once_with("viking://user/alice/specs/design.pdf", ctx=ctx, skip_count=True)
+    assert "viking://user/alice/specs/design.pdf (design.pdf, 2.4 MB)" in result
+    match = re.search(
+        r"curl -fL -o \./design\.pdf 'https://ov\.example\.com/api/v1/content/download"
+        r"\?token=([A-Za-z0-9]+)'",
+        result,
+    )
+    assert match, result
+    assert "no OpenViking API key needed" in result
+    assert "replay the same headers" in result
+    assert "expires in ~10 minutes" in result
+    assert "OPENVIKING_PUBLIC_BASE_URL is not set" not in result
+    info = store.peek(match.group(1))
+    assert info.uri == "viking://user/alice/specs/design.pdf"
+    assert (info.account_id, info.user_id, info.role) == ("acct", "alice", Role.USER)
+    assert info.actor_peer_id == "bot-a"
+    assert info.from_oauth is True
+
+
+async def test_download_shell_quotes_untrusted_filename(monkeypatch, _clear_download_tokens):
+    _stat_service(
+        monkeypatch, AsyncMock(return_value={"name": "$(id).pdf", "size": 3, "isDir": False})
+    )
+
+    result = await download("viking://resources/$(id).pdf")
+
+    assert "-o './$(id).pdf' " in result
+
+
+async def test_download_rejects_directory_without_minting(monkeypatch, _clear_download_tokens):
+    _stat_service(monkeypatch, AsyncMock(return_value={"name": "specs", "isDir": True}))
+
+    result = await download("viking://resources/specs")
+
+    assert "directory" in result
+    assert "list or tree" in result
+    assert _clear_download_tokens._store == {}
+
+
+async def test_download_missing_file_fails_without_minting(service, _clear_download_tokens):
+    with pytest.raises(NotFoundError):
+        await download("viking://resources/does-not-exist.pdf")
+    assert _clear_download_tokens._store == {}
+
+
+async def test_download_denied_file_fails_without_minting(monkeypatch, _clear_download_tokens):
+    _stat_service(monkeypatch, AsyncMock(side_effect=PermissionDeniedError("denied")))
+
+    with pytest.raises(PermissionDeniedError):
+        await download("viking://resources/secret.pdf")
+    assert _clear_download_tokens._store == {}
+
+
+async def test_download_checks_with_user_role_outside_api_key_mode(
+    monkeypatch, _clear_download_tokens
+):
+    stat = AsyncMock(return_value={"name": "a.bin", "size": 10, "isDir": False})
+    _stat_service(monkeypatch, stat)
+    monkeypatch.setattr(
+        mcp_endpoint,
+        "get_server_config",
+        lambda: SimpleNamespace(
+            get_effective_auth_mode=lambda: "dev",
+            upload_signed_ttl_seconds=600,
+        ),
+    )
+    monkeypatch.setenv("OPENVIKING_PUBLIC_BASE_URL", "https://ov.example.com")
+    ctx = RequestContext(UserIdentifier("default", "default"), Role.ROOT)
+    token_ctx = _mcp_ctx.set(ctx)
+    try:
+        await download("viking://resources/a.bin")
+    finally:
+        _mcp_ctx.reset(token_ctx)
+
+    assert stat.await_args.kwargs["ctx"].role == Role.USER
+
+
+async def test_download_inferred_base_url_adds_operator_note(monkeypatch, _clear_download_tokens):
+    from openviking.server.mcp_endpoint import _request_url_ctx
+
+    _stat_service(
+        monkeypatch, AsyncMock(return_value={"name": "a.bin", "size": 10, "isDir": False})
+    )
+    monkeypatch.delenv("OPENVIKING_PUBLIC_BASE_URL", raising=False)
+    token = _request_url_ctx.set({"x_forwarded_host": "ov.public.example.com"})
+    try:
+        result = await download("viking://resources/a.bin")
+    finally:
+        _request_url_ctx.reset(token)
+
+    assert "https://ov.public.example.com/api/v1/content/download?token=" in result
+    assert "(a.bin, 10 B)" in result
+    assert "OPENVIKING_PUBLIC_BASE_URL is not set" in result
 
 
 async def test_add_resource_temp_file_id_lookalike_in_path_is_rejected(service):
@@ -1165,6 +1836,7 @@ async def test_add_resource_remote_parent_is_forwarded(service, monkeypatch):
     )
 
     assert captured["parent"] == "viking://resources/imports"
+    assert captured["create_parent"] is True
     assert captured["to"] is None
 
 
@@ -1252,15 +1924,20 @@ async def test_add_resource_temp_file_id_branch_resolves_and_ingests(
 
     async def fake_add_resource(*, path, ctx, **kwargs):
         captured["path"] = path
-        captured["allow_local_path_resolution"] = kwargs.get("allow_local_path_resolution")
+        captured.update(kwargs)
         return {"root_uri": "viking://resources/from_tfid"}
 
     monkeypatch.setattr(service.resources, "add_resource", fake_add_resource)
 
-    result = await add_resource(temp_file_id=tfid)
+    result = await add_resource(
+        temp_file_id=tfid,
+        parent="viking://resources/imports",
+    )
     assert "Resource added" in result
     assert captured["path"] == str(target.resolve())
     assert captured["allow_local_path_resolution"] is True
+    assert captured["parent"] == "viking://resources/imports"
+    assert captured["create_parent"] is True
     upload_token_store.clear()
 
 
@@ -1481,11 +2158,12 @@ async def test_write_replace_overwrites_existing(service):
     assert body == "v2-content"
 
 
-async def test_write_create_fails_when_file_exists(service):
+async def test_write_create_overwrites_existing_file(service):
     uri = "viking://resources/test_write_create_exists.md"
     await write(uri=uri, content="v1")
-    with pytest.raises(AlreadyExistsError):
-        await write(uri=uri, content="v2", mode="create")
+    result = await write(uri=uri, content="v2", mode="create")
+    assert "mode=create" in result
+    assert await service.fs.read(uri, ctx=DEFAULT_CTX) == "v2"
 
 
 async def test_write_append_appends_to_existing(service):
@@ -1496,11 +2174,11 @@ async def test_write_append_appends_to_existing(service):
     assert body == "line1\nline2\n"
 
 
-async def test_write_append_missing_file_fails(service):
-    with pytest.raises(NotFoundError):
-        await write(
-            uri="viking://resources/test_write_append_missing.md", content="x", mode="append"
-        )
+async def test_write_append_creates_missing_file(service):
+    uri = "viking://resources/test_write_append_missing.md"
+    result = await write(uri=uri, content="x", mode="append")
+    assert "mode=append" in result
+    assert await service.fs.read(uri, ctx=DEFAULT_CTX) == "x"
 
 
 async def test_write_create_rejects_disallowed_extension(service):
@@ -1558,6 +2236,15 @@ async def test_edit_missing_old_string_fails(service):
     uri = "viking://resources/test_edit_missing.md"
     await write(uri=uri, content="alpha\n")
     with pytest.raises(InvalidArgumentError, match="not found"):
+        await edit(uri=uri, old_string="zzz", new_string="x")
+
+
+async def test_edit_line_ending_mismatch_says_so(service):
+    uri = "viking://resources/test_edit_crlf.md"
+    await write(uri=uri, content="line 1\r\nline 2\r\n")
+    with pytest.raises(InvalidArgumentError, match="CRLF/LF"):
+        await edit(uri=uri, old_string="line 1\nline 2\n", new_string="x")
+    with pytest.raises(InvalidArgumentError, match=r"not found in \S+\. Re-read"):
         await edit(uri=uri, old_string="zzz", new_string="x")
 
 
@@ -1877,6 +2564,76 @@ async def test_tree_node_limit_adds_truncation_note(service):
 
     result = await tree(uri="viking://resources/test_tree_limit", node_limit=1)
     assert "(truncated at node_limit=1" in result
+
+
+async def test_tree_exact_node_limit_does_not_add_truncation_note(service):
+    await write(uri="viking://resources/test_tree_exact_limit/f1.md", content="1\n")
+
+    result = await tree(uri="viking://resources/test_tree_exact_limit", node_limit=1)
+
+    assert "(truncated at node_limit=1" not in result
+
+
+async def test_tree_include_abstract_renders_directory_abstracts(service, monkeypatch):
+    captured = {}
+
+    async def fake_tree(uri, **kwargs):
+        captured.update(kwargs)
+        return ListingPage(
+            entries=[
+                {
+                    "rel_path": "pr-review",
+                    "isDir": True,
+                    "abstract": "name: pr-review\ndescription: Review a PR diff",
+                },
+                {"rel_path": "pr-review/SKILL.md", "isDir": False, "size": 42, "abstract": ""},
+            ],
+            has_more=False,
+        )
+
+    monkeypatch.setattr(service.fs, "tree", fake_tree)
+
+    result = await tree(uri="viking://user/test_user/skills", include_abstract=True)
+
+    assert "\npr-review/\n  - name: pr-review description: Review a PR diff\n" in result
+    assert "\n  SKILL.md (42 B)" in result
+    assert captured["output"] == "agent"
+    assert captured["abs_limit"] == 1024
+
+
+async def test_tree_include_abstract_skips_not_ready_placeholders(service, monkeypatch):
+    async def fake_tree(uri, **kwargs):
+        return ListingPage(
+            entries=[
+                {
+                    "rel_path": "pdf",
+                    "uri": "viking://user/test_user/skills/pdf",
+                    "isDir": True,
+                    "abstract": "name: pdf\ndescription: Fill PDF forms",
+                },
+                {
+                    "rel_path": "pdf/scripts",
+                    "uri": "viking://user/test_user/skills/pdf/scripts",
+                    "isDir": True,
+                    "abstract": "# viking://user/test_user/skills/pdf/scripts [Directory abstract is not ready]",
+                },
+                {
+                    "rel_path": "pdf/references",
+                    "uri": "viking://user/test_user/skills/pdf/references",
+                    "isDir": True,
+                    "abstract": "[.abstract.md is not ready]",
+                },
+            ],
+            has_more=False,
+        )
+
+    monkeypatch.setattr(service.fs, "tree", fake_tree)
+
+    result = await tree(uri="viking://user/test_user/skills", include_abstract=True)
+
+    assert "  - name: pdf description: Fill PDF forms" in result
+    assert "not ready" not in result
+    assert "\n  scripts/\n  references/" in result
 
 
 async def test_tree_include_abstract_still_renders(service):

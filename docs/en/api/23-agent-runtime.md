@@ -22,6 +22,8 @@ Agent Runtime Server executes Agent tasks and currently supports Compile. Applic
 
 The entire `args` object is optional, and the model endpoint ID is not a top-level field. Use `args.model_name` to select a model; when omitted, the execution backend uses its default model configuration.
 
+The model-selection examples below require a backend that accepts `args.model_name`. When using bundled VikingBot, omit `args` and CLI `--args`; it rejects non-empty arguments. The Python example uses `SyncHTTPClient`; await `compile()` with `AsyncHTTPClient`.
+
 **HTTP API**
 
 ```http
@@ -32,6 +34,7 @@ POST /api/v1/compile
 curl -X POST http://localhost:1933/api/v1/compile \
   -H "Content-Type: application/json" \
   -H "X-API-Key: your-key" \
+  -H "Idempotency-Key: studio-compile-001" \
   -d '{
     "from": ["viking://resources/research"],
     "to": "viking://resources/research-wiki",
@@ -107,9 +110,65 @@ task, err := client.Compile(
 
 :::
 
+### Check Compile availability
+
+```http
+GET /api/v1/compile/capabilities
+```
+
+Uses the current authentication context and takes no request parameters. Returns `200 OK`:
+
+```json
+{
+  "status": "ok",
+  "result": {
+    "configured": true,
+    "can_create": true,
+    "reason_code": null
+  }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `configured` | Whether a Compile execution endpoint is configured |
+| `can_create` | Whether the current authentication context permits submission to that endpoint |
+| `reason_code` | `NOT_CONFIGURED` when no endpoint is configured; `API_KEY_REQUIRED` when a remote endpoint requires a forwardable OV API key; otherwise `null` |
+
+An unavailable configuration is reported in the result with `can_create: false`, not as an HTTP error. This checks configuration and credentials; it does not probe backend health or validate a particular Compile request.
+
+### Compile routing embeddings
+
+`POST /api/v1/compile/embeddings` embeds transient routing texts using the current authentication context, without indexing or retaining them.
+
+Body: required `target_uri` (an existing resource or Skill namespace target with read access); optional `texts` (string array, default `[]`, at most 32 texts, each 1–1024 characters and not whitespace-only); optional `expected_model` (model fingerprint; a non-empty value must match the current model).
+
+Returns `200 OK` with `status: "ok"` and `result: {"model": "...", "vectors": [...]}`. Vectors follow input order; empty `texts` returns only the model fingerprint and an empty vector array.
+
+### Find a task by submission key
+
+```http
+GET /api/v1/compile/submissions/{key}
+```
+
+Use this endpoint when a task creation response was lost or timed out. Pass the same key that was sent in the optional `Idempotency-Key` header of `POST /api/v1/compile`.
+
+| Parameter | Location | Type | Required | Description |
+|-----------|----------|------|----------|-------------|
+| `key` | Path | string | Yes | 16–128 characters; only letters, digits, `:`, `.`, `_`, and `-` are allowed |
+
+```bash
+curl http://localhost:1933/api/v1/compile/submissions/studio-compile-001 \
+  -H "X-API-Key: your-key"
+```
+
+Returns `200 OK` with `status: "ok"` and the existing OV task record in `result`, using the same structure as the task creation response above. Lookup is scoped to the current account and user and does not create a task. A missing submission, including a key used only by another user, returns `404`; an invalid key returns `400 INVALID_ARGUMENT`.
+
+To retry creation safely, reuse the same `Idempotency-Key` and request parameters. A key reused with different parameters returns `409`. Without this header, creation does not provide a submission key for this lookup.
+
 ### Get task status
 
-A task is visible only to the principal that created it. A missing task and a task owned by another principal both return `404`.
+For ordinary user requests, a task is visible only to its creator; missing tasks and tasks owned by another user return `404`. ROOT queries have separate administrative visibility and cannot cancel tasks.
 
 ```http
 GET /api/v1/tasks/{task_id}

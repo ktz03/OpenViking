@@ -4,7 +4,7 @@
 
 ## 目标
 
-隐私配置用于把敏感值（如 `api_key`、`token`、`base_url`）从技能正文中分离出来，避免明文长期存储在 `SKILL.md` 中，同时保留版本化管理与回滚能力。
+隐私配置用于把敏感值（如 `api_key`、`token`、`base_url`）从技能正文中分离出来，减少已识别敏感值在 `SKILL.md` 中的明文存储，并支持版本查询和切换。抽取依赖模型，只替换识别并匹配成功的片段，不能保证发现所有敏感信息。
 
 核心目标：
 
@@ -24,7 +24,7 @@
 用户空间下的存储路径：
 
 ```
-viking://user/{user_space}/privacy/{category}/{target_key}/
+viking://user/{user_id}/privacy/{category}/{target_key}/
 ├── .meta.json                 # 元信息（active_version/latest_version/labels 等）
 ├── current.json               # 当前生效版本快照
 └── history/
@@ -45,11 +45,13 @@ viking://user/{user_space}/privacy/{category}/{target_key}/
 - 如果与当前版本 `values` 完全一致，则不新建版本，直接返回当前版本
 - 否则创建新版本并自动设为当前生效版本
 - 允许新增 key（不会因“未知 key”报错）
+- `values` 是完整快照，不是部分更新；省略的旧 key 不会保留在新版本中
 
 ### activate（激活）
 
 - 将历史版本设置为当前生效版本（写回 `current.json`）
 - 更新 `.meta.json` 中的 `active_version`
+- 不会轮换或撤销第三方服务中的密钥；这里只切换 OpenViking 使用的值
 
 ---
 
@@ -74,7 +76,7 @@ add_skill
 3. **保留块映射**：会同时记录：
    - `original_content_blocks`
    - `replacement_content_blocks`
-4. **写盘结果**：`SKILL.md` 持久化的是占位符内容，不是明文值。
+4. **写盘结果**：匹配成功的片段以占位符保存，未匹配内容保持原样。该流程处理技能正文，不等于扫描并清理所有附件。
 
 ---
 
@@ -110,14 +112,15 @@ fs.read(uri)
    -> 记入“额外配置”提示（`Configured but not referenced in content`）。
 
 4. 当存在 `unresolved_entries` 或“额外配置”时，会在内容末尾追加：
-   - `[OpenViking Privacy Notice]`
-   - `Related configured privacy values: ...`
-   - `Not replaced (missing config): ...`（如有）
+   - `[Privacy Config Notice]`
+   - `Missing config: ...`（如有）
    - `Configured but not referenced in content: ...`（如有）
 
-> 注意：当前实现中，仅当该 skill 已有 `current` 配置时才会进入 restore。若没有当前配置，不会追加 notice。
+> 仅当该 skill 已有 `current` 配置时才会进入 restore。若没有当前配置，不会追加 notice。
 
 ---
+
+`read` 返回的是还原后的值；“额外配置”提示也会包含配置值。Privacy API 和历史快照同样可以返回完整值，该功能不等于响应脱敏或存储加密。需要加密存储时，另见[存储加密](./10-encryption.md)。
 
 ## 与 CLI/API 的关系
 
@@ -125,15 +128,30 @@ fs.read(uri)
 - 内容面：通过 `read` 自动恢复占位符
 - 两者解耦：内容文件负责占位符，隐私服务负责敏感值与版本
 
-常用命令：
+PrivacySanitizer 不根据字段名猜测敏感性。当前 active Privacy 中长度不少于 6 个 Unicode 字符的字符串值会参与正文自动扫描与引用替换；更短的值仍可保存、引用和显式读取，但不会参与全文替换，以降低普通正文误命中。Python 负责目录、引用和缓存策略，匹配器构建、最长匹配与正文重写由 `ragfs` 的 Rust Aho-Corasick 实现完成，并通过 PyO3 复用不可变 matcher、扫描时释放 GIL。匹配目录按用户和本进程 revision 缓存，本进程修改会立即失效，另外设有 3600 秒缓存 TTL 以覆盖多 worker/多节点修改。
+
+以保存 GitHub Personal Access Token（PAT）为例：
 
 ```bash
-openviking privacy categories
-openviking privacy list skill
-openviking privacy skill <target_key>
-openviking privacy upsert skill <target_key> --values-json '{"api_key":"..."}'
-openviking privacy activate skill <target_key> <version>
-openviking read viking://user/default/skills/<target_key>/SKILL.md
+# 首次写入或轮换 GitHub PAT；credential/github 是 target，pat 是 field
+ov privacy upsert credential github --field-pat 'github_pat_...'
+
+# target 只有 pat 一个字段时可以省略 field
+ov privacy reference credential github
+ov privacy resolve credential github
+
+# 显式指定 field 的等价形式
+ov privacy reference credential github pat
+ov privacy resolve credential github pat
+ov privacy resolve '{{ov_privacy:alice:viking://~/privacy/credential/github#/values/pat}}'
+
+# 查看/切换历史版本，或删除 pat 字段（最后一个字段删除后 target 也会删除）
+ov privacy versions credential github
+ov privacy activate credential github 1
+ov privacy delete credential github pat --yes
+
+# 扫描一个明确的 URI；默认仅报告，--fix 才会替换明文 PAT
+ov privacy scan --uri viking://~/resources/project-a
 ```
 
 ---
@@ -141,7 +159,7 @@ openviking read viking://user/default/skills/<target_key>/SKILL.md
 ## 设计收益
 
 - 降低明文敏感信息在技能正文中的暴露风险
-- 通过版本化支持密钥轮换与快速回滚
+- 为外部密钥轮换后的配置切换保留版本记录
 - 对上层调用透明：`read` 即可拿到还原后的可执行技能文本
 - 对不完整配置提供可观测提示，便于排障
 

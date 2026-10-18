@@ -17,6 +17,7 @@ from openviking.resource.processing_mode import DEFAULT_PROCESSING_MODE, Process
 from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
 from openviking.server.temp_upload_store import TempUploadStore
+from openviking.storage.acl import AclSpec
 
 
 async def ingest_temp_upload(
@@ -32,6 +33,7 @@ async def ingest_temp_upload(
     tags: Optional[list[str]] = None,
     tag_mode: str = "replace",
     parse_mode: ParseMode | str = ParseMode.DEFAULT,
+    acl: AclSpec | None = None,
 ) -> dict[str, Any]:
     """Resolve a temp upload and ingest it as a resource; return the raw add_resource result.
 
@@ -57,6 +59,7 @@ async def ingest_temp_upload(
                 ctx=ctx,
                 to=to or None,
                 parent=parent or None,
+                create_parent=bool(parent),
                 reason=reason,
                 source_name=resolved.original_filename,
                 wait=False,
@@ -67,6 +70,7 @@ async def ingest_temp_upload(
                 args=ingest_args,
                 tags=tags,
                 tag_mode=tag_mode,
+                acl=acl,
             )
         except Exception:
             raise

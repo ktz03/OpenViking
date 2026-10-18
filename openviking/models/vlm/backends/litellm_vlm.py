@@ -14,10 +14,11 @@ os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
 
 import litellm
 from litellm import acompletion, completion
+from litellm.types.utils import all_litellm_params
 
+from openviking.models.model_error import model_error_boundary
 from openviking.telemetry import tracer
 from openviking.utils.message_format import format_messages, sanitize_openai_messages
-from openviking.utils.model_retry import retry_async, retry_sync
 from openviking.utils.multimodal import redact_image_data_urls
 from openviking_cli.utils import get_logger
 
@@ -195,7 +196,7 @@ class LiteLLMVLMProvider(VLMBase):
         """Resolve model name by applying provider prefixes."""
         if _has_litellm_prefix(model, EXPLICIT_LITELLM_PREFIXES):
             return model
-        if model.lower().startswith("openai/"):
+        if model.lower().startswith(("openai/", *OLLAMA_LITELLM_PREFIXES)):
             return model
 
         provider = self._detected_provider or detect_provider_by_model(model)
@@ -292,6 +293,7 @@ class LiteLLMVLMProvider(VLMBase):
             "messages": sanitize_openai_messages(messages),
             "temperature": self.temperature,
             "timeout": self.timeout,
+            "num_retries": 0,
         }
         effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
         if effective_max_tokens is not None:
@@ -309,15 +311,43 @@ class LiteLLMVLMProvider(VLMBase):
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
         if self.extra_request_body:
-            kwargs["extra_body"] = dict(self.extra_request_body)
+            if model.startswith("anthropic/"):
+                # LiteLLM serializes extra_body literally on its Anthropic route.
+                # Native body options must be kwargs, but must not become SDK controls.
+                reserved = set(all_litellm_params) | {
+                    "model",
+                    "messages",
+                    "tools",
+                    "tool_choice",
+                    "stream",
+                    "timeout",
+                    "extra_headers",
+                    "extra_body",
+                }
+                conflicts = reserved.intersection(self.extra_request_body)
+                if conflicts:
+                    raise ValueError(
+                        "Anthropic extra_request_body cannot set LiteLLM controls: "
+                        + ", ".join(sorted(conflicts))
+                    )
+                kwargs.update(self.extra_request_body)
+            else:
+                kwargs["extra_body"] = dict(self.extra_request_body)
 
         # Ollama-specific request options. Without an explicit num_ctx the server
         # truncates long prompts to its 4096-token default; thinking models left
         # in thinking mode emit only reasoning and stall on CPU. Set safe
         # defaults, but let extra_request_body override either.
+        #
+        # ``num_ctx`` must be a top-level argument, not part of ``extra_body``:
+        # LiteLLM forwards ``extra_body`` verbatim as top-level JSON while Ollama
+        # only reads ``num_ctx`` from ``options``, so an ``extra_body`` value is
+        # silently ignored and the window stays at the 4096 default. ``think`` is
+        # accepted top-level by Ollama either way.
         if _has_litellm_prefix(model, OLLAMA_LITELLM_PREFIXES):
             extra = kwargs.get("extra_body", {})
-            extra.setdefault("num_ctx", OLLAMA_DEFAULT_NUM_CTX)
+            num_ctx = extra.pop("num_ctx", None)
+            kwargs["num_ctx"] = num_ctx if num_ctx is not None else OLLAMA_DEFAULT_NUM_CTX
             extra.setdefault("think", self._effective_thinking(thinking))
             kwargs["extra_body"] = extra
 
@@ -425,6 +455,7 @@ class LiteLLMVLMProvider(VLMBase):
             kwargs_messages = [{"role": "user", "content": content}]
         return self._build_kwargs(model, kwargs_messages, tools, tool_choice, thinking=thinking)
 
+    @model_error_boundary
     def get_completion(
         self,
         prompt: str = "",
@@ -446,13 +477,9 @@ class LiteLLMVLMProvider(VLMBase):
                 return self._build_vlm_response(response, has_tools=True)
             return self._clean_response(self._extract_content_from_response(response))
 
-        return retry_sync(
-            _call,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name="LiteLLM VLM completion",
-        )
+        return _call()
 
+    @model_error_boundary
     async def get_completion_async(
         self,
         prompt: str = "",
@@ -482,13 +509,9 @@ class LiteLLMVLMProvider(VLMBase):
                 return self._build_vlm_response(response, has_tools=True)
             return self._clean_response(self._extract_content_from_response(response))
 
-        return await retry_async(
-            _call,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name="LiteLLM VLM async completion",
-        )
+        return await _call()
 
+    @model_error_boundary
     def get_vision_completion(
         self,
         prompt: str = "",
@@ -510,13 +533,9 @@ class LiteLLMVLMProvider(VLMBase):
                 return self._build_vlm_response(response, has_tools=True)
             return self._clean_response(self._extract_content_from_response(response))
 
-        return retry_sync(
-            _call,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name="LiteLLM VLM vision completion",
-        )
+        return _call()
 
+    @model_error_boundary
     async def get_vision_completion_async(
         self,
         prompt: str = "",
@@ -538,12 +557,7 @@ class LiteLLMVLMProvider(VLMBase):
                 return self._build_vlm_response(response, has_tools=True)
             return self._clean_response(self._extract_content_from_response(response))
 
-        return await retry_async(
-            _call,
-            max_retries=self.max_retries,
-            logger=logger,
-            operation_name="LiteLLM VLM async vision completion",
-        )
+        return await _call()
 
     def _update_token_usage_from_response(
         self,
