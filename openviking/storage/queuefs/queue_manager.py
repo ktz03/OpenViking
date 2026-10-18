@@ -11,7 +11,6 @@ import threading
 import traceback
 from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Set, Union
 
-from openviking.service.task_work_index import TaskWorkIndex
 from openviking.utils.async_client_cache import LoopScopedAsyncClientCache
 from openviking_cli.utils.logger import get_logger
 
@@ -136,13 +135,12 @@ class QueueManager:
         self._queue_stop_events: Dict[str, threading.Event] = {}
         self._embedding_worker_stopped = threading.Event()
         self._poll_interval = 0.2
-        self._task_work_index = TaskWorkIndex()
         self._vlm_resolver: Optional["VLMResolver"] = None
         # Import at composition time to avoid a service <-> queue package cycle.
         from openviking.service.task_queue_middleware import TaskWorkQueueMiddleware
 
         self._middlewares: tuple[QueueMiddleware, ...] = (
-            TaskWorkQueueMiddleware(self._task_work_index),
+            TaskWorkQueueMiddleware(),
             *middlewares,
         )
 
@@ -167,10 +165,28 @@ class QueueManager:
         logger.info(f"[QueueManager] mount_point={self.mount_point} Started")
 
     async def prepare_task_tracking(self, tracker: Any) -> list[Any]:
-        """Rebuild task work from QueueFS before any consumer starts."""
+        """Bootstrap Work only for stores that reconstruct it from QueueFS."""
+        from openviking.service.task_domain import WorkRecoveryMode
+        from openviking.service.task_work_index import extract_task_metadata
+
+        if tracker.work_recovery_mode is WorkRecoveryMode.DURABLE_STORE:
+            return []
+
         snapshots = {name: await queue.snapshot() for name, queue in self._queues.items()}
-        owners = self._task_work_index.rebuild(snapshots)
-        tracker.attach_work_index(self._task_work_index)
+        owners: Dict[str, tuple[str, str]] = {}
+        for queue_name, messages in snapshots.items():
+            for message in messages:
+                metadata = extract_task_metadata(message)
+                if metadata is None or not metadata.account_id or not metadata.user_id:
+                    continue
+                owners[metadata.task_id] = (metadata.account_id, metadata.user_id)
+                await tracker.reconcile_delivery(
+                    metadata.task_id,
+                    metadata.work_id,
+                    queue_name,
+                    account_id=metadata.account_id,
+                    user_id=metadata.user_id,
+                )
         return await tracker.restore_work_tasks(owners)
 
     def setup_standard_queues(
