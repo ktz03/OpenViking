@@ -47,8 +47,8 @@ OpenViking 是面向 AI 智能体的开源上下文数据库——用一个文�
 
 <a href="https://studio.openviking.ai" target="_blank" rel="noopener noreferrer">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="../images/studio-playground-dark.png">
-    <img src="../images/studio-playground.png" alt="OpenViking Studio：浏览上下文，体验语义检索">
+    <source media="(prefers-color-scheme: dark)" srcset="../images/studio-filesystem-dark.png">
+    <img src="../images/studio-filesystem.png" alt="OpenViking Studio 文件系统：浏览个人记忆与资源">
   </picture>
 </a>
 
@@ -393,6 +393,7 @@ ov chat   # 在另一个终端运行
 - [NoKV](https://github.com/NoKV-Lab/NoKV) - AI 原生的分布式文件系统
 - [loopx](https://github.com/huangruiteng/loopx) - 轻量级循环工程状态内核
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent) - 与用户共同成长的智能体
+- [NVIDIA cuVS](https://github.com/NVIDIA/cuvs) - GPU 加速的向量搜索与聚类库
 
 合作提议请[提交 issue](https://github.com/volcengine/OpenViking/issues)。
 

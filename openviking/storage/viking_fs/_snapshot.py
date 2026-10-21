@@ -15,6 +15,7 @@ from openviking.pyagfs.exceptions import (
 )
 from openviking.server.error_mapping import is_not_found_error, map_exception
 from openviking.server.identity import RequestContext, Role
+from openviking.service.task_work_index import detach_task_context
 from openviking.storage.acl import AclAction
 from openviking.storage.viking_fs._base import (
     _prepare_snapshot_diff,
@@ -827,18 +828,19 @@ class _SnapshotMixin:
             vlm_resolver=self._vlm_resolver,
             vector_config_resolver=self._vector_config_resolver,
         )
-        for op, uri, level in tasks:
-            loop.create_task(
-                self._run_vector_rebuild(
-                    executor,
-                    op,
-                    uri,
-                    level,
-                    ctx,
-                    file_task_owner="standalone",
-                ),
-                name=f"vikingfs-git-{op}:{uri}:{int(level)}",
-            )
+        with detach_task_context():
+            for op, uri, level in tasks:
+                loop.create_task(
+                    self._run_vector_rebuild(
+                        executor,
+                        op,
+                        uri,
+                        level,
+                        ctx,
+                        file_task_owner="standalone",
+                    ),
+                    name=f"vikingfs-git-{op}:{uri}:{int(level)}",
+                )
 
     async def _run_restore_rebuild_tracked(
         self,
@@ -858,7 +860,11 @@ class _SnapshotMixin:
         from openviking.service.task_work_index import bind_task_context
 
         tracker = get_task_tracker()
-        tracker.register_running_task(task_id)
+        running_work_id = await tracker.register_running_task(
+            task_id,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+        )
         try:
             await tracker.start(
                 task_id,
@@ -871,7 +877,12 @@ class _SnapshotMixin:
                 vector_config_resolver=self._vector_config_resolver,
             )
             reindex_ctx = self._restore_reindex_context(ctx)
-            with bind_task_context(task_id, ctx.account_id, ctx.user.user_id):
+            with bind_task_context(
+                task_id,
+                ctx.account_id,
+                ctx.user.user_id,
+                work_id=running_work_id,
+            ):
                 await asyncio.gather(
                     *[
                         self._run_vector_rebuild(

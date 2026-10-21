@@ -47,8 +47,8 @@ OpenVikingは、AIエージェントのためのオープンソースのコン�
 
 <a href="https://studio.openviking.ai" target="_blank" rel="noopener noreferrer">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="../images/studio-playground-dark.png">
-    <img src="../images/studio-playground.png" alt="OpenViking Studio：コンテキストの閲覧と意味検索">
+    <source media="(prefers-color-scheme: dark)" srcset="../images/studio-filesystem-dark.png">
+    <img src="../images/studio-filesystem.png" alt="OpenViking Studio のファイルシステム：個人のメモリとリソースを閲覧">
   </picture>
 </a>
 
@@ -400,6 +400,7 @@ ov chat   # 別のターミナルで実行
 - [NoKV](https://github.com/NoKV-Lab/NoKV) - AI ネイティブの分散ファイルシステム
 - [loopx](https://github.com/huangruiteng/loopx) - 軽量なループエンジニアリング状態カーネル
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent) - あなたと共に成長するエージェント
+- [NVIDIA cuVS](https://github.com/NVIDIA/cuvs) - GPU アクセラレーションによるベクトル検索・クラスタリングライブラリ
 
 提携の提案は [issue](https://github.com/volcengine/OpenViking/issues) で受け付けています。
 
