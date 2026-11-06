@@ -769,6 +769,17 @@ class _AnyDocMarkdownRenderer:
         at_line_start: bool = False,
     ) -> str:
         characters = list(text)
+        ordered_markers = (
+            {
+                match.end() - 1
+                for match in re.finditer(
+                    r"(?:^|(?<=[\r\n]))[ \t]*[0-9]{1,9}[.)](?=[ \t\r\n]|$)", text
+                )
+                if at_line_start or match.start() > 0
+            }
+            if context == "block" and not styled and not in_label
+            else set()
+        )
         output: list[str] = []
         line_has_content = not at_line_start
         for index, char in enumerate(characters):
@@ -785,6 +796,8 @@ class _AnyDocMarkdownRenderer:
             later = characters[index + 1 :]
             escape = False
             if char == "\\":
+                escape = True
+            elif index in ordered_markers:
                 escape = True
             elif char == "]" and in_label:
                 escape = True
