@@ -543,7 +543,10 @@ class _AnyDocMarkdownRenderer:
                     anchors.append(inline.anchor)
         for note in _items(self.document.notes):
             for inline in self._walk_inlines(note.blocks):
-                if _kind(inline) == "anchor" and inline.anchor:
+                kind = _kind(inline)
+                if kind == "link" and inline.target and inline.target.kind == "anchor":
+                    linked.add(inline.target.value)
+                elif kind == "anchor" and inline.anchor:
                     anchors.append(inline.anchor)
 
         resolved: dict[str, _ResolvedAnchor] = {}
