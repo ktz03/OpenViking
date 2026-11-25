@@ -344,7 +344,10 @@ class MemoryUsageExtractor:
                     match = line_re.fullmatch(line)
                     if match is None:
                         continue
-                    label = match.group(1).split(" - ", 1)[0].strip()
+                    label = match.group(1).strip()
+                    tool_name = part.tool_name.strip()
+                    if tool_name != "list" and not _MCP_OPENVIKING_TOOL_RE.fullmatch(tool_name):
+                        label = label.split(" - ", 1)[0].strip()
                     if label.startswith("viking://"):
                         candidates.append(label)
                     elif parent_uri:
